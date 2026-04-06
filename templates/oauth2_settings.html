@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Archiver — Microsoft OAuth2 Settings</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-header">
+                <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+                <h1><a href="{{ url_for('dashboard') }}">Mail Archiver</a></h1>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-small" title="Home">Home</a>
+            </div>
+            <div class="user-info">
+                <span>{{ username }}</span>
+                <a href="{{ url_for('logout') }}" class="btn btn-small">Log Out</a>
+            </div>
+        </header>
+
+        <h2>Microsoft OAuth2 Settings</h2>
+
+        <div class="card" style="max-width:700px;">
+            <p>To use Microsoft (Outlook/Hotmail) accounts with OAuth2, you need to register a free Azure AD app. This gives you a Client ID and Client Secret that Mail Archiver uses to authenticate with Microsoft on your behalf.</p>
+
+            <div style="background:#f0f7ff;border-left:4px solid #2196f3;padding:16px 20px;margin:20px 0;border-radius:0 6px 6px 0;">
+                <strong>Setup takes about 5 minutes. You only do this once.</strong>
+                <ol style="margin:12px 0 0 20px;line-height:1.8;">
+                    <li>Go to <a href="https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank">Azure App Registrations</a></li>
+                    <li>Click <strong>New Registration</strong></li>
+                    <li>Name: <code>Mail Archiver</code></li>
+                    <li>Supported account types: <strong>Accounts in any organizational directory and personal Microsoft accounts</strong></li>
+                    <li>Redirect URI: <strong>Web</strong> → <code>{{ request.url_root }}oauth2/callback</code></li>
+                    <li>Click <strong>Register</strong></li>
+                    <li>Copy the <strong>Application (client) ID</strong> — paste below</li>
+                    <li>Go to <strong>Certificates & secrets</strong> → <strong>New client secret</strong></li>
+                    <li>Copy the secret <strong>Value</strong> (not the ID) — paste below</li>
+                    <li>Go to <strong>API permissions</strong> → <strong>Add a permission</strong> → <strong>APIs my organization uses</strong> → search <strong>Office 365 Exchange Online</strong> → <strong>Delegated</strong> → <strong>IMAP.AccessAsUser.All</strong></li>
+                </ol>
+                <p style="margin-top:12px;"><a href="{{ url_for('static', filename='guides/microsoft-oauth-setup.html') }}" target="_blank">See our visual step-by-step guide with screenshots →</a></p>
+            </div>
+
+            {% with messages = get_flashed_messages() %}
+            {% if messages %}
+            <div class="flash">
+                {% for message in messages %}
+                <p>{{ message }}</p>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% endwith %}
+
+            <form method="post" action="{{ url_for('oauth2_settings') }}">
+                <div class="form-group">
+                    <label for="client_id">Application (Client) ID</label>
+                    <input type="text" id="client_id" name="client_id" value="{{ client_id }}"
+                           placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                           style="width:100%;font-family:monospace;">
+                </div>
+
+                <div class="form-group" style="margin-top:16px;">
+                    <label for="client_secret">Client Secret Value</label>
+                    <input type="password" id="client_secret" name="client_secret"
+                           placeholder="{{ '••••••• (saved)' if has_secret else 'Paste your client secret here' }}"
+                           style="width:100%;font-family:monospace;">
+                    {% if has_secret %}
+                    <small style="color:#666;">Leave blank to keep the existing secret. Enter a new value to replace it.</small>
+                    {% endif %}
+                </div>
+
+                <div style="margin-top:20px;">
+                    <button type="submit" class="btn btn-primary">Save Credentials</button>
+                    <a href="{{ url_for('dashboard') }}" class="btn btn-small" style="margin-left:12px;">Back to Dashboard</a>
+                </div>
+            </form>
+
+            {% if client_id and has_secret %}
+            <div style="margin-top:24px;padding-top:16px;border-top:1px solid #eee;">
+                <p style="color:#2e7d32;"><strong>✓ Microsoft OAuth2 is configured.</strong> You can now add Outlook/Hotmail accounts from the dashboard — click "Add Email Account" and select "Outlook / Hotmail".</p>
+            </div>
+            {% endif %}
+        </div>
+
+        <div style="margin-top:20px;">
+            <a href="{{ url_for('dashboard') }}" class="btn">← Back to Dashboard</a>
+        </div>
+    </div>
+</body>
+</html>

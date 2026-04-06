@@ -1,0 +1,12 @@
+Package: mail-archiver
+Version: 1.0.0-1
+Architecture: all
+Maintainer: Madhav Diwan <madhav@decllc.biz>
+Depends: python3-flask, gunicorn, isync
+Section: mail
+Priority: optional
+Homepage: https://dec-llc.biz
+Description: Self-hosted email archive with full-text search
+ Mail Archiver is a self-hosted email archive supporting Gmail, iCloud,
+ and Outlook/Hotmail via IMAP. Features SQLite FTS5 search index,
+ Microsoft OAuth2, MBOX/EML export, and scheduled sync.

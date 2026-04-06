@@ -1,0 +1,369 @@
+/* Mail Archiver — DEC-LLC branded CSS */
+:root {
+    --bg: #f5f7f9;
+    --card-bg: #fff;
+    --text: #333;
+    --text-muted: #666;
+    --border: #ddd;
+    --primary: #0f2b46;
+    --primary-hover: #1a4d7d;
+    --accent: #2196f3;
+    --accent-dark: #1565c0;
+    --teal: #00897b;
+    --danger: #dc2626;
+    --success: #16a34a;
+    --warning: #d97706;
+    --syncing: #7c3aed;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+}
+
+.container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+}
+
+.login-container {
+    max-width: 400px;
+    margin-top: 10vh;
+    text-align: center;
+}
+
+.login-container h1 { margin-bottom: 0.25rem; }
+.subtitle { color: var(--text-muted); margin-bottom: 2rem; }
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 2px solid var(--primary);
+}
+
+header h1 { font-size: 1.5rem; color: var(--primary); }
+header a { color: inherit; text-decoration: none; }
+
+.logo-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.logo-header img { height: 36px; }
+.logo-header span { font-weight: 800; font-size: 0.75rem; color: var(--text-muted); letter-spacing: 0.05em; }
+
+.user-info {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    color: var(--text-muted);
+}
+
+/* Forms */
+form { text-align: left; }
+
+label {
+    display: block;
+    margin: 1rem 0 0.25rem;
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+
+input[type="text"], input[type="email"], input[type="password"], select {
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 1rem;
+    background: var(--card-bg);
+}
+
+input:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.15);
+}
+
+.help-text { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem; }
+
+/* Buttons */
+.btn {
+    display: inline-block;
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card-bg);
+    color: var(--text);
+    font-size: 0.9rem;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.15s;
+}
+.btn:hover { background: #eee; }
+
+.btn-primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+}
+.btn-primary:hover { background: var(--accent-dark); }
+
+.btn-danger { color: var(--danger); border-color: var(--danger); }
+.btn-danger:hover { background: #fef2f2; }
+
+.btn-small { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
+
+button[type="submit"].btn { margin-top: 1.5rem; width: 100%; }
+.form-actions { margin-top: 1.5rem; display: flex; gap: 0.5rem; }
+.form-actions .btn { flex: 1; text-align: center; }
+
+/* Flash messages */
+.flash {
+    background: #fef3c7;
+    border: 1px solid #fbbf24;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+}
+.flash p { margin: 0; }
+
+/* Actions bar */
+.actions-bar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+}
+
+/* Empty state */
+.empty-state {
+    text-align: center;
+    padding: 4rem 1rem;
+    color: var(--text-muted);
+}
+.empty-state h2 { margin-bottom: 0.5rem; color: var(--text); }
+
+/* Account cards */
+.accounts-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.account-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem;
+    border-left: 4px solid var(--border);
+}
+
+.account-card.ok { border-left-color: var(--success); }
+.account-card.error { border-left-color: var(--danger); }
+.account-card.syncing { border-left-color: var(--syncing); }
+.account-card.new { border-left-color: var(--warning); }
+.account-card.disabled { opacity: 0.6; }
+
+.account-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+
+.account-provider { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+.account-status-badge {
+    font-size: 0.75rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 9999px;
+    font-weight: 600;
+}
+.status-ok { background: #dcfce7; color: var(--success); }
+.status-error { background: #fef2f2; color: var(--danger); }
+.status-syncing { background: #ede9fe; color: var(--syncing); }
+.status-new { background: #fef3c7; color: var(--warning); }
+
+.account-email { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.5rem; }
+
+.account-stats {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+}
+
+.account-last-sync { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+
+.account-error {
+    font-size: 0.8rem;
+    color: var(--danger);
+    background: #fef2f2;
+    padding: 0.5rem;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+    font-family: monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.account-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+}
+
+/* Schedule selector */
+.schedule-form { display: inline; }
+.schedule-select {
+    padding: 0.25rem 0.4rem;
+    font-size: 0.8rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card-bg);
+    cursor: pointer;
+}
+
+/* Inline details for update key */
+.inline-details { display: inline; }
+.inline-details summary { list-style: none; cursor: pointer; }
+.inline-details summary::-webkit-details-marker { display: none; }
+.inline-form {
+    display: flex;
+    gap: 0.25rem;
+    margin-top: 0.5rem;
+}
+.inline-form input {
+    width: auto;
+    flex: 1;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.8rem;
+}
+
+/* Footer */
+footer {
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+}
+.info-links {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+code {
+    background: #f0f0f0;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    font-size: 0.85em;
+}
+
+/* Search */
+.search-form { margin-bottom: 1.5rem; }
+.search-bar {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+}
+.search-bar input[type="text"] {
+    flex: 1;
+    font-size: 1rem;
+    padding: 0.6rem 0.75rem;
+}
+.search-account-filter {
+    width: auto;
+    min-width: 140px;
+    padding: 0.4rem 0.5rem;
+    font-size: 0.85rem;
+}
+.search-meta {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
+}
+.search-results {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+.search-result {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+}
+.result-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    margin-bottom: 0.35rem;
+}
+.result-subject {
+    font-weight: 600;
+    font-size: 1rem;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.result-date {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.result-meta {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-bottom: 0.35rem;
+}
+.result-from { font-weight: 500; color: var(--text); }
+.result-to { margin-left: 0.5rem; }
+.result-folder {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 0.5rem;
+}
+.result-account-tag, .result-folder-tag {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    background: #f0f0f0;
+    color: var(--text-muted);
+}
+.result-account-tag { background: #e0e7ff; color: #3730a3; }
+.result-snippet {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+    padding: 0.5rem;
+    background: #fafafa;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 6rem;
+    overflow: hidden;
+}
+
+@media (max-width: 600px) {
+    .account-stats { flex-direction: column; gap: 0.25rem; }
+    .account-actions { flex-direction: column; }
+    .search-bar { flex-direction: column; }
+    .search-account-filter { width: 100%; }
+    .result-header { flex-direction: column; gap: 0.25rem; }
+}

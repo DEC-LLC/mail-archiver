@@ -1,0 +1,15 @@
+[Unit]
+Description=Mail Archiver Web UI
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gunicorn --bind 0.0.0.0:8400 --workers 2 --timeout 120 app:app
+WorkingDirectory=/opt/mail-archiver
+Environment=MAIL_ARCHIVER_DATA=/datapool/email-archive
+Environment=MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

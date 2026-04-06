@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Archiver — Add Account</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-header">
+                <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+                <h1><a href="{{ url_for('dashboard') }}">Mail Archiver</a></h1>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-small" title="Home">Home</a>
+            </div>
+        </header>
+
+        {% with messages = get_flashed_messages() %}
+        {% if messages %}
+        <div class="flash">
+            {% for msg in messages %}<p>{{ msg }}</p>{% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
+
+        <h2>Add Email Account</h2>
+
+        <form method="post" action="{{ url_for('add_account') }}">
+            <label for="provider">Email Provider</label>
+            <select id="provider" name="provider" required onchange="updateHelp()">
+                <option value="">-- Select --</option>
+                {% for key, prov in providers.items() %}
+                <option value="{{ key }}"
+                    data-auth="{{ prov.auth }}"
+                    data-label="{{ prov.auth_label }}"
+                    data-help="{{ prov.auth_help }}"
+                    data-custom="{{ 'yes' if prov.get('custom_host') else 'no' }}">{{ prov.name }}</option>
+                {% endfor %}
+            </select>
+
+            <label for="email">Email Address</label>
+            <input type="email" id="email" name="email" required
+                   placeholder="you@example.com">
+
+            <div id="custom-host-section" style="display:none;">
+                <label for="custom_host">IMAP Server</label>
+                <input type="text" id="custom_host" name="custom_host"
+                       placeholder="imap.yourserver.com">
+                <label for="custom_port">Port</label>
+                <input type="number" id="custom_port" name="custom_port"
+                       value="993" style="width:120px;">
+            </div>
+
+            <div id="credential-section">
+                <label for="credential" id="credential-label">App Password</label>
+                <input type="password" id="credential" name="credential"
+                       placeholder="Enter app password or token">
+                <p class="help-text" id="credential-help"></p>
+            </div>
+
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">Add Account</button>
+                <a href="{{ url_for('dashboard') }}" class="btn">Cancel</a>
+            </div>
+        </form>
+    </div>
+
+    <script>
+    function updateHelp() {
+        var sel = document.getElementById('provider');
+        var opt = sel.options[sel.selectedIndex];
+        var label = document.getElementById('credential-label');
+        var help = document.getElementById('credential-help');
+        var credSection = document.getElementById('credential-section');
+        var customSection = document.getElementById('custom-host-section');
+
+        if (opt.value) {
+            label.textContent = opt.dataset.label;
+            help.textContent = opt.dataset.help;
+            credSection.style.display = opt.dataset.auth === 'oauth2' ? 'none' : 'block';
+            customSection.style.display = opt.dataset.custom === 'yes' ? 'block' : 'none';
+        } else {
+            label.textContent = 'App Password';
+            help.textContent = '';
+            credSection.style.display = 'block';
+            customSection.style.display = 'none';
+        }
+    }
+    </script>
+</body>
+</html>

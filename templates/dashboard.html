@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Archiver — {{ username }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-header">
+                <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+                <h1>Mail Archiver</h1>
+            </div>
+            <div class="user-info">
+                <span>{{ username }}</span>
+                <a href="{{ url_for('logout') }}" class="btn btn-small">Log Out</a>
+            </div>
+        </header>
+
+        {% with messages = get_flashed_messages() %}
+        {% if messages %}
+        <div class="flash">
+            {% for msg in messages %}<p>{{ msg }}</p>{% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
+
+        <div class="actions-bar">
+            <a href="{{ url_for('add_account') }}" class="btn btn-primary">Add Email Account</a>
+            {% if accounts %}
+            <a href="{{ url_for('search') }}" class="btn">Search Archive</a>
+            <form method="post" action="{{ url_for('sync_all') }}" style="display:inline">
+                <button type="submit" class="btn">Sync All</button>
+            </form>
+            {% endif %}
+        </div>
+
+        {% if not accounts %}
+        <div class="empty-state">
+            <h2>No email accounts configured</h2>
+            <p>Add a Gmail, Outlook/Hotmail, or iCloud account to start archiving.</p>
+        </div>
+        {% else %}
+        <div class="accounts-grid">
+            {% for acct in accounts %}
+            <div class="account-card {{ 'disabled' if not acct.enabled }} {{ acct.status.get('state', 'new') }}">
+                <div class="account-header">
+                    <div class="account-provider">{{ acct.provider_info.get('name', acct.provider) }}</div>
+                    <div class="account-status-badge
+                        {% if acct.status.get('state') == 'ok' %}status-ok
+                        {% elif acct.status.get('state') == 'error' %}status-error
+                        {% elif acct.status.get('state') == 'syncing' %}status-syncing
+                        {% else %}status-new{% endif %}">
+                        {% if acct.status.get('state') == 'ok' %}Synced
+                        {% elif acct.status.get('state') == 'error' %}Error
+                        {% elif acct.status.get('state') == 'syncing' %}Syncing...
+                        {% else %}Not synced{% endif %}
+                    </div>
+                </div>
+
+                <div class="account-email">{{ acct.email }}</div>
+
+                <div class="account-stats">
+                    <span>{{ acct.stats.messages }} messages</span>
+                    <span>{{ acct.stats.folders }} folders</span>
+                    <span>{{ acct.stats.size }}</span>
+                </div>
+
+                {% if acct.status.get('finished') %}
+                <div class="account-last-sync">
+                    Last sync: {{ acct.status.finished }}
+                </div>
+                {% endif %}
+
+                {% if acct.status.get('state') == 'error' and acct.status.get('error') %}
+                <div class="account-error">
+                    {{ acct.status.error[:200] }}
+                </div>
+                {% endif %}
+
+                <div class="account-actions">
+                    <form method="post" action="{{ url_for('sync_account', email=acct.email) }}" style="display:inline">
+                        <button type="submit" class="btn btn-small" {% if not acct.enabled %}disabled{% endif %}>Sync Now</button>
+                    </form>
+                    <form method="post" action="{{ url_for('toggle_account', email=acct.email) }}" style="display:inline">
+                        <button type="submit" class="btn btn-small">{{ 'Enable' if not acct.enabled else 'Disable' }}</button>
+                    </form>
+
+                    <form method="post" action="{{ url_for('update_schedule', email=acct.email) }}" style="display:inline" class="schedule-form">
+                        <select name="sync_interval" onchange="scheduleChanged(this)" class="schedule-select">
+                            {% for key, info in sync_intervals.items() %}
+                            <option value="{{ key }}" {{ 'selected' if acct.get('sync_interval', 'daily') == key }}>{{ info.label }}</option>
+                            {% endfor %}
+                        </select>
+                    </form>
+
+                    <details class="inline-details">
+                        <summary class="btn btn-small">Update Key</summary>
+                        <form method="post" action="{{ url_for('update_credential', email=acct.email) }}" class="inline-form">
+                            <input type="password" name="credential" placeholder="{{ acct.provider_info.get('auth_label', 'App Password') }}" required>
+                            <button type="submit" class="btn btn-small">Save</button>
+                        </form>
+                    </details>
+
+                    <form method="post" action="{{ url_for('remove_account', email=acct.email) }}" style="display:inline"
+                          onsubmit="return confirm('Remove {{ acct.email }}? Archived mail will NOT be deleted.')">
+                        <button type="submit" class="btn btn-small btn-danger">Remove</button>
+                    </form>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <footer>
+            <div class="info-links">
+                <span>Data: <code>{{ archive_dir }}</code></span>
+                <span>Sync times are automatically staggered across accounts to avoid overloading mail servers.</span>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+    function scheduleChanged(sel) {
+        if (sel.value === 'manual') {
+            if (!confirm(
+                'Setting this account to "Manual only" means it will NOT sync automatically.\n\n' +
+                'If you have multiple accounts, the remaining accounts will still sync on their schedules. ' +
+                'However, this account will only update when you click "Sync Now".\n\n' +
+                'Are you sure?'
+            )) {
+                // revert to previous selection
+                sel.selectedIndex = Array.from(sel.options).findIndex(o => o.defaultSelected);
+                return;
+            }
+        }
+        sel.form.submit();
+    }
+    </script>
+</body>
+</html>

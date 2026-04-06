@@ -1,0 +1,15 @@
+# Mail Archiver Dependencies
+#
+# Install via OS package manager — DO NOT use pip install.
+#
+# Debian/Ubuntu:
+#   sudo apt-get install python3-flask gunicorn isync
+#
+# Rocky/RHEL/Fedora:
+#   sudo dnf install python3-flask python3-gunicorn isync
+#
+# Optional (for PAM auth):
+#   sudo apt-get install python3-pam    (Debian/Ubuntu)
+#   sudo dnf install python3-pam        (Rocky/RHEL)
+#
+# All other dependencies are Python stdlib (sqlite3, email, json, etc.)

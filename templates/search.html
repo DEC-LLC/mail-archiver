@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Archiver — Search</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .search-filters { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; margin: 16px 0; }
+        .search-filters label { font-size: 0.85rem; color: #666; display: block; margin-bottom: 4px; }
+        .search-filters input, .search-filters select { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9rem; }
+        .search-bar { display: flex; gap: 8px; align-items: center; }
+        .search-bar input[type="text"] { flex: 1; padding: 12px 16px; font-size: 1.05rem; border: 2px solid #ddd; border-radius: 8px; }
+        .search-bar input[type="text"]:focus { border-color: #2196f3; outline: none; }
+        .search-bar button { padding: 12px 28px; background: #2196f3; color: white; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; white-space: nowrap; }
+        .search-bar button:hover { background: #1565c0; }
+        .search-meta { color: #666; font-size: 0.9rem; margin: 16px 0 8px; padding-bottom: 8px; border-bottom: 1px solid #eee; }
+        .result-card { padding: 16px; margin: 8px 0; border: 1px solid #eee; border-radius: 8px; transition: background 0.15s; cursor: pointer; text-decoration: none; display: block; color: inherit; }
+        .result-card:hover { background: #f8fafb; border-color: #2196f3; }
+        .result-subject { font-weight: 600; color: #0f2b46; font-size: 1.05rem; margin-bottom: 4px; }
+        .result-meta { font-size: 0.85rem; color: #666; margin-bottom: 8px; }
+        .result-meta span { margin-right: 16px; }
+        .result-snippet { font-size: 0.92rem; color: #444; line-height: 1.5; }
+        .result-snippet mark { background: #fff3cd; padding: 1px 2px; border-radius: 2px; }
+        .result-account { display: inline-block; background: #e3f2fd; color: #1565c0; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+        .result-folder { display: inline-block; background: #f0f0f0; color: #666; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; }
+        .no-results { text-align: center; padding: 60px 20px; color: #999; }
+        .no-results h3 { color: #666; margin-bottom: 12px; }
+        .search-tips { background: #f8fafb; padding: 24px; border-radius: 8px; margin-top: 24px; }
+        .search-tips h4 { color: #0f2b46; margin-bottom: 12px; font-size: 1.1rem; }
+        .search-tips ul { color: #555; font-size: 0.95rem; line-height: 2; margin-left: 20px; }
+        .export-bar { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+        .export-bar a { font-size: 0.85rem; color: #1565c0; text-decoration: none; padding: 6px 14px; border: 1px solid #1565c0; border-radius: 6px; }
+        .export-bar a:hover { background: #e3f2fd; }
+        @media (max-width: 700px) { .search-filters { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-header">
+                <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+                <h1><a href="{{ url_for('dashboard') }}">Mail Archiver</a></h1>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-small" title="Home">Home</a>
+            </div>
+            <div class="user-info">
+                <span>{{ username }}</span>
+                <a href="{{ url_for('logout') }}" class="btn btn-small">Log Out</a>
+            </div>
+        </header>
+
+        <h2>Search Archive</h2>
+
+        <form method="get" action="{{ url_for('search') }}">
+            <div class="search-bar">
+                <input type="text" name="q" value="{{ query }}"
+                       placeholder="Search emails — subjects, senders, body text..."
+                       autofocus>
+                <button type="submit">Search</button>
+            </div>
+
+            <div class="search-filters">
+                <div>
+                    <label for="account">Account</label>
+                    <select name="account" id="account">
+                        <option value="">All accounts</option>
+                        {% for acct in accounts %}
+                        <option value="{{ acct.email }}"
+                            {{ 'selected' if account_filter == acct.email }}>{{ acct.email }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label for="date_from">From date</label>
+                    <input type="date" name="date_from" id="date_from" value="{{ date_from or '' }}">
+                </div>
+                <div>
+                    <label for="date_to">To date</label>
+                    <input type="date" name="date_to" id="date_to" value="{{ date_to or '' }}">
+                </div>
+                <div>
+                    <label for="sender">From (sender)</label>
+                    <input type="text" name="sender" id="sender" value="{{ sender_filter or '' }}" placeholder="e.g., john@example.com">
+                </div>
+                <div>
+                    <label for="recipient">To (recipient)</label>
+                    <input type="text" name="recipient" id="recipient" value="{{ recipient_filter or '' }}" placeholder="e.g., me@gmail.com">
+                </div>
+                <div>
+                    <label for="has_attachment">Attachments</label>
+                    <select name="has_attachment" id="has_attachment">
+                        <option value="">Any</option>
+                        <option value="yes" {{ 'selected' if has_attachment == 'yes' }}>Has attachments</option>
+                        <option value="no" {{ 'selected' if has_attachment == 'no' }}>No attachments</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="search_in">Search in</label>
+                    <select name="search_in" id="search_in">
+                        <option value="" {{ 'selected' if not search_in }}>Everything (subject + body + sender)</option>
+                        <option value="subject" {{ 'selected' if search_in == 'subject' }}>Subject only</option>
+                        <option value="body" {{ 'selected' if search_in == 'body' }}>Body only</option>
+                        <option value="sender" {{ 'selected' if search_in == 'sender' }}>Sender only</option>
+                    </select>
+                </div>
+            </div>
+        </form>
+
+        {% if query %}
+        <div class="search-meta">
+            {{ results|length }} result{{ 's' if results|length != 1 }} for
+            "<strong>{{ query }}</strong>"
+            {% if account_filter %} in <strong>{{ account_filter }}</strong>{% endif %}
+            {% if date_from %} from <strong>{{ date_from }}</strong>{% endif %}
+            {% if date_to %} to <strong>{{ date_to }}</strong>{% endif %}
+            {% if sender_filter %} from sender <strong>{{ sender_filter }}</strong>{% endif %}
+            {% if search_time %} <span style="float:right;">{{ search_time }}s</span>{% endif %}
+        </div>
+
+        {% if results %}
+        <div class="export-bar">
+            <span style="font-size:0.85rem;color:#666;">Export these results:</span>
+            <a href="{{ url_for('search', q=query, account=account_filter, date_from=date_from or '', date_to=date_to or '', format='mbox') }}">Download as MBOX</a>
+            <a href="{{ url_for('search', q=query, account=account_filter, date_from=date_from or '', date_to=date_to or '', format='eml') }}">Download as EML (zip)</a>
+        </div>
+        {% endif %}
+
+        {% if results %}
+            {% for result in results %}
+            <a class="result-card" href="{{ url_for('view_email', path=result.filepath) }}">
+                <div class="result-subject">{{ result.subject }}</div>
+                <div class="result-meta">
+                    <span>From: <strong>{{ result.from }}</strong></span>
+                    <span>To: {{ result.to }}</span>
+                    <span>{{ result.date }}</span>
+                </div>
+                <div class="result-meta">
+                    <span class="result-account">{{ result.account }}</span>
+                    <span class="result-folder">{{ result.folder }}</span>
+                    {% if result.has_attachment %}<span style="color:#e65100;">📎 attachment</span>{% endif %}
+                </div>
+                <div class="result-snippet">{% if result.snippet %}{{ result.snippet|safe }}{% endif %}</div>
+            </a>
+            {% endfor %}
+        {% else %}
+            <div class="no-results">
+                <h3>No results found</h3>
+                <p>Try a different search term, broaden the date range, or search across all accounts.</p>
+            </div>
+        {% endif %}
+
+        {% else %}
+        <!-- No query — show recent emails + search guide -->
+
+        {% if showing_recent and results %}
+        <div class="search-meta">
+            Most recent {{ results|length }} email{{ 's' if results|length != 1 }}
+            {% if account_filter %} in <strong>{{ account_filter }}</strong>{% endif %}
+            {% if date_from %} from <strong>{{ date_from }}</strong>{% endif %}
+            {% if date_to %} to <strong>{{ date_to }}</strong>{% endif %}
+            ({{ total_in_index }} total in archive)
+            {% if search_time %} <span style="float:right;">{{ search_time }}s</span>{% endif %}
+        </div>
+
+        {% for result in results %}
+        <a class="result-card" href="{{ url_for('view_email', path=result.filepath) }}">
+            <div class="result-subject">{{ result.subject }}</div>
+            <div class="result-meta">
+                <span>From: <strong>{{ result.from }}</strong></span>
+                <span>To: {{ result.to }}</span>
+                <span>{{ result.date }}</span>
+            </div>
+            <div class="result-meta">
+                <span class="result-account">{{ result.account }}</span>
+                <span class="result-folder">{{ result.folder }}</span>
+                {% if result.has_attachment %}<span style="color:#e65100;">📎 attachment</span>{% endif %}
+            </div>
+        </a>
+        {% endfor %}
+        {% endif %}
+
+        <!-- Search guide with examples -->
+        <div class="search-tips">
+            <h4>How to Search</h4>
+            <p style="color:#555;margin-bottom:16px;">
+                Type a word or phrase in the search box. All other fields are optional filters.
+                The search box is the only required field — everything else narrows your results.
+            </p>
+
+            <table style="width:100%;border-collapse:collapse;font-size:0.92rem;margin-bottom:20px;">
+                <thead>
+                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                        <th style="padding:8px 12px;">What you want</th>
+                        <th style="padding:8px 12px;">Search box</th>
+                        <th style="padding:8px 12px;">Filters to set</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">Find all emails about "invoice"</td>
+                        <td style="padding:8px 12px;"><code>invoice</code></td>
+                        <td style="padding:8px 12px;">(none needed)</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">Emails from John about the project</td>
+                        <td style="padding:8px 12px;"><code>project</code></td>
+                        <td style="padding:8px 12px;">From: <code>john@</code></td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">All emails in March 2025</td>
+                        <td style="padding:8px 12px;"><code>*</code></td>
+                        <td style="padding:8px 12px;">From date: <code>2025-03-01</code>, To date: <code>2025-03-31</code></td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">Emails with attachments from Gmail only</td>
+                        <td style="padding:8px 12px;"><code>*</code></td>
+                        <td style="padding:8px 12px;">Account: (pick your Gmail), Attachments: Has attachments</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">Exact phrase</td>
+                        <td style="padding:8px 12px;"><code>"quarterly report"</code></td>
+                        <td style="padding:8px 12px;">(none needed)</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">Emails containing budget OR forecast</td>
+                        <td style="padding:8px 12px;"><code>budget OR forecast</code></td>
+                        <td style="padding:8px 12px;">(none needed)</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">Exclude a term</td>
+                        <td style="padding:8px 12px;"><code>meeting NOT cancelled</code></td>
+                        <td style="padding:8px 12px;">(none needed)</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:8px 12px;">Search subject lines only</td>
+                        <td style="padding:8px 12px;"><code>important</code></td>
+                        <td style="padding:8px 12px;">Search in: Subject only</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px;">Search email body only</td>
+                        <td style="padding:8px 12px;"><code>password reset</code></td>
+                        <td style="padding:8px 12px;">Search in: Body only</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4 style="margin-top:20px;">Tips</h4>
+            <ul>
+                <li>The <strong>search box</strong> searches subjects, senders, recipients, and full message body</li>
+                <li>Use <strong>quotes</strong> for exact phrases: <code>"board meeting"</code></li>
+                <li>Use <strong>OR</strong> between words to match either: <code>receipt OR invoice</code></li>
+                <li>Use <strong>NOT</strong> to exclude: <code>project NOT cancelled</code></li>
+                <li>Use <strong>*</strong> as a wildcard prefix: <code>financ*</code> matches finance, financial, financing</li>
+                <li>Leave the search box empty and just set <strong>date range</strong> or <strong>account</strong> to browse recent emails matching those filters</li>
+                <li><strong>Export</strong> any search results as MBOX (for email clients) or EML zip (individual files)</li>
+            </ul>
+
+            <p style="margin-top:20px;color:#888;font-size:0.9rem;">
+                Your archive contains emails from {{ accounts|length }} account{{ 's' if accounts|length != 1 }}.
+            </p>
+        </div>
+        {% endif %}
+
+        <div style="margin-top:24px;">
+            <a href="{{ url_for('dashboard') }}" class="btn">← Back to Dashboard</a>
+        </div>
+    </div>
+</body>
+</html>

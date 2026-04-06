@@ -1,0 +1,16 @@
+#!/bin/bash
+set -e
+
+# Generate secret key if not present
+if [ ! -f /opt/mail-archiver/.secret_key ]; then
+    python3 -c "import secrets; print(secrets.token_hex(32))" > /opt/mail-archiver/.secret_key
+    chmod 600 /opt/mail-archiver/.secret_key
+fi
+
+# Create default data directory
+mkdir -p /var/lib/mail-archiver 2>/dev/null || true
+
+systemctl daemon-reload
+
+echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
+echo "Then: systemctl enable --now mail-archiver"
