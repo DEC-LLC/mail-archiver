@@ -2,7 +2,7 @@
 
 **Archive your email. Search it instantly. Read it anywhere. One app — Windows, Linux, NAS, container.**
 
-A self-hosted email archive with full-text search that runs on **Windows** (standalone EXE — no install needed), **Linux** (RPM/DEB), **NAS** (bare metal), or **containers**. Supports Gmail, iCloud, Outlook, Yahoo, and any IMAP server. No cloud, no subscription, your data stays on your hardware.
+A self-hosted email archive with full-text search that runs on **Windows** (standalone EXE — no install needed), **Linux** (RPM/DEB), **NAS** (bare metal), or **containers**. Supports Gmail, iCloud, Outlook, Yahoo, and any IMAP server. No cloud dependencies, no subscription — install anywhere, your data stays on your hardware.
 
 [![Windows](https://img.shields.io/badge/Windows-EXE-blue.svg)]()
 [![RPM](https://img.shields.io/badge/Rocky%2FRHEL-RPM-red.svg)]()
