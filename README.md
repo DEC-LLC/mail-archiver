@@ -35,7 +35,6 @@ A self-hosted email archive with full-text search that runs on **Windows** (stan
 - **Automatic sync** — scheduled syncs (hourly, 6h, 12h, daily) with staggered execution
 - **Dual auth** — PAM mode (NAS/server) or built-in accounts (Windows/container)
 - **Plain files** — Maildir on disk, accessible via SMB, NFS, or any Maildir client
-- **DEC-LLC branded** — company logo, colors, links to dec-llc.biz
 
 ## Quick Start (Windows)
 
