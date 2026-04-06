@@ -43,6 +43,20 @@ A self-hosted email archive with full-text search that runs on **Windows** (stan
 3. Register an account, add your email, click Sync
 4. Search your entire archive instantly
 
+## Day-to-Day Usage
+
+### Windows
+
+Mail Archiver runs a small local web server on your computer. Leave it running in your system tray and open `http://127.0.0.1:8400` in your browser whenever you need it. If you close the program, just double-click the EXE again — it picks up right where you left off. Your archive and settings are saved in `%APPDATA%\MailArchiver\` and persist between sessions.
+
+### Linux / NAS
+
+Mail Archiver runs as a systemd service in the background. It starts automatically at boot. To access it, open `http://your-server:8400` in any browser on your network. No need to start or stop anything — it's always running.
+
+### Multi-User
+
+Every person gets their own login and their own private archive. One installation serves your whole family or small office — each user registers their own account, adds their own email providers, and searches only their own mail. Set it up on a shared NAS or home server and everyone connects from their own device.
+
 ## Quick Start (Container)
 
 ```bash
