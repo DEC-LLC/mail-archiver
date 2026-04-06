@@ -47,7 +47,31 @@ if not secret_file.exists():
 os.environ['MAIL_ARCHIVER_SECRET_FILE'] = str(secret_file)
 
 PORT = 8400
-URL = f'http://127.0.0.1:{PORT}'
+URL = f'https://127.0.0.1:{PORT}'
+
+
+def _generate_self_signed_cert():
+    """Generate a self-signed cert for HTTPS if none exists."""
+    cert_dir = DATA_DIR / 'certs'
+    cert_file = cert_dir / 'mail-archiver.crt'
+    key_file = cert_dir / 'mail-archiver.key'
+    if cert_file.exists() and key_file.exists():
+        return str(cert_file), str(key_file)
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import subprocess
+        subprocess.run([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+            '-keyout', str(key_file), '-out', str(cert_file),
+            '-days', '3650', '-subj', '/O=Mail Archiver/CN=localhost',
+            '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1',
+        ], capture_output=True, timeout=30)
+        if cert_file.exists():
+            log.info('Self-signed certificate generated at %s', cert_dir)
+            return str(cert_file), str(key_file)
+    except Exception as e:
+        log.warning('Could not generate self-signed cert: %s — using HTTP', e)
+    return None, None
 
 
 def run_flask():
@@ -55,7 +79,20 @@ def run_flask():
     # Import here so env vars are set first
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from app import app
-    app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False)
+
+    # Try HTTPS with self-signed cert
+    cert, key = _generate_self_signed_cert()
+    if cert and key:
+        import ssl
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        os.environ['MAIL_ARCHIVER_HTTPS'] = '1'
+        log.info('Serving HTTPS on port %d', PORT)
+        app.run(host='127.0.0.1', port=PORT, debug=False,
+                use_reloader=False, ssl_context=context)
+    else:
+        log.info('Serving HTTP on port %d (no openssl available)', PORT)
+        app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False)
 
 
 def run_tray():

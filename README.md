@@ -142,17 +142,103 @@ Combine with filters (all optional) to narrow results:
 
 When you open the search page with no query, it shows your 10 most recent emails.
 
+## HTTPS
+
+Mail Archiver ships with HTTPS enabled by default. On first start, a self-signed TLS certificate is automatically generated. Your browser will show a security warning — that's expected for self-signed certs, but the connection is encrypted.
+
+**Default ports:**
+- `8443` — HTTPS (when certs are present)
+- `8400` — HTTP fallback (if cert generation fails)
+
+**Windows:** HTTPS works automatically if OpenSSL is available on the system. If not, it falls back to HTTP on port 8400.
+
+### Changing the Port
+
+**Linux (systemd):**
+```bash
+sudo systemctl edit mail-archiver
+```
+Add under `[Service]`:
+```ini
+Environment=MAIL_ARCHIVER_PORT=9443
+```
+Then restart: `sudo systemctl restart mail-archiver`
+
+**Windows:** Set the `MAIL_ARCHIVER_PORT` environment variable before launching the EXE.
+
+### Using Let's Encrypt (for internet-facing installs)
+
+If you have a domain name pointing to your server, you can replace the self-signed cert with a real one:
+
+```bash
+# Install certbot
+sudo apt install certbot    # Debian/Ubuntu
+sudo dnf install certbot    # Rocky/RHEL
+
+# Get a certificate
+sudo certbot certonly --standalone -d mail.yourdomain.com --agree-tos
+
+# Copy certs to Mail Archiver
+sudo cp /etc/letsencrypt/live/mail.yourdomain.com/fullchain.pem /opt/mail-archiver/certs/mail-archiver.crt
+sudo cp /etc/letsencrypt/live/mail.yourdomain.com/privkey.pem /opt/mail-archiver/certs/mail-archiver.key
+sudo chown mail-archiver:mail-archiver /opt/mail-archiver/certs/*
+
+# Restart
+sudo systemctl restart mail-archiver
+```
+
+Certbot auto-renews. Set up a cron or timer to copy renewed certs and restart the service.
+
+### Disabling HTTPS
+
+If you're behind a reverse proxy (nginx, Caddy, HAProxy) that handles TLS, you can run Mail Archiver as HTTP-only:
+
+```bash
+sudo systemctl edit mail-archiver
+```
+```ini
+[Service]
+Environment=MAIL_ARCHIVER_HTTPS=0
+Environment=MAIL_ARCHIVER_PORT=8400
+ExecStart=
+ExecStart=/usr/bin/gunicorn --bind 0.0.0.0:8400 --workers 2 --timeout 120 app:app
+```
+
 ## Configuration
 
 All via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAIL_ARCHIVER_DATA` | `/datapool/email-archive` | Where mail archives are stored |
+| `MAIL_ARCHIVER_DATA` | `/var/lib/mail-archiver` | Where mail archives are stored |
 | `MAIL_ARCHIVER_AUTH` | `pam` | Auth mode: `pam` (system users) or `builtin` (self-registration) |
-| `MAIL_ARCHIVER_PORT` | `8400` | Listen port (only used with `app.run()`) |
+| `MAIL_ARCHIVER_PORT` | `8443` (HTTPS) / `8400` (HTTP) | Listen port |
+| `MAIL_ARCHIVER_HTTPS` | `1` | Set to `0` to disable HTTPS redirect |
+| `MAIL_ARCHIVER_CERT_DIR` | `/opt/mail-archiver/certs` | TLS certificate directory |
 | `MAIL_ARCHIVER_SECRET_FILE` | — | Path to file containing Flask secret key |
 | `MAIL_ARCHIVER_SECRET` | (random) | Flask secret key (fallback if no file) |
+
+### Changing the Data Directory
+
+```bash
+# 1. Create the new directory and set ownership
+sudo mkdir -p /your/path
+sudo chown -R mail-archiver:mail-archiver /your/path
+
+# 2. Override in systemd
+sudo systemctl edit mail-archiver
+# Add:
+#   [Service]
+#   Environment=MAIL_ARCHIVER_DATA=/your/path
+#   ReadWritePaths=/your/path
+
+# 3. If SELinux is enabled
+sudo semanage fcontext -a -t httpd_var_lib_t "/your/path(/.*)?"
+sudo restorecon -Rv /your/path
+
+# 4. Restart
+sudo systemctl restart mail-archiver
+```
 
 ## Files
 
@@ -160,12 +246,16 @@ All via environment variables:
 app.py                  # Flask application
 oauth2_microsoft.py     # Microsoft OAuth2 Authorization Code flow
 search_index.py         # SQLite FTS5 search engine
+imap_sync.py            # Cross-platform IMAP sync (imaplib stdlib)
+gunicorn.conf.py        # Gunicorn config (auto-detects HTTPS)
+generate-cert.sh        # Self-signed certificate generator
 templates/              # Jinja2 HTML templates
   login.html
   register.html
   dashboard.html
   add_account.html
   search.html           # Advanced search with filters + export
+  view_email.html       # Full email viewer with attachments
   oauth2_settings.html  # Microsoft OAuth2 configuration
 static/
   style.css             # Clean, minimal CSS

@@ -23,6 +23,17 @@ from flask import (Flask, render_template, request, redirect, url_for,
 
 app = Flask(__name__)
 
+# HTTPS redirect: when serving on 8443, redirect HTTP requests
+@app.before_request
+def _https_redirect():
+    """Redirect HTTP to HTTPS when TLS is configured."""
+    if (os.environ.get('MAIL_ARCHIVER_HTTPS') == '1'
+            and not request.is_secure
+            and request.headers.get('X-Forwarded-Proto', 'http') != 'https'):
+        from flask import redirect as _redir
+        url = request.url.replace('http://', 'https://', 1).replace(':8400', ':8443', 1)
+        return _redir(url, code=301)
+
 # Load secret key from file if specified, else env var, else random
 _secret_file = os.environ.get('MAIL_ARCHIVER_SECRET_FILE')
 if _secret_file and os.path.exists(_secret_file):

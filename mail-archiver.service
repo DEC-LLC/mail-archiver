@@ -1,19 +1,18 @@
 [Unit]
-Description=Mail Archiver Web UI
+Description=Mail Archiver Web UI (HTTPS)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/gunicorn --bind 0.0.0.0:8400 --workers 2 --timeout 120 app:app
+ExecStartPre=/opt/mail-archiver/generate-cert.sh /opt/mail-archiver/certs
+ExecStart=/usr/bin/gunicorn --config /opt/mail-archiver/gunicorn.conf.py app:app
 WorkingDirectory=/opt/mail-archiver
 Environment=MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key
 Environment=MAIL_ARCHIVER_AUTH=pam
+Environment=MAIL_ARCHIVER_HTTPS=1
+Environment=MAIL_ARCHIVER_CERT_DIR=/opt/mail-archiver/certs
 
-# Override MAIL_ARCHIVER_DATA in this drop-in:
-#   systemctl edit mail-archiver
-#   [Service]
-#   Environment=MAIL_ARCHIVER_DATA=/your/path
-#   ReadWritePaths=/your/path
+# Override data path: systemctl edit mail-archiver
 Environment=MAIL_ARCHIVER_DATA=/var/lib/mail-archiver
 
 User=mail-archiver
@@ -25,7 +24,7 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/mail-archiver /opt/mail-archiver/.secret_key
+ReadWritePaths=/var/lib/mail-archiver /opt/mail-archiver/.secret_key /opt/mail-archiver/certs
 PrivateTmp=true
 CapabilityBoundingSet=
 RestrictNamespaces=true
