@@ -8,8 +8,18 @@ ExecStart=/usr/bin/gunicorn --bind 0.0.0.0:8400 --workers 2 --timeout 120 app:ap
 WorkingDirectory=/opt/mail-archiver
 Environment=MAIL_ARCHIVER_DATA=/datapool/email-archive
 Environment=MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key
+Environment=MAIL_ARCHIVER_AUTH=pam
+User=mail-archiver
+Group=mail-archiver
 Restart=on-failure
 RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/datapool/email-archive /opt/mail-archiver/.secret_key
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

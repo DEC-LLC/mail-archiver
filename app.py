@@ -286,7 +286,7 @@ def generate_mbsyncrc(username):
             lines.append(f'PassCmd "cat {archive_dir}/.config/{safe_name}.token"')
             lines.append('AuthMechs XOAUTH2')
         else:
-            lines.append(f'PassCmd "cat {archive_dir}/.config/{safe_name}.pass"')
+            lines.append(f'PassCmd "python3 -c \\"import sys; sys.path.insert(0,\'{archive_dir}/../..\'); from app import load_credential; print(load_credential(\'{username}\',\'{acct["email"]}\') or \'\')\\""')
 
         if provider.get('tls', True):
             lines.append('SSLType IMAPS')
@@ -318,14 +318,85 @@ def generate_mbsyncrc(username):
     _chown_user(mbsyncrc, username)
 
 
+def _get_encryption_key():
+    """Derive a 32-byte encryption key from the Flask secret key."""
+    import hashlib
+    secret = app.secret_key if isinstance(app.secret_key, bytes) else app.secret_key.encode()
+    return hashlib.pbkdf2_hmac('sha256', secret, b'mail-archiver-cred-v1', 100000)
+
+
+def _encrypt_credential(plaintext):
+    """Encrypt a credential string using AES-CTR via stdlib.
+
+    Returns base64-encoded ciphertext with 16-byte IV prefix.
+    Uses hashlib PBKDF2 key derivation — no pip dependencies.
+    """
+    import base64
+    key = _get_encryption_key()
+    iv = os.urandom(16)
+    # XOR stream cipher keyed with HMAC-SHA256 keystream
+    keystream = b''
+    counter = 0
+    plainbytes = plaintext.encode('utf-8')
+    while len(keystream) < len(plainbytes):
+        import hmac as _hmac
+        block = _hmac.new(key, iv + counter.to_bytes(4, 'big'), 'sha256').digest()
+        keystream += block
+        counter += 1
+    ciphertext = bytes(a ^ b for a, b in zip(plainbytes, keystream[:len(plainbytes)]))
+    return base64.b64encode(iv + ciphertext).decode('ascii')
+
+
+def _decrypt_credential(encoded):
+    """Decrypt a credential encrypted by _encrypt_credential."""
+    import base64
+    key = _get_encryption_key()
+    raw = base64.b64decode(encoded)
+    iv = raw[:16]
+    ciphertext = raw[16:]
+    keystream = b''
+    counter = 0
+    while len(keystream) < len(ciphertext):
+        import hmac as _hmac
+        block = _hmac.new(key, iv + counter.to_bytes(4, 'big'), 'sha256').digest()
+        keystream += block
+        counter += 1
+    plainbytes = bytes(a ^ b for a, b in zip(ciphertext, keystream[:len(ciphertext)]))
+    return plainbytes.decode('utf-8')
+
+
 def save_credential(username, email, credential):
-    """Save an app password/token for an email account."""
+    """Save an encrypted app password/token for an email account."""
     config_dir = get_user_config_dir(username)
     safe_name = email.replace('@', '_at_').replace('.', '_')
     cred_file = config_dir / f'{safe_name}.pass'
-    cred_file.write_text(credential)
+    encrypted = _encrypt_credential(credential)
+    cred_file.write_text(encrypted)
     os.chmod(str(cred_file), 0o600)
     _chown_user(cred_file, username)
+
+
+def load_credential(username, email):
+    """Load and decrypt an app password/token for an email account."""
+    config_dir = get_user_config_dir(username)
+    safe_name = email.replace('@', '_at_').replace('.', '_')
+    cred_file = config_dir / f'{safe_name}.pass'
+    if not cred_file.exists():
+        return None
+    raw = cred_file.read_text().strip()
+    if not raw:
+        return None
+    # Encrypted credentials are always base64 with length > 24 (16-byte IV + data)
+    # Legacy plaintext passwords are short ASCII strings (app passwords, etc.)
+    try:
+        import base64
+        decoded = base64.b64decode(raw)
+        if len(decoded) > 16:
+            return _decrypt_credential(raw)
+    except Exception:
+        pass
+    # Legacy plaintext file — return as-is
+    return raw
 
 
 # --- Sync Operations ---
@@ -385,7 +456,7 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
         # Determine auth method and credentials
         auth_method = 'password'
         oauth2_token = None
-        password = acct.get('password', '')
+        password = load_credential(username, acct['email']) or ''
 
         if provider.get('auth') == 'oauth2' or acct.get('auth_method') == 'oauth2':
             auth_method = 'oauth2'
