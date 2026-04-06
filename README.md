@@ -1,6 +1,6 @@
 # Mail Archiver
 
-**Archive your email. Search it instantly. Read it anywhere. One app — Windows, Linux, NAS, container.**
+**Archive your email. Search it instantly. Read it anywhere. One app — Windows, Linux, NAS, container, cloud.**
 
 A self-hosted email archive with full-text search that runs on **Windows** (standalone EXE — no install needed), **Linux** (RPM/DEB), **NAS** (bare metal), or **containers**. Supports Gmail, iCloud, Outlook, Yahoo, and any IMAP server. No cloud dependencies, no subscription — install anywhere, your data stays on your hardware.
 
