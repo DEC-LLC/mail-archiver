@@ -1006,6 +1006,126 @@ TLS_MODES = [
 _ALLOWED_CERT_EXTS = {'.pem', '.crt', '.cer', '.key'}
 
 
+def _redact_middle(s, head=4, tail=4):
+    """Redact a secret for display. Short strings collapse to bullets only
+    so we never leak more than a hint. Never returns the full plaintext."""
+    if not s:
+        return ''
+    n = len(s)
+    if n <= head + tail + 2:
+        # Too short to reveal head+tail without giving up most of it —
+        # show a bullet run of the actual length instead.
+        return '•' * min(n, 20)
+    return f'{s[:head]}…{s[-tail:]}'
+
+
+def _mtime_hint(path):
+    """Human-friendly 'set N minutes/hours/days ago'."""
+    try:
+        mt = path.stat().st_mtime
+    except OSError:
+        return ''
+    age = max(0, int(time.time() - mt))
+    if age < 90:
+        return f'{age} sec ago'
+    if age < 5400:
+        return f'{age // 60} min ago'
+    if age < 172800:
+        return f'{age // 3600} hr ago'
+    return f'{age // 86400} d ago'
+
+
+def _credential_hint(username, email):
+    """State of the saved app-password / API-key for an account.
+    Returns a dict safe for template use — never plaintext."""
+    config_dir = get_user_config_dir(username)
+    safe_name = email.replace('@', '_at_').replace('.', '_')
+    cred_file = config_dir / f'{safe_name}.pass'
+    if not cred_file.exists():
+        return {'set': False, 'length': 0, 'redacted': '', 'age': ''}
+    plain = load_credential(username, email) or ''
+    return {
+        'set': True,
+        'length': len(plain),
+        'redacted': _redact_middle(plain),
+        'age': _mtime_hint(cred_file),
+    }
+
+
+def _oauth2_token_hint(username, email):
+    """State of the saved Microsoft OAuth2 tokens for an account.
+    Returns access-token head/tail, expiry, refresh-token presence."""
+    from pathlib import Path as _P
+    config_dir = _P(CONFIG['data_dir']) / username / '.config'
+    safe_name = email.replace('@', '_at_').replace('.', '_')
+    token_file = config_dir / f'{safe_name}.oauth2.json'
+    pass_file = config_dir / f'{safe_name}.token'
+    if not token_file.exists():
+        return {'authorized': False}
+    try:
+        with open(token_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {'authorized': False, 'error': 'token file unreadable'}
+    access = data.get('access_token', '')
+    refresh = data.get('refresh_token', '')
+    expires_at = int(data.get('expires_at', 0))
+    now = int(time.time())
+    if expires_at > now:
+        exp_delta = expires_at - now
+        if exp_delta < 60:
+            exp_str = f'in {exp_delta}s'
+        elif exp_delta < 3600:
+            exp_str = f'in {exp_delta // 60} min'
+        else:
+            exp_str = f'in {exp_delta // 3600} hr'
+    elif expires_at:
+        exp_str = f'{(now - expires_at) // 60} min ago (expired — will auto-refresh)'
+    else:
+        exp_str = 'unknown'
+    return {
+        'authorized': bool(access),
+        'access_redacted': _redact_middle(access),
+        'access_length': len(access),
+        'refresh_present': bool(refresh),
+        'refresh_redacted': _redact_middle(refresh) if refresh else '',
+        'expires_at': time.strftime('%Y-%m-%d %H:%M:%S',
+                                    time.localtime(expires_at)) if expires_at else '',
+        'expires_when': exp_str,
+        'scope': data.get('scope', ''),
+        'pass_file_present': pass_file.exists(),
+        'age': _mtime_hint(token_file),
+    }
+
+
+def _cert_hint(username, filename):
+    """State of an uploaded client cert or key PEM file."""
+    if not filename:
+        return {'present': False}
+    config_dir = get_user_config_dir(username)
+    path = config_dir / filename
+    if not path.exists():
+        return {'present': False, 'error': f'{filename} missing from disk'}
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return {'present': False, 'error': f'{filename} not readable'}
+    # First 12 hex chars of SHA-256 — enough to verify "same file as before"
+    # without leaking the actual key material.
+    import hashlib as _hashlib
+    try:
+        h = _hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    except OSError:
+        h = ''
+    return {
+        'present': True,
+        'filename': filename,
+        'size_bytes': size,
+        'sha256_head': h,
+        'age': _mtime_hint(path),
+    }
+
+
 def _find_account(accounts, email):
     """Return (index, account_dict) for email, or (None, None)."""
     for i, acct in enumerate(accounts):
@@ -1080,7 +1200,11 @@ def edit_account(email):
 
     return render_template('edit_account.html', account=acct,
                            provider=provider, tls_modes=TLS_MODES,
-                           providers=PROVIDERS)
+                           providers=PROVIDERS,
+                           cred_hint=_credential_hint(username, email),
+                           oauth_hint=_oauth2_token_hint(username, email),
+                           cert_hint=_cert_hint(username, acct.get('client_cert')),
+                           key_hint=_cert_hint(username, acct.get('client_key')))
 
 
 def _save_cert_upload(username, email, field, form_field, allowed_ext_hint):
@@ -1789,24 +1913,36 @@ def oauth2_settings():
     if request.method == 'POST':
         client_id = request.form.get('client_id', '').strip()
         client_secret = request.form.get('client_secret', '').strip()
-        if client_id and client_secret:
-            config = load_oauth2_config(CONFIG['data_dir'])
-            config['microsoft'] = {
-                'client_id': client_id,
-                'client_secret': client_secret,
-            }
-            save_oauth2_config(CONFIG['data_dir'], config)
-            flash('Microsoft OAuth2 credentials saved.')
+        cfg = load_oauth2_config(CONFIG['data_dir'])
+        existing = cfg.get('microsoft', {})
+        # A blank client_id clears everything (rare but valid). A blank
+        # client_secret keeps the existing one — the "leave blank to keep"
+        # hint on the form now actually matches behavior. Refuse only the
+        # true no-op cases: no client_id + no existing secret to keep.
+        if not client_id:
+            flash('Client ID is required (leave blank to clear both).')
+            return redirect(url_for('oauth2_settings'))
+        new_secret = client_secret or existing.get('client_secret', '')
+        if not new_secret:
+            flash('Client Secret is required — no existing secret to keep.')
+            return redirect(url_for('oauth2_settings'))
+        cfg['microsoft'] = {'client_id': client_id, 'client_secret': new_secret}
+        save_oauth2_config(CONFIG['data_dir'], cfg)
+        if client_secret:
+            flash('Microsoft OAuth2 credentials saved (both fields).')
         else:
-            flash('Both Client ID and Client Secret are required.')
+            flash('Client ID updated. Existing Client Secret preserved.')
         return redirect(url_for('oauth2_settings'))
 
     config = load_oauth2_config(CONFIG['data_dir'])
     ms_config = config.get('microsoft', {})
+    secret_val = ms_config.get('client_secret', '')
     return render_template('oauth2_settings.html',
                            username=session['username'],
                            client_id=ms_config.get('client_id', ''),
-                           has_secret=bool(ms_config.get('client_secret')))
+                           has_secret=bool(secret_val),
+                           secret_redacted=_redact_middle(secret_val) if secret_val else '',
+                           secret_length=len(secret_val))
 
 
 @app.route('/oauth2/authorize')

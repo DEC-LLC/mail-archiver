@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.6
+Version:        1.0.7
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -115,6 +115,36 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.7-1
+- Settings pages now show current configuration state — was previously
+  silent overwrite. Every place where a credential/secret/cert can be
+  saved now shows what's already there (redacted) so operator sees
+  BEFORE typing whether they're replacing an existing value.
+- Per-account edit page:
+    * Authentication section (OAuth): shows access-token head…tail,
+      length, expiry (relative + absolute), refresh-token presence,
+      .token file presence, scope. Warns loudly if refresh token or
+      .token file is missing (silent-sync-failure classes).
+    * Authentication section (password): shows saved-credential
+      head…tail + length + set-time. "Enter" vs "Replace" label on
+      the input.
+    * Client cert section: shows filename + size + sha256 head + upload
+      time for cert and key separately. Flags a red state if the DB
+      entry points at a file that's no longer on disk.
+- Server Settings (OAuth2) page: shows redacted client_secret hint
+  (head…tail + length) instead of just a generic "saved" indicator.
+  Warns explicitly when not configured.
+- FIX (behavior, not just UX): /oauth2/settings POST used to require
+  BOTH client_id AND client_secret to be non-empty on every submit —
+  the "leave blank to keep" hint on the form was a lie, and you
+  couldn't update the client_id without re-typing the secret. Now
+  correctly preserves the existing secret when the field is left blank.
+- Redaction rules: strings ≤ 10 chars collapse to bullet-string of the
+  actual length (never leak head/tail on short secrets). Longer strings
+  show first4…last4. Applies to all credential/token/secret displays.
+- Cert integrity display uses first 12 chars of SHA-256 — enough for
+  "same file as before" verification without leaking key material.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.6-1
 - Per-account Settings page (GH-style /account/<email>/edit) reached
   from a Settings button on every dashboard row. Consolidates every

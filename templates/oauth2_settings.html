@@ -62,8 +62,19 @@
 
                 <div class="form-group" style="margin-top:16px;">
                     <label for="client_secret">Client Secret Value</label>
+                    {% if has_secret %}
+                    <p style="margin:4px 0 8px;padding:8px 12px;background:#f0f7ff;border-left:3px solid #2196f3;border-radius:0 4px 4px 0;">
+                        <strong>Currently set:</strong>
+                        <code style="font-family:monospace;">{{ secret_redacted }}</code>
+                        <span style="color:#666;font-size:0.9em;">({{ secret_length }} chars)</span>
+                    </p>
+                    {% else %}
+                    <p style="margin:4px 0 8px;padding:8px 12px;background:#fff3cd;border-left:3px solid #ff9800;border-radius:0 4px 4px 0;color:#664d03;">
+                        <strong>Not configured.</strong> Microsoft OAuth2 sign-in will fail until you paste a secret below.
+                    </p>
+                    {% endif %}
                     <input type="password" id="client_secret" name="client_secret"
-                           placeholder="{{ '••••••• (saved)' if has_secret else 'Paste your client secret here' }}"
+                           placeholder="{{ 'Leave blank to keep the current secret' if has_secret else 'Paste your Azure app secret Value here' }}"
                            style="width:100%;font-family:monospace;">
                     {% if has_secret %}
                     <small style="color:#666;">Leave blank to keep the existing secret. Enter a new value to replace it.</small>

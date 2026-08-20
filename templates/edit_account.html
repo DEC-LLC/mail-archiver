@@ -98,9 +98,31 @@
 
             {% if account.auth_type == 'oauth2' or provider.auth == 'oauth2' %}
                 <p>This account uses <strong>Microsoft OAuth2</strong>. No password is stored locally — mbsync uses a rotating access token.</p>
+
+                {% if oauth_hint.authorized %}
+                <div style="margin:8px 0 12px;padding:10px 14px;background:#e8f5e9;border-left:3px solid #4caf50;border-radius:0 4px 4px 0;">
+                    <p style="margin:0;"><strong>Authorized.</strong> Token stored {{ oauth_hint.age }}.</p>
+                    <p style="margin:4px 0 0;font-size:0.92em;color:#555;">
+                        Access token: <code>{{ oauth_hint.access_redacted }}</code>
+                        ({{ oauth_hint.access_length }} chars),
+                        expires {{ oauth_hint.expires_when }} ({{ oauth_hint.expires_at }}).<br>
+                        Refresh token: {% if oauth_hint.refresh_present %}<code>{{ oauth_hint.refresh_redacted }}</code> — present, will auto-renew access token.{% else %}<strong style="color:#c62828;">MISSING</strong> — token will not auto-refresh; you'll need to sign in again when access expires.{% endif %}<br>
+                        {% if not oauth_hint.pass_file_present %}<strong style="color:#c62828;">.token file missing</strong> — mbsync PassCmd will fail. Click Sign in with Microsoft to regenerate.{% endif %}
+                        {% if oauth_hint.scope %}<br>Scope: <code style="font-size:0.85em;">{{ oauth_hint.scope }}</code>{% endif %}
+                    </p>
+                </div>
+                {% else %}
+                <div style="margin:8px 0 12px;padding:10px 14px;background:#fff3cd;border-left:3px solid #ff9800;border-radius:0 4px 4px 0;color:#664d03;">
+                    <strong>Not yet authorized.</strong> Click Sign in with Microsoft to grant this app IMAP access to your mailbox.
+                    {% if oauth_hint.error %}<br><small>({{ oauth_hint.error }})</small>{% endif %}
+                </div>
+                {% endif %}
+
                 <p>
-                    <a href="{{ url_for('oauth2_authorize', email=account.email) }}" class="btn btn-primary">Sign in with Microsoft</a>
+                    <a href="{{ url_for('oauth2_authorize', email=account.email) }}" class="btn btn-primary">{{ 'Re-authorize with Microsoft' if oauth_hint.authorized else 'Sign in with Microsoft' }}</a>
+                    {% if oauth_hint.authorized %}
                     <a href="{{ url_for('oauth2_refresh', email=account.email) }}" class="btn">Force Token Refresh</a>
+                    {% endif %}
                 </p>
                 <p class="help-text">
                     OAuth2 client credentials for the whole server are configured in <a href="{{ url_for('oauth2_settings') }}">Server Settings → OAuth2</a>.
@@ -108,10 +130,24 @@
             {% else %}
                 <p>Provider expects: <strong>{{ provider.auth_label or 'App Password' }}</strong>.</p>
                 <p class="help-text">{{ provider.auth_help or 'Enter the app-specific password issued by your mail provider.' }}</p>
+
+                {% if cred_hint.set %}
+                <div style="margin:8px 0 12px;padding:10px 14px;background:#e8f5e9;border-left:3px solid #4caf50;border-radius:0 4px 4px 0;">
+                    <p style="margin:0;"><strong>Currently set:</strong>
+                        <code style="font-family:monospace;">{{ cred_hint.redacted }}</code>
+                        <span style="color:#666;font-size:0.9em;">({{ cred_hint.length }} chars, saved {{ cred_hint.age }})</span>
+                    </p>
+                </div>
+                {% else %}
+                <div style="margin:8px 0 12px;padding:10px 14px;background:#fff3cd;border-left:3px solid #ff9800;border-radius:0 4px 4px 0;color:#664d03;">
+                    <strong>Not set.</strong> Sync will fail until you save a password below.
+                </div>
+                {% endif %}
+
                 <form method="post" action="{{ url_for('update_credential', email=account.email) }}">
-                    <label for="credential">{{ provider.auth_label or 'App Password' }}</label>
+                    <label for="credential">{{ 'Replace' if cred_hint.set else 'Enter' }} {{ provider.auth_label or 'App Password' }}</label>
                     <input type="password" id="credential" name="credential" required
-                           placeholder="Enter new {{ (provider.auth_label or 'App Password') | lower }}">
+                           placeholder="{{ 'Type new value to replace the current one' if cred_hint.set else 'Enter your app password' }}">
                     <div class="form-actions">
                         <button type="submit" class="btn btn-primary">Save</button>
                     </div>
@@ -132,12 +168,30 @@
                 setups. PEM format. Max 256 KiB per file.
             </p>
 
-            <p>
-                <strong>Current cert:</strong>
-                <code>{{ account.client_cert or '(none)' }}</code><br>
-                <strong>Current key:</strong>
-                <code>{{ account.client_key or '(none)' }}</code>
+            {% if cert_hint.present or key_hint.present %}
+            <div style="margin:8px 0 12px;padding:10px 14px;background:#e8f5e9;border-left:3px solid #4caf50;border-radius:0 4px 4px 0;">
+                <p style="margin:0 0 4px;"><strong>Currently uploaded:</strong></p>
+                {% if cert_hint.present %}
+                <p style="margin:2px 0;">Cert: <code>{{ cert_hint.filename }}</code>
+                    <span style="color:#666;font-size:0.9em;">({{ cert_hint.size_bytes }} bytes, sha256:{{ cert_hint.sha256_head }}…, uploaded {{ cert_hint.age }})</span>
+                </p>
+                {% elif account.client_cert %}
+                <p style="margin:2px 0;color:#c62828;">Cert: <code>{{ account.client_cert }}</code> — {{ cert_hint.error or 'file missing from disk' }}</p>
+                {% endif %}
+                {% if key_hint.present %}
+                <p style="margin:2px 0;">Key: <code>{{ key_hint.filename }}</code>
+                    <span style="color:#666;font-size:0.9em;">({{ key_hint.size_bytes }} bytes, sha256:{{ key_hint.sha256_head }}…, uploaded {{ key_hint.age }})</span>
+                </p>
+                {% elif account.client_key %}
+                <p style="margin:2px 0;color:#c62828;">Key: <code>{{ account.client_key }}</code> — {{ key_hint.error or 'file missing from disk' }}</p>
+                {% endif %}
+                <p style="margin:6px 0 0;font-size:0.9em;color:#555;">Uploading below <strong>replaces</strong> the file on disk. Only files you upload here will replace them — leave a field blank to keep the current file.</p>
+            </div>
+            {% else %}
+            <p style="margin:8px 0 12px;padding:10px 14px;background:#f5f5f5;border-left:3px solid #999;border-radius:0 4px 4px 0;color:#555;">
+                <strong>No client cert configured.</strong> Only needed for mutual-TLS IMAP servers.
             </p>
+            {% endif %}
 
             <form method="post" action="{{ url_for('upload_account_cert', email=account.email) }}"
                   enctype="multipart/form-data">
