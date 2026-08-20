@@ -21,14 +21,22 @@ Restart=on-failure
 RestartSec=5
 
 # Security hardening
-NoNewPrivileges=true
+# NOTE: NoNewPrivileges must be FALSE when MAIL_ARCHIVER_AUTH=pam (default).
+# pam_unix invokes the setuid helper /usr/sbin/unix_chkpwd (root:shadow, setgid
+# bit) to read /etc/shadow — NoNewPrivileges=true blocks setuid execution,
+# causing PAM auth to fail silently and users to hit an endless login loop.
+# For MAIL_ARCHIVER_AUTH=builtin only, you can safely set this to true via a
+# systemd drop-in override.
+NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/mail-archiver /opt/mail-archiver/.secret_key /opt/mail-archiver/certs
 PrivateTmp=true
-CapabilityBoundingSet=
+# CapabilityBoundingSet intentionally NOT emptied — pam_unix needs
+# CAP_DAC_READ_SEARCH via unix_chkpwd's setgid=shadow path.
 RestrictNamespaces=true
-RestrictSUIDSGID=true
+# RestrictSUIDSGID also disabled — pam_unix helper is setuid/setgid.
+# RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
