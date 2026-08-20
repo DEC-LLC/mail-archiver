@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.10
+Version:        1.0.11
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -118,6 +118,19 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.11-1
+- HOTFIX: NameError: 'shutil' is not defined in run_sync at the runuser
+  vs su fallback check (line ~710). Latent since 1.0.5 — the shutil
+  module was only imported inside _has_mbsync, but the 1.0.5 change
+  to swap `su` for `runuser` added a `shutil.which('runuser')` call
+  at module scope in run_sync that assumed a top-level import.
+  Every account, every provider, every sync attempt returned 500
+  the moment the user actually clicked Sync Now (all sync attempts
+  before today were blocked upstream by PAM login-loop or the OAuth
+  scope error, so nothing ever reached run_sync). Add `import shutil`
+  at module top; remove the now-redundant inline import from
+  _has_mbsync. Zero behavioral change beyond letting sync run.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.10-1
 - Add-page OAuth picker (Item 1): /account/add now shows the same
   OAuth-app dropdown that was previously only on /account/<email>/edit,

@@ -16,6 +16,7 @@ import email
 import email.policy
 import re
 import shlex
+import shutil
 import fcntl
 from pathlib import Path
 from functools import wraps
@@ -544,7 +545,6 @@ def get_sync_status(username):
 
 def _has_mbsync():
     """Check if mbsync is available on this system."""
-    import shutil
     return shutil.which('mbsync') is not None
 
 
