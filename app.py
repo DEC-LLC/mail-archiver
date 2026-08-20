@@ -18,11 +18,14 @@ import re
 import shlex
 import shutil
 import fcntl
+import threading
+import uuid
 from pathlib import Path
 from functools import wraps
 
 from flask import (Flask, render_template, request, redirect, url_for,
-                   session, flash, jsonify, abort, send_from_directory)
+                   session, flash, jsonify, abort, send_from_directory,
+                   Response)
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -1490,15 +1493,223 @@ def update_schedule(email):
     return redirect(url_for('dashboard'))
 
 
+# ----------------------------------------------------------------------
+# Background-threaded sync + SSE progress stream (1.0.14)
+# ----------------------------------------------------------------------
+# WebUI sync must not block the request for up to 3600s. Post triggers a
+# background thread, returns a job_id, and the browser opens an EventSource
+# to /api/sync/<job_id>/stream to render live per-folder / per-message
+# progress. Cron path (`python3 app.py scheduled-sync`) stays synchronous
+# via run_sync() below — no SSE needed.
+
+_SYNC_JOBS = {}
+_SYNC_JOBS_LOCK = threading.Lock()
+
+# mbsync progress line: `C: 0/1 B: 0/12 M: +0/47 *0/0 #0/0`
+#   C = channels, B = boxes (folders), M = messages,
+#   * = flag changes, # = expunges. `+N/T` = done/total.
+_MBSYNC_LINE_RE = re.compile(
+    r'C:\s*(\d+)/(\d+)\s+B:\s*(\d+)/(\d+)\s+M:\s*\+(\d+)/(\d+)'
+    r'\s+\*(\d+)/(\d+)\s+#(\d+)/(\d+)'
+)
+
+
+def _parse_mbsync_line(line):
+    m = _MBSYNC_LINE_RE.search(line)
+    if not m:
+        return None
+    (ch_d, ch_t, bx_d, bx_t,
+     m_new_d, m_new_t, m_flg_d, m_flg_t, m_exp_d, m_exp_t) = map(int, m.groups())
+    return {
+        'channels_done': ch_d, 'channels_total': ch_t,
+        'folders_done': bx_d, 'folders_total': bx_t,
+        'msg_new_done': m_new_d, 'msg_new_total': m_new_t,
+        'msg_flag_done': m_flg_d, 'msg_flag_total': m_flg_t,
+        'msg_expunge_done': m_exp_d, 'msg_expunge_total': m_exp_t,
+    }
+
+
+def _purge_old_sync_jobs():
+    cutoff = time.time() - 3600
+    with _SYNC_JOBS_LOCK:
+        for jid in [j for j, job in _SYNC_JOBS.items()
+                    if job.get('started_epoch', 0) < cutoff]:
+            _SYNC_JOBS.pop(jid, None)
+
+
+def _new_sync_job(username, target):
+    _purge_old_sync_jobs()
+    job_id = uuid.uuid4().hex
+    with _SYNC_JOBS_LOCK:
+        _SYNC_JOBS[job_id] = {
+            'job_id': job_id,
+            'username': username,
+            'target': target,
+            'state': 'starting',
+            'started_epoch': time.time(),
+            'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'progress': None,
+            'last_line': '',
+            'exit_code': None,
+            'error': None,
+            'finished': None,
+        }
+    return job_id
+
+
+def _run_sync_background(job_id, username, account_email=None):
+    """Threaded mbsync runner. Streams stderr into _SYNC_JOBS[job_id].
+    Falls back to synchronous run_sync() when mbsync isn't installed
+    (imaplib path — no line stream, single done event).
+    """
+    with _SYNC_JOBS_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+    if not job:
+        return
+    try:
+        if not _has_mbsync():
+            with _SYNC_JOBS_LOCK:
+                job['state'] = 'syncing'
+            result = run_sync(username, account_email)
+            with _SYNC_JOBS_LOCK:
+                job['state'] = 'done' if result.get('state') == 'ok' else 'error'
+                job['exit_code'] = result.get('exit_code')
+                job['error'] = result.get('error')
+                job['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            return
+
+        config_dir = get_user_config_dir(username)
+        status_file = config_dir / 'sync_status.json'
+        status = get_sync_status(username)
+        key = account_email or '__all__'
+        status[key] = {'state': 'syncing',
+                       'started': time.strftime('%Y-%m-%d %H:%M:%S')}
+        _write_sync_status_locked(status_file, status)
+
+        if account_email:
+            safe_name = account_email.replace('@', '_at_').replace('.', '_')
+            safe_name = re.sub(r'[^a-zA-Z0-9_]', '', safe_name)
+            mbsync_arg = safe_name
+        else:
+            mbsync_arg = '-a'
+
+        # Verbose mode (-V) forces mbsync to emit the C:/B:/M: progress
+        # line on every state change instead of only at end-of-run.
+        popen_kwargs = {
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.STDOUT,
+            'bufsize': 1,
+            'text': True,
+        }
+        if CONFIG['auth_mode'] == 'pam':
+            import pwd as _pwd
+            try:
+                pw = _pwd.getpwnam(username)
+            except KeyError:
+                raise ValueError(
+                    f'PAM user {username!r} not present on this host — '
+                    f'cannot run mbsync as that identity')
+            cmd = ['mbsync', '-V', mbsync_arg]
+            popen_kwargs.update({
+                'user':  pw.pw_uid,
+                'group': pw.pw_gid,
+                'cwd':   pw.pw_dir,
+                'env': {
+                    'HOME':    pw.pw_dir,
+                    'USER':    username,
+                    'LOGNAME': username,
+                    'SHELL':   pw.pw_shell or '/bin/sh',
+                    'PATH':    '/usr/local/sbin:/usr/local/bin:'
+                               '/usr/sbin:/usr/bin:/sbin:/bin',
+                },
+            })
+        else:
+            archive_dir = Path(CONFIG['data_dir']) / username
+            rc = archive_dir / '.mbsyncrc'
+            cmd = ['mbsync', '-V', '-c', str(rc), mbsync_arg]
+
+        with _SYNC_JOBS_LOCK:
+            job['state'] = 'syncing'
+        started = time.time()
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        tail_lines = []
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip('\n')
+                tail_lines.append(line)
+                if len(tail_lines) > 200:
+                    tail_lines.pop(0)
+                parsed = _parse_mbsync_line(line)
+                with _SYNC_JOBS_LOCK:
+                    job['last_line'] = line
+                    if parsed:
+                        job['progress'] = parsed
+        finally:
+            proc.wait()
+
+        duration = int(time.time() - started)
+        raw_tail = '\n'.join(tail_lines[-20:])
+        with _SYNC_JOBS_LOCK:
+            job['exit_code'] = proc.returncode
+            job['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            job['duration_s'] = duration
+            if proc.returncode == 0:
+                job['state'] = 'done'
+                status[key] = {
+                    'state': 'ok',
+                    'finished': job['finished'],
+                    'exit_code': 0,
+                    'error': '',
+                }
+            else:
+                friendly = friendly_sync_error(raw_tail, account_email or '')
+                job['state'] = 'error'
+                job['error'] = friendly
+                status[key] = {
+                    'state': 'error',
+                    'finished': job['finished'],
+                    'exit_code': proc.returncode,
+                    'error': friendly,
+                    'raw_error': raw_tail,
+                }
+
+        _write_sync_status_locked(status_file, status)
+        _chown_user(status_file, username)
+
+        if status[key].get('state') == 'ok':
+            try:
+                from search_index import index_maildir
+                index_maildir(username, CONFIG['data_dir'],
+                              account_filter=account_email)
+            except Exception:
+                pass
+    except Exception as e:
+        with _SYNC_JOBS_LOCK:
+            job['state'] = 'error'
+            job['error'] = str(e)
+            job['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _wants_json():
+    return ('application/json' in request.headers.get('Accept', '')
+            or request.headers.get('X-Requested-With', '') == 'XMLHttpRequest')
+
+
 @app.route('/sync', methods=['POST'])
 @login_required
 def sync_all():
     username = session['username']
-    result = run_sync(username)
-    if result['state'] == 'ok':
-        flash('Sync completed successfully.')
-    else:
-        flash(f'Sync failed: {result.get("error", "unknown error")}')
+    job_id = _new_sync_job(username, '__all__')
+    t = threading.Thread(target=_run_sync_background,
+                         args=(job_id, username, None), daemon=True)
+    t.start()
+    if _wants_json():
+        return jsonify({
+            'job_id': job_id,
+            'stream_url': url_for('sync_job_stream', job_id=job_id),
+            'status_url': url_for('sync_job_status', job_id=job_id),
+        }), 202
+    flash('Sync started for all accounts.')
     return redirect(url_for('dashboard'))
 
 
@@ -1506,12 +1717,104 @@ def sync_all():
 @login_required
 def sync_account(email):
     username = session['username']
-    result = run_sync(username, email)
-    if result['state'] == 'ok':
-        flash(f'Sync for {email} completed successfully.')
-    else:
-        flash(f'Sync for {email} failed: {result.get("error", "unknown error")}')
+    job_id = _new_sync_job(username, email)
+    t = threading.Thread(target=_run_sync_background,
+                         args=(job_id, username, email), daemon=True)
+    t.start()
+    if _wants_json():
+        return jsonify({
+            'job_id': job_id,
+            'stream_url': url_for('sync_job_stream', job_id=job_id),
+            'status_url': url_for('sync_job_status', job_id=job_id),
+        }), 202
+    flash(f'Sync started for {email}.')
     return redirect(url_for('dashboard'))
+
+
+@app.route('/api/sync/<job_id>')
+@login_required
+def sync_job_status(job_id):
+    with _SYNC_JOBS_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+        if not job or job['username'] != session['username']:
+            return jsonify({'error': 'not_found'}), 404
+        return jsonify({
+            'job_id': job_id,
+            'state': job['state'],
+            'target': job['target'],
+            'started': job['started'],
+            'finished': job.get('finished'),
+            'exit_code': job.get('exit_code'),
+            'error': job.get('error'),
+            'progress': job.get('progress'),
+            'last_line': job.get('last_line'),
+        })
+
+
+@app.route('/api/sync/<job_id>/stream')
+@login_required
+def sync_job_stream(job_id):
+    with _SYNC_JOBS_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+        if not job or job['username'] != session['username']:
+            return jsonify({'error': 'not_found'}), 404
+
+    def event_stream():
+        last_progress = None
+        last_heartbeat = time.time()
+        stream_start = time.time()
+        while True:
+            with _SYNC_JOBS_LOCK:
+                current = _SYNC_JOBS.get(job_id)
+                if not current:
+                    yield 'event: error\ndata: {"error":"job_gone"}\n\n'
+                    return
+                state = current['state']
+                progress = current.get('progress')
+                error = current.get('error')
+                exit_code = current.get('exit_code')
+                last_line = current.get('last_line')
+                finished = current.get('finished')
+
+            if progress and progress != last_progress:
+                last_progress = progress
+                yield ('event: progress\ndata: '
+                       + json.dumps({'progress': progress,
+                                     'last_line': last_line})
+                       + '\n\n')
+
+            if state == 'done':
+                yield ('event: done\ndata: '
+                       + json.dumps({'exit_code': exit_code,
+                                     'finished': finished,
+                                     'last_line': last_line,
+                                     'progress': progress})
+                       + '\n\n')
+                return
+            if state == 'error':
+                yield ('event: error\ndata: '
+                       + json.dumps({'error': error,
+                                     'exit_code': exit_code,
+                                     'finished': finished,
+                                     'last_line': last_line})
+                       + '\n\n')
+                return
+
+            now = time.time()
+            if now - last_heartbeat >= 5:
+                last_heartbeat = now
+                yield 'event: ping\ndata: {}\n\n'
+
+            if now - stream_start > 3500:
+                yield 'event: timeout\ndata: {"error":"stream_capped"}\n\n'
+                return
+
+            time.sleep(0.5)
+
+    resp = Response(event_stream(), mimetype='text/event-stream')
+    resp.headers['Cache-Control'] = 'no-cache'
+    resp.headers['X-Accel-Buffering'] = 'no'
+    return resp
 
 
 @app.route('/api/status')

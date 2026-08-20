@@ -38,5 +38,29 @@ done
 
 systemctl daemon-reload
 
+# Regenerate ~/.mbsyncrc for every provisioned user under the effective
+# MAIL_ARCHIVER_DATA path. The PassCmd format has churned across 1.0.10
+# (helper script) and 1.0.13 (subprocess kwargs) — stale cached mbsyncrc
+# files silently break sync after upgrade until an operator opens each
+# account's edit page. This closes the class of bug.
+EFFECTIVE_DATA=$(systemctl show mail-archiver -p Environment --value 2>/dev/null \
+    | tr ' ' '\n' | grep '^MAIL_ARCHIVER_DATA=' | tail -1 | cut -d= -f2-)
+[ -z "$EFFECTIVE_DATA" ] && EFFECTIVE_DATA=/var/lib/mail-archiver
+if [ -d "$EFFECTIVE_DATA" ]; then
+    for ACCT in "$EFFECTIVE_DATA"/*/.config/accounts.json; do
+        [ -f "$ACCT" ] || continue
+        USR=$(echo "$ACCT" | awk -F/ '{print $(NF-2)}')
+        cd /opt/mail-archiver && MAIL_ARCHIVER_DATA="$EFFECTIVE_DATA" \
+            MAIL_ARCHIVER_AUTH=pam \
+            MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key \
+            python3 -c "import app; app.generate_mbsyncrc('$USR')" 2>/dev/null || true
+    done
+fi
+
+# Restart if already running so new gunicorn config + code take effect
+if systemctl is-active --quiet mail-archiver; then
+    systemctl restart mail-archiver || true
+fi
+
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
 echo "Then: systemctl enable --now mail-archiver"

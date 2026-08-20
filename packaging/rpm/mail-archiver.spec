@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.13
+Version:        1.0.14
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -10,6 +10,10 @@ Requires:       python3-flask
 Requires:       python3-gunicorn
 Requires:       isync
 Requires:       python3-pam
+# XOAUTH2 SASL plugin — Microsoft Exchange IMAP requires it. Rocky/RHEL
+# gets it via EPEL as cyrus-sasl-xoauth2. Weak dep so install still
+# proceeds on hosts without EPEL (personal accounts still work).
+Recommends:     cyrus-sasl-xoauth2
 
 %description
 Mail Archiver is a self-hosted email archive with full-text search.
@@ -108,6 +112,29 @@ for U in $(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /nologin|f
 done
 
 systemctl daemon-reload
+
+# Regenerate ~/.mbsyncrc for every provisioned user under the effective
+# MAIL_ARCHIVER_DATA path. Stale cached mbsyncrc files (PassCmd format
+# churn across 1.0.10 / 1.0.13) silently break sync after upgrade —
+# this closes the class of bug at install time.
+EFFECTIVE_DATA=$(systemctl show mail-archiver -p Environment --value 2>/dev/null \
+    | tr ' ' '\n' | grep '^MAIL_ARCHIVER_DATA=' | tail -1 | cut -d= -f2-)
+[ -z "$EFFECTIVE_DATA" ] && EFFECTIVE_DATA=/var/lib/mail-archiver
+if [ -d "$EFFECTIVE_DATA" ]; then
+    for ACCT in "$EFFECTIVE_DATA"/*/.config/accounts.json; do
+        [ -f "$ACCT" ] || continue
+        USR=$(echo "$ACCT" | awk -F/ '{print $(NF-2)}')
+        cd /opt/mail-archiver && MAIL_ARCHIVER_DATA="$EFFECTIVE_DATA" \
+            MAIL_ARCHIVER_AUTH=pam \
+            MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key \
+            python3 -c "import app; app.generate_mbsyncrc('$USR')" 2>/dev/null || true
+    done
+fi
+
+if systemctl is-active --quiet mail-archiver; then
+    systemctl restart mail-archiver || true
+fi
+
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
 echo "Then: systemctl enable --now mail-archiver"
 
@@ -118,6 +145,38 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.14-1
+- SSE progress stream: Sync Now + Sync All are now fire-and-poll —
+  POST returns 202 with a job_id, and the browser opens an EventSource
+  to /api/sync/<job_id>/stream which emits parsed mbsync progress
+  (folders_done/total, msg_new_done/total) as `progress` events and
+  a final `done`/`error` event. mbsync stderr is verbose-mode piped
+  through subprocess.Popen and parsed via the canonical C: B: M:
+  format regex. Heartbeat every 5s. Dashboard grew inline per-account
+  progress bar + refresh link. Cron path (`python3 app.py
+  scheduled-sync`) stays synchronous — cron doesn't need SSE.
+- gunicorn worker class → gthread with account-scaled threads.
+  Formula: max(base, min(cap, base + total_accounts)) where base=4,
+  cap=24. Env overrides MAIL_ARCHIVER_WORKERS,
+  MAIL_ARCHIVER_THREADS_BASE, MAIL_ARCHIVER_THREADS_MAX. Rationale:
+  each concurrent SSE stream holds one thread for the sync duration;
+  each UI page load uses one for <1s. 10 accounts + 4 users clicking
+  around → 14 thread slots wanted; formula gives 14. Startup log
+  emits `gunicorn: workers=N threads=M (accounts=A, base=B, cap=C)`
+  so operators can see the resolved value in journalctl.
+- Add cyrus-sasl-xoauth2 as a Recommends dep (Rocky/EPEL). Microsoft
+  Exchange IMAP requires XOAUTH2 SASL mechanism; without the plugin
+  mbsync fails with "selected: XOAUTH2 available: SCRAM/PLAIN/...".
+  DEB counterpart is libsasl2-modules-kdexoauth2 (already added to
+  Depends in DEBIAN/control this release).
+- Postinst regenerates ~/.mbsyncrc for every user with an existing
+  accounts.json under the effective MAIL_ARCHIVER_DATA. Kills the
+  class of "stale cached mbsyncrc silently breaks sync after
+  upgrade" bugs (bit us with 1.0.10 helper switch and 1.0.13
+  subprocess switch — users only saw sync failures next time they
+  clicked Sync Now, hours or days later). Also restarts the service
+  when already active so new gunicorn config + code take effect.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.13-1
 - Kernel-level setuid via subprocess kwargs — no more su/runuser wrapper.
   Ends the ping-pong (1.0.5 su→runuser fallback, 1.0.12 fixed runuser

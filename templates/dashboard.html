@@ -5,6 +5,40 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Mail Archiver — {{ username }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+    .sync-progress {
+        margin: 0.5rem 0;
+        padding: 0.5rem 0.75rem;
+        background: #f6f7f9;
+        border: 1px solid #d6d9de;
+        border-radius: 4px;
+        font-size: 0.85rem;
+        line-height: 1.4;
+    }
+    .sync-progress.hidden { display: none; }
+    .sync-progress.error { background: #fbe9e7; border-color: #d84315; }
+    .sync-progress.done  { background: #e8f5e9; border-color: #388e3c; }
+    .sync-progress-bar {
+        height: 6px;
+        background: #d6d9de;
+        border-radius: 3px;
+        overflow: hidden;
+        margin-top: 0.35rem;
+    }
+    .sync-progress-bar > div {
+        height: 100%;
+        background: #388e3c;
+        transition: width 0.3s ease;
+    }
+    .sync-progress .last-line {
+        font-family: monospace;
+        color: #555;
+        margin-top: 0.25rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    </style>
 </head>
 <body>
     <div class="container">
@@ -32,11 +66,11 @@
             <a href="{{ url_for('add_account') }}" class="btn btn-primary">Add Email Account</a>
             {% if accounts %}
             <a href="{{ url_for('search') }}" class="btn">Search Archive</a>
-            <form method="post" action="{{ url_for('sync_all') }}" style="display:inline">
-                <button type="submit" class="btn">Sync All</button>
-            </form>
+            <button type="button" class="btn sync-all-btn">Sync All</button>
             {% endif %}
         </div>
+
+        <div id="sync-all-status" class="sync-progress hidden" data-target="__all__"></div>
 
         {% if not accounts %}
         <div class="empty-state">
@@ -81,10 +115,10 @@
                 </div>
                 {% endif %}
 
+                <div class="sync-progress hidden" data-target="{{ acct.email }}"></div>
+
                 <div class="account-actions">
-                    <form method="post" action="{{ url_for('sync_account', email=acct.email) }}" style="display:inline">
-                        <button type="submit" class="btn btn-small" {% if not acct.enabled %}disabled{% endif %}>Sync Now</button>
-                    </form>
+                    <button type="button" class="btn btn-small sync-now-btn" data-email="{{ acct.email }}" {% if not acct.enabled %}disabled{% endif %}>Sync Now</button>
                     <form method="post" action="{{ url_for('toggle_account', email=acct.email) }}" style="display:inline">
                         <button type="submit" class="btn btn-small">{{ 'Enable' if not acct.enabled else 'Disable' }}</button>
                     </form>
@@ -121,6 +155,110 @@
     </div>
 
     <script>
+    // ------------------------------------------------------------------
+    // Live sync progress via Server-Sent Events (1.0.14)
+    // ------------------------------------------------------------------
+    function renderProgress(panel, msg) {
+        var p = msg.progress || {};
+        var totalMsgs = (p.msg_new_total || 0) + (p.msg_flag_total || 0);
+        var doneMsgs  = (p.msg_new_done  || 0) + (p.msg_flag_done  || 0);
+        var pct = totalMsgs ? Math.floor(100 * doneMsgs / totalMsgs) : 0;
+        var line = 'Syncing ';
+        if (p.folders_total) {
+            line += 'folder ' + p.folders_done + '/' + p.folders_total + ' — ';
+        }
+        if (p.msg_new_total) {
+            line += (p.msg_new_done || 0) + '/' + p.msg_new_total + ' new messages';
+        } else {
+            line += 'starting…';
+        }
+        panel.innerHTML =
+            '<div class="sync-progress-line">' + line + '</div>' +
+            '<div class="sync-progress-bar"><div style="width:' + pct + '%"></div></div>' +
+            (msg.last_line ? '<div class="last-line">' + msg.last_line + '</div>' : '');
+    }
+
+    function renderDone(panel, msg, isAll, target) {
+        panel.classList.add('done');
+        var label = isAll ? 'All accounts' : target;
+        panel.innerHTML =
+            '<div>Sync completed for ' + label +
+            ' (exit ' + (msg.exit_code === 0 ? 'ok' : msg.exit_code) + ')' +
+            (msg.finished ? ' at ' + msg.finished : '') + '.</div>' +
+            '<div style="margin-top:0.35rem">' +
+              '<a href="" onclick="window.location.reload();return false;">Refresh</a>' +
+            '</div>';
+    }
+
+    function renderError(panel, msg, isAll, target) {
+        panel.classList.add('error');
+        var label = isAll ? 'all accounts' : target;
+        panel.innerHTML =
+            '<div><strong>Sync failed for ' + label + '</strong></div>' +
+            (msg.error ? '<div>' + msg.error + '</div>' : '') +
+            (msg.last_line ? '<div class="last-line">' + msg.last_line + '</div>' : '');
+    }
+
+    function startSync(url, panel, target) {
+        panel.classList.remove('hidden', 'error', 'done');
+        panel.innerHTML = '<div>Starting sync…</div>';
+        var isAll = target === '__all__';
+        fetch(url, {
+            method: 'POST',
+            headers: {'Accept': 'application/json',
+                      'X-Requested-With': 'XMLHttpRequest'},
+        }).then(function (r) {
+            if (r.status !== 202) throw new Error('HTTP ' + r.status);
+            return r.json();
+        }).then(function (job) {
+            var es = new EventSource(job.stream_url);
+            es.addEventListener('progress', function (ev) {
+                try { renderProgress(panel, JSON.parse(ev.data)); } catch (e) {}
+            });
+            es.addEventListener('done', function (ev) {
+                try { renderDone(panel, JSON.parse(ev.data), isAll, target); }
+                catch (e) { renderDone(panel, {}, isAll, target); }
+                es.close();
+            });
+            es.addEventListener('error', function (ev) {
+                // Distinguish transport error (no ev.data) from server-emitted 'error' event
+                if (ev.data) {
+                    try { renderError(panel, JSON.parse(ev.data), isAll, target); }
+                    catch (e) { renderError(panel, {error: 'stream ended'}, isAll, target); }
+                } else if (es.readyState === EventSource.CLOSED) {
+                    renderError(panel, {error: 'connection lost'}, isAll, target);
+                }
+                es.close();
+            });
+            es.addEventListener('ping', function () { /* keepalive */ });
+            es.addEventListener('timeout', function () {
+                renderError(panel, {error: 'stream timed out (>1h)'}, isAll, target);
+                es.close();
+            });
+        }).catch(function (e) {
+            renderError(panel, {error: 'Could not start sync: ' + e.message},
+                        isAll, target);
+        });
+    }
+
+    document.addEventListener('click', function (e) {
+        var btn = e.target.closest('.sync-now-btn');
+        if (btn && !btn.disabled) {
+            var email = btn.dataset.email;
+            var panel = document.querySelector(
+                '.sync-progress[data-target="' + email.replace(/"/g,'\\"') + '"]');
+            if (panel) {
+                startSync('/sync/' + encodeURIComponent(email), panel, email);
+            }
+            return;
+        }
+        var allBtn = e.target.closest('.sync-all-btn');
+        if (allBtn && !allBtn.disabled) {
+            var panelAll = document.getElementById('sync-all-status');
+            if (panelAll) startSync('/sync', panelAll, '__all__');
+        }
+    });
+
     function scheduleChanged(sel) {
         if (sel.value === 'manual') {
             if (!confirm(
