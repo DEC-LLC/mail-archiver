@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.8
+Version:        1.0.9
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -115,6 +115,19 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.9-1
+- HOTFIX (OAuth completion blocker for personal Microsoft accounts):
+  Change IMAP scope from https://outlook.office365.com/... to
+  https://outlook.office.com/... (drop the "365"). The .office365.com
+  variant is work/school-tenant-only; Azure rejects it with
+  "The provided resource value for the input parameter 'scope' is not
+  valid" for any personal MSA (hotmail.com/outlook.com/live.com).
+  The .office.com variant is the unified endpoint accepted by both
+  personal + work/school flows. Blocks OAuth token exchange until fixed
+  — no accounts have ever successfully completed the flow with the old
+  scope (both pnas hosts had zero .oauth2.json / .token files despite
+  multiple sign-in attempts since the OAuth flow was wired 4+ months ago).
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.8-1
 - OAuth Apps management: registered Azure apps are now named + reusable
   at two scopes (server-wide + per-user), with per-provider defaults and

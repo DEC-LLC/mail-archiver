@@ -27,9 +27,17 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 
-# Scopes for IMAP access — provider-fixed for Microsoft
+# Scopes for IMAP access — provider-fixed for Microsoft.
+#
+# CRITICAL: use `outlook.office.com` (NOT `outlook.office365.com`).
+# The `.office365.com` variant is work/school-only — Azure rejects it with
+# "The provided resource value for the input parameter 'scope' is not valid"
+# when a personal Microsoft account (hotmail.com/outlook.com/live.com) tries
+# to authorize. The `.office.com` variant is the unified endpoint that
+# accepts BOTH personal MSA + work/school accounts, so it's the correct
+# default for a Mail Archiver serving mixed account types via tenant=common.
 SCOPES = [
-    'https://outlook.office365.com/IMAP.AccessAsUser.All',
+    'https://outlook.office.com/IMAP.AccessAsUser.All',
     'offline_access',
     'openid',
     'email',
