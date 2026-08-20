@@ -17,6 +17,9 @@ Environment=MAIL_ARCHIVER_DATA=/var/lib/mail-archiver
 
 User=mail-archiver
 Group=mail-archiver
+# shadow: needed for PAM auth (pam_unix reads /etc/shadow via setgid=shadow
+# helper unix_chkpwd). Backup path in case setgid execution is blocked.
+SupplementaryGroups=shadow
 Restart=on-failure
 RestartSec=5
 
@@ -32,8 +35,14 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/mail-archiver /opt/mail-archiver/.secret_key /opt/mail-archiver/certs
 PrivateTmp=true
-# CapabilityBoundingSet intentionally NOT emptied — pam_unix needs
-# CAP_DAC_READ_SEARCH via unix_chkpwd's setgid=shadow path.
+# Cap set needed for PAM auth mode:
+#   CAP_CHOWN            — app.py _chown_user() sets ownership of per-user
+#                          config dirs on first login (user's uid/gid)
+#   CAP_DAC_READ_SEARCH  — pam_unix reads /etc/shadow (backup path if setgid
+#                          via unix_chkpwd is denied)
+#   CAP_SETUID/SETGID    — pam_unix's account-phase seteuid/setegid calls
+CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_CHOWN CAP_DAC_READ_SEARCH
 RestrictNamespaces=true
 # RestrictSUIDSGID also disabled — pam_unix helper is setuid/setgid.
 # RestrictSUIDSGID=true
