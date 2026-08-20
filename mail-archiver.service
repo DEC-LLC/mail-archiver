@@ -47,9 +47,11 @@ PrivateTmp=true
 #   CAP_DAC_OVERRIDE    — write per-user ~/.mbsyncrc into another user's home
 #   CAP_DAC_READ_SEARCH — pam_unix reads /etc/shadow (backup path if setgid
 #                         via unix_chkpwd is denied by kernel)
+#   CAP_FOWNER          — chmod/utime on per-user accounts.json (owned by
+#                         PAM user, not by mail-archiver service user)
 #   CAP_SETUID/SETGID   — pam_unix account-phase seteuid/setegid
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
-AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
 RestrictNamespaces=true
 # RestrictSUIDSGID left disabled — pam_unix helper is setuid/setgid.
 # RestrictSUIDSGID=true
