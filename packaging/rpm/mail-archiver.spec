@@ -9,6 +9,7 @@ BuildArch:      noarch
 Requires:       python3-flask
 Requires:       python3-gunicorn
 Requires:       isync
+Requires:       python3-pam
 
 %description
 Mail Archiver is a self-hosted email archive with full-text search.
