@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.11
+Version:        1.0.12
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -118,6 +118,17 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.12-1
+- HOTFIX: `runuser -u <user> -s /bin/sh -- mbsync ...` errors with
+  "options --{shell,fast,command,session-command,login} and --user
+  are mutually exclusive". runuser(1) forbids combining -u/--user
+  with -s/--shell (unlike su). With -u, args after `--` are exec'd
+  directly with no shell — no -s needed. Drop -s /bin/sh from the
+  runuser branch; leave the su fallback branch untouched (su uses
+  -s to force /bin/sh over the target user's login shell). Also
+  removes any residual shlex concern about mbsync_arg since it's
+  now a distinct argv element, not a shell string.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.11-1
 - HOTFIX: NameError: 'shutil' is not defined in run_sync at the runuser
   vs su fallback check (line ~710). Latent since 1.0.5 — the shutil

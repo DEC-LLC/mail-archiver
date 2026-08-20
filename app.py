@@ -709,8 +709,12 @@ def run_sync(username, account_email=None):
             # Fall back to su if runuser isn't installed.
             runner = 'runuser' if shutil.which('runuser') else 'su'
             if runner == 'runuser':
-                cmd = ['runuser', '-u', username, '-s', '/bin/sh', '--',
-                       'mbsync', mbsync_arg]
+                # `runuser -u <user> -- CMD [ARGS]` exec's directly, no
+                # shell. Cannot combine -u with -s/--shell — mutually
+                # exclusive per runuser(1). Passing mbsync as a distinct
+                # argv element (not a shell string) also removes any
+                # shell-quoting concerns about mbsync_arg.
+                cmd = ['runuser', '-u', username, '--', 'mbsync', mbsync_arg]
             else:
                 cmd = ['su', '-s', '/bin/sh', '-', username, '-c',
                        f'mbsync {shlex.quote(mbsync_arg)}']
