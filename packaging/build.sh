@@ -28,9 +28,12 @@ mkdir -p "$RPMBUILD_DIR"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
 cp "$SRC_DIR/app.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/search_index.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/oauth2_microsoft.py" "$RPMBUILD_DIR/SOURCES/"
+cp "$SRC_DIR/imap_sync.py" "$RPMBUILD_DIR/SOURCES/" 2>/dev/null || true
 cp -r "$SRC_DIR/templates" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/static" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/mail-archiver.service" "$RPMBUILD_DIR/SOURCES/"
+cp "$SRC_DIR/gunicorn.conf.py" "$RPMBUILD_DIR/SOURCES/"
+cp "$SRC_DIR/generate-cert.sh" "$RPMBUILD_DIR/SOURCES/"
 
 # Copy spec (substitute Version/Release from the single source of truth)
 sed -e "s/^Version:.*/Version:        $VERSION/" \
@@ -69,6 +72,10 @@ mkdir -p "$DEB_PKG/DEBIAN"
 cp "$SRC_DIR/app.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/search_index.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/oauth2_microsoft.py" "$DEB_PKG/opt/mail-archiver/"
+cp "$SRC_DIR/imap_sync.py" "$DEB_PKG/opt/mail-archiver/" 2>/dev/null || true
+cp "$SRC_DIR/gunicorn.conf.py" "$DEB_PKG/opt/mail-archiver/"
+cp "$SRC_DIR/generate-cert.sh" "$DEB_PKG/opt/mail-archiver/"
+chmod 0755 "$DEB_PKG/opt/mail-archiver/generate-cert.sh"
 cp "$SRC_DIR/templates/"*.html "$DEB_PKG/opt/mail-archiver/templates/"
 cp "$SRC_DIR/static/"*.css "$DEB_PKG/opt/mail-archiver/static/"
 cp "$SRC_DIR/mail-archiver.service" "$DEB_PKG/etc/systemd/system/"

@@ -174,7 +174,12 @@ def builtin_create_user(username, password):
 def pam_authenticate(username, password):
     """Authenticate user via PAM. Returns True/False."""
     try:
-        import PAM
+        # Debian ships uppercase PAM module in python3-pam; Rocky/RHEL/Fedora
+        # python3-pam ships lowercase pam. Try both so the same wheel works.
+        try:
+            import PAM
+        except ImportError:
+            import pam as PAM  # type: ignore
 
         def pam_conv(auth, query_list, userData):
             resp = []
@@ -566,8 +571,18 @@ def run_sync(username, account_email=None):
             mbsync_arg = '-a'
 
         if CONFIG['auth_mode'] == 'pam':
-            cmd = ['su', '-', username, '-c',
-                   f'mbsync {shlex.quote(mbsync_arg)}']
+            # Use runuser instead of su — su prompts for target user's password
+            # when the caller isn't root (the WebUI-triggered sync path runs as
+            # mail-archiver, not root, unlike the cron path). runuser skips the
+            # password prompt when the caller has CAP_SETUID (which we do).
+            # Fall back to su if runuser isn't installed.
+            runner = 'runuser' if shutil.which('runuser') else 'su'
+            if runner == 'runuser':
+                cmd = ['runuser', '-u', username, '-s', '/bin/sh', '--',
+                       'mbsync', mbsync_arg]
+            else:
+                cmd = ['su', '-s', '/bin/sh', '-', username, '-c',
+                       f'mbsync {shlex.quote(mbsync_arg)}']
         else:
             rc = archive_dir / '.mbsyncrc'
             cmd = ['mbsync', '-c', str(rc), mbsync_arg]
@@ -858,6 +873,25 @@ def add_account():
         maildir = Path(CONFIG['data_dir']) / username / safe_name
         maildir.mkdir(parents=True, exist_ok=True)
         _chown_user(maildir, username)
+
+        # OAuth2 accounts have no password to store — jump straight to the
+        # Microsoft consent flow so the user isn't left staring at a "no
+        # button to sign in" dashboard. Only redirect if OAuth is
+        # configured; otherwise fall through with a helpful flash.
+        if provider_info['auth'] == 'oauth2':
+            try:
+                from oauth2_microsoft import load_oauth2_config
+                cfg = load_oauth2_config(CONFIG['data_dir']).get('microsoft', {})
+                if cfg.get('client_id') and cfg.get('client_secret'):
+                    flash(f'Added {email}. Signing in with Microsoft…')
+                    return redirect(url_for('oauth2_authorize', email=email))
+                flash(f'Added {email}. Configure Microsoft OAuth2 credentials '
+                      f'in Settings → OAuth2, then click "Sign in with '
+                      f'Microsoft" on the account row.')
+            except Exception:
+                flash(f'Added {email}. OAuth2 config not readable — check '
+                      f'Settings → OAuth2.')
+            return redirect(url_for('dashboard'))
 
         flash(f'Added {email}. You can now sync it.')
         return redirect(url_for('dashboard'))

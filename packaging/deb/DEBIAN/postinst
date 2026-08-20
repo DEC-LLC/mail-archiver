@@ -1,14 +1,40 @@
 #!/bin/bash
 set -e
 
-# Generate secret key if not present
+# Service user + group
+getent group mail-archiver >/dev/null || groupadd -r mail-archiver
+getent passwd mail-archiver >/dev/null || \
+    useradd -r -g mail-archiver -d /var/lib/mail-archiver -s /usr/sbin/nologin \
+            -c "Mail Archiver service" mail-archiver
+
+# Secret key — group-readable so mbsync PassCmd running AS the target user
+# (who is in mail-archiver group per the loop at the bottom) can decrypt
+# per-user IMAP credentials.
 if [ ! -f /opt/mail-archiver/.secret_key ]; then
     python3 -c "import secrets; print(secrets.token_hex(32))" > /opt/mail-archiver/.secret_key
-    chmod 600 /opt/mail-archiver/.secret_key
 fi
+chown root:mail-archiver /opt/mail-archiver/.secret_key
+chmod 0640 /opt/mail-archiver/.secret_key
 
-# Create default data directory
+# Certs dir writable by service user
+mkdir -p /opt/mail-archiver/certs
+chown mail-archiver:mail-archiver /opt/mail-archiver/certs
+chmod 0750 /opt/mail-archiver/certs
+
+# Cron log preseed
+touch /var/log/mail-archiver-sync.log
+chown root:mail-archiver /var/log/mail-archiver-sync.log
+chmod 0640 /var/log/mail-archiver-sync.log
+
+# Default data root (do not overwrite operator-chosen MAIL_ARCHIVER_DATA)
 mkdir -p /var/lib/mail-archiver 2>/dev/null || true
+
+# Add all local human users to mail-archiver group so mbsync PassCmd can
+# read the shared secret key. Additive — never removes memberships.
+for U in $(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /nologin|false/ {print $1}'); do
+    id -nG "$U" 2>/dev/null | tr ' ' '\n' | grep -qx mail-archiver && continue
+    usermod -aG mail-archiver "$U" 2>/dev/null || true
+done
 
 systemctl daemon-reload
 

@@ -136,9 +136,29 @@ class MicrosoftOAuth2:
 
 
 def save_oauth2_tokens(data_dir: str, username: str, email: str, tokens: dict):
-    """Save OAuth2 tokens for an account."""
+    """Save OAuth2 tokens for an account.
+
+    In PAM mode the .token file is read by mbsync running AS THE TARGET USER
+    via PassCmd — so token_file, pass_file, AND the parent .config/ dir must
+    be owned by that user or mbsync sees EACCES and silently auths with an
+    empty password. Chown here (best-effort; if the target uid can't be
+    resolved, files stay owned by mail-archiver and the operator will need
+    to fix ownership by hand).
+    """
+    import os, pwd
     config_dir = Path(data_dir) / username / '.config'
     config_dir.mkdir(parents=True, exist_ok=True)
+
+    target_uid = target_gid = None
+    try:
+        pw = pwd.getpwnam(username)
+        target_uid, target_gid = pw.pw_uid, pw.pw_gid
+        try:
+            os.chown(config_dir, target_uid, target_gid)
+        except (PermissionError, OSError):
+            pass
+    except KeyError:
+        pass
 
     safe_name = email.replace('@', '_at_').replace('.', '_')
     token_file = config_dir / f'{safe_name}.oauth2.json'
@@ -154,6 +174,11 @@ def save_oauth2_tokens(data_dir: str, username: str, email: str, tokens: dict):
     with open(token_file, 'w') as f:
         json.dump(token_data, f, indent=2)
     token_file.chmod(0o600)
+    if target_uid is not None:
+        try:
+            os.chown(token_file, target_uid, target_gid)
+        except (PermissionError, OSError):
+            pass
 
     # Also write the access token to the .token file that mbsync reads
     # mbsync's PassCmd reads this file for XOAUTH2
@@ -161,6 +186,11 @@ def save_oauth2_tokens(data_dir: str, username: str, email: str, tokens: dict):
     with open(pass_file, 'w') as f:
         f.write(tokens['access_token'])
     pass_file.chmod(0o600)
+    if target_uid is not None:
+        try:
+            os.chown(pass_file, target_uid, target_gid)
+        except (PermissionError, OSError):
+            pass
 
 
 def load_oauth2_tokens(data_dir: str, username: str, email: str) -> dict:

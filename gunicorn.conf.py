@@ -24,4 +24,4 @@ else:
     keyfile = None
 
 workers = 2
-timeout = 120
+timeout = 3600  # match mbsync subprocess timeout — first-time full syncs of large inboxes routinely exceed 2min

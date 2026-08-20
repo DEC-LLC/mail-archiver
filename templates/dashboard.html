@@ -96,13 +96,17 @@
                         </select>
                     </form>
 
+                    {% if acct.provider_info.get('auth') == 'oauth2' %}
+                    <a href="{{ url_for('oauth2_authorize', email=acct.email) }}" class="btn btn-small" title="Grant this app access to your Microsoft mailbox via browser sign-in">Sign in with Microsoft</a>
+                    {% else %}
                     <details class="inline-details">
-                        <summary class="btn btn-small">Update Key</summary>
+                        <summary class="btn btn-small">Update {{ acct.provider_info.get('auth_label', 'App Password') }}</summary>
                         <form method="post" action="{{ url_for('update_credential', email=acct.email) }}" class="inline-form">
                             <input type="password" name="credential" placeholder="{{ acct.provider_info.get('auth_label', 'App Password') }}" required>
                             <button type="submit" class="btn btn-small">Save</button>
                         </form>
                     </details>
+                    {% endif %}
 
                     <form method="post" action="{{ url_for('remove_account', email=acct.email) }}" style="display:inline"
                           onsubmit="return confirm('Remove {{ acct.email }}? Archived mail will NOT be deleted.')">
