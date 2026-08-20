@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.5
+Version:        1.0.6
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -115,6 +115,31 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.6-1
+- Per-account Settings page (GH-style /account/<email>/edit) reached
+  from a Settings button on every dashboard row. Consolidates every
+  configuration knob for an account into one page — was previously
+  spread across "Update Key", "Sign in with Microsoft", and (for
+  everything else) not editable at all.
+- Editable per-account fields: display name, IMAP host, port, TLS
+  mode (SSL/STARTTLS/none), folder pattern (mbsync Patterns), and
+  connection timeout. All override the PROVIDERS[] defaults so an
+  operator can switch a Gmail account to a paid Exchange host, run
+  STARTTLS on 143, or restrict sync to INBOX only.
+- Client certificate upload (mutual-TLS IMAP): per-account PEM cert
+  + key upload widget. Stored under ${DATA}/${user}/.config/,
+  chowned to the target PAM user, mbsyncrc generator wires them
+  into ClientCertificate / ClientKey directives. Removal button
+  wipes both files atomically.
+- Server Settings link now appears in the dashboard header
+  (opens /oauth2/settings for the site-wide Microsoft OAuth2 client
+  credentials). Previously reachable only by typing the URL.
+- generate_mbsyncrc extended to honor all new per-account fields
+  with backward-compatible fallbacks (missing field → PROVIDERS
+  default → mbsync default).
+- Upload cap: MAX_CONTENT_LENGTH set to 256 KiB; friendly 413
+  handler redirects with a hint instead of Flask's default page.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.5-1
 - Fix WebUI-triggered sync failing with "su: Authentication failure" —
   swap `su - <user>` → `runuser -u <user>` so the WebUI's mail-archiver

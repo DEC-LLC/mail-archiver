@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Archiver — Settings — {{ account.email }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-header">
+                <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+                <h1><a href="{{ url_for('dashboard') }}">Mail Archiver</a></h1>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-small" title="Home">Home</a>
+            </div>
+        </header>
+
+        {% with messages = get_flashed_messages() %}
+        {% if messages %}
+        <div class="flash">
+            {% for msg in messages %}<p>{{ msg }}</p>{% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
+
+        <h2>Account Settings</h2>
+        <p class="help-text">
+            <strong>{{ account.email }}</strong> — provider: <em>{{ provider.name or account.provider }}</em>
+            {% if provider.host %}(defaults: <code>{{ provider.host }}:{{ provider.port or 993 }}</code>){% endif %}
+        </p>
+
+        <!-- ============================================================
+             Section 1: server + protocol settings (main form)
+             ============================================================ -->
+        <form method="post" action="{{ url_for('edit_account', email=account.email) }}">
+            <fieldset>
+                <legend>Server &amp; protocol</legend>
+
+                <label for="display_name">Display name</label>
+                <input type="text" id="display_name" name="display_name"
+                       value="{{ account.display_name or '' }}"
+                       placeholder="e.g. Family Hotmail (Mrunalini)">
+                <p class="help-text">Optional friendly label shown on the dashboard. Leave blank to use the provider name.</p>
+
+                <label for="host">IMAP host</label>
+                <input type="text" id="host" name="host"
+                       value="{{ account.host or '' }}"
+                       placeholder="{{ provider.host or 'imap.example.com' }}">
+                <p class="help-text">Leave blank to use the provider default (<code>{{ provider.host or '—' }}</code>).</p>
+
+                <label for="port">Port</label>
+                <input type="number" id="port" name="port" min="1" max="65535"
+                       value="{{ account.port or '' }}"
+                       placeholder="{{ provider.port or 993 }}"
+                       style="width: 140px;">
+                <p class="help-text">993 for SSL/TLS, 143 for STARTTLS. Leave blank for provider default.</p>
+
+                <label for="tls_mode">TLS mode</label>
+                <select id="tls_mode" name="tls_mode">
+                    <option value="">(provider default — {{ 'SSL/TLS' if provider.tls else 'plaintext' }})</option>
+                    {% for val, label in tls_modes %}
+                    <option value="{{ val }}" {% if account.tls_mode == val %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+                <p class="help-text">
+                    Override if your server uses STARTTLS on port 143 instead of implicit TLS on 993.
+                </p>
+
+                <label for="folder_pattern">Folder pattern</label>
+                <input type="text" id="folder_pattern" name="folder_pattern"
+                       value="{{ account.folder_pattern or '' }}"
+                       placeholder="* (all folders)">
+                <p class="help-text">
+                    mbsync-style pattern. Examples: <code>*</code> (all), <code>INBOX Sent</code>,
+                    <code>* !Trash !Spam</code>. Leave blank for all folders.
+                </p>
+
+                <label for="timeout_seconds">Connection timeout (seconds)</label>
+                <input type="number" id="timeout_seconds" name="timeout_seconds" min="1" max="3600"
+                       value="{{ account.timeout_seconds or '' }}"
+                       placeholder="20 (mbsync default)"
+                       style="width: 140px;">
+                <p class="help-text">Bump above 60 for slow WAN paths or first-time full syncs.</p>
+
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Save Settings</button>
+                    <a href="{{ url_for('dashboard') }}" class="btn">Cancel</a>
+                </div>
+            </fieldset>
+        </form>
+
+        <!-- ============================================================
+             Section 2: authentication — password or OAuth
+             ============================================================ -->
+        <fieldset style="margin-top: 2em;">
+            <legend>Authentication</legend>
+
+            {% if account.auth_type == 'oauth2' or provider.auth == 'oauth2' %}
+                <p>This account uses <strong>Microsoft OAuth2</strong>. No password is stored locally — mbsync uses a rotating access token.</p>
+                <p>
+                    <a href="{{ url_for('oauth2_authorize', email=account.email) }}" class="btn btn-primary">Sign in with Microsoft</a>
+                    <a href="{{ url_for('oauth2_refresh', email=account.email) }}" class="btn">Force Token Refresh</a>
+                </p>
+                <p class="help-text">
+                    OAuth2 client credentials for the whole server are configured in <a href="{{ url_for('oauth2_settings') }}">Server Settings → OAuth2</a>.
+                </p>
+            {% else %}
+                <p>Provider expects: <strong>{{ provider.auth_label or 'App Password' }}</strong>.</p>
+                <p class="help-text">{{ provider.auth_help or 'Enter the app-specific password issued by your mail provider.' }}</p>
+                <form method="post" action="{{ url_for('update_credential', email=account.email) }}">
+                    <label for="credential">{{ provider.auth_label or 'App Password' }}</label>
+                    <input type="password" id="credential" name="credential" required
+                           placeholder="Enter new {{ (provider.auth_label or 'App Password') | lower }}">
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary">Save</button>
+                    </div>
+                </form>
+            {% endif %}
+        </fieldset>
+
+        <!-- ============================================================
+             Section 3: mutual-TLS client certificate (uploads)
+             ============================================================ -->
+        <fieldset style="margin-top: 2em;">
+            <legend>Client certificate (mutual TLS)</legend>
+
+            <p class="help-text">
+                Only needed if your IMAP server requires client-cert
+                authentication in addition to (or instead of) a password
+                — some paid Exchange front-ends and self-hosted Dovecot
+                setups. PEM format. Max 256 KiB per file.
+            </p>
+
+            <p>
+                <strong>Current cert:</strong>
+                <code>{{ account.client_cert or '(none)' }}</code><br>
+                <strong>Current key:</strong>
+                <code>{{ account.client_key or '(none)' }}</code>
+            </p>
+
+            <form method="post" action="{{ url_for('upload_account_cert', email=account.email) }}"
+                  enctype="multipart/form-data">
+                <label for="cert_file">Client certificate (.pem / .crt / .cer)</label>
+                <input type="file" id="cert_file" name="cert_file"
+                       accept=".pem,.crt,.cer,application/x-x509-user-cert,application/x-pem-file">
+
+                <label for="key_file">Private key (.pem / .key)</label>
+                <input type="file" id="key_file" name="key_file"
+                       accept=".pem,.key,application/x-pem-file">
+
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Upload</button>
+                </div>
+            </form>
+
+            {% if account.client_cert or account.client_key %}
+            <form method="post"
+                  action="{{ url_for('remove_account_cert', email=account.email) }}"
+                  style="margin-top: 1em;"
+                  onsubmit="return confirm('Remove the uploaded client cert + key for {{ account.email }}?');">
+                <button type="submit" class="btn btn-danger">Remove uploaded cert + key</button>
+            </form>
+            {% endif %}
+        </fieldset>
+
+        <p style="margin-top: 2em;">
+            <a href="{{ url_for('dashboard') }}" class="btn">← Back to dashboard</a>
+        </p>
+    </div>
+</body>
+</html>

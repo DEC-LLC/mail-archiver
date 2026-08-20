@@ -19,9 +19,14 @@ from pathlib import Path
 from functools import wraps
 
 from flask import (Flask, render_template, request, redirect, url_for,
-                   session, flash, jsonify, abort)
+                   session, flash, jsonify, abort, send_from_directory)
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+# Cap request bodies at 256 KiB. Only routes we accept uploads on are the
+# per-account client-cert PEM uploads — a PEM cert + PEM key together are
+# well under 20 KiB. This guards the whole app from oversize form bodies.
+app.config['MAX_CONTENT_LENGTH'] = 256 * 1024
 
 # HTTPS redirect: when serving on 8443, redirect HTTP requests
 @app.before_request
@@ -283,6 +288,8 @@ def generate_mbsyncrc(username):
         '',
     ]
 
+    config_dir_str = str(archive_dir / '.config')
+
     for acct in accounts:
         if not acct.get('enabled', True):
             continue
@@ -290,23 +297,59 @@ def generate_mbsyncrc(username):
         safe_name = acct['email'].replace('@', '_at_').replace('.', '_')
         maildir = archive_dir / safe_name
 
+        # Per-account overrides win over provider defaults so an operator can
+        # switch a Gmail account to a paid business Exchange host, override
+        # a port for a firewall traversal, etc. — without touching PROVIDERS.
+        host = acct.get('host') or provider.get('host', '')
+        port = acct.get('port') or provider.get('port', 993)
+        tls_default = 'ssl' if provider.get('tls', True) else 'none'
+        tls_mode = (acct.get('tls_mode') or tls_default).lower()
+        display_name = acct.get('display_name') or provider.get('name', acct['provider'])
+
         lines.extend([
-            f'# --- {acct["email"]} ({provider.get("name", acct["provider"])}) ---',
+            f'# --- {acct["email"]} ({display_name}) ---',
             f'IMAPAccount {safe_name}',
-            f'Host {provider.get("host", acct.get("host", ""))}',
-            f'Port {provider.get("port", 993)}',
+            f'Host {host}',
+            f'Port {port}',
             f'User {acct["email"]}',
         ])
 
-        if acct['provider'] == 'hotmail' and acct.get('auth_type') == 'oauth2':
-            lines.append(f'PassCmd "cat {archive_dir}/.config/{safe_name}.token"')
+        auth_type = acct.get('auth_type') or provider.get('auth', 'password')
+        if auth_type == 'oauth2':
+            lines.append(f'PassCmd "cat {config_dir_str}/{safe_name}.token"')
             lines.append('AuthMechs XOAUTH2')
         else:
             lines.append(f'PassCmd "python3 -c \\"import sys; sys.path.insert(0,\'{archive_dir}/../..\'); from app import load_credential; print(load_credential(\'{username}\',\'{acct["email"]}\') or \'\')\\""')
 
-        if provider.get('tls', True):
+        # TLS mode is now per-account, three-valued: ssl | starttls | none.
+        # mbsync accepts SSLType {IMAPS,STARTTLS,None}.
+        if tls_mode == 'ssl':
             lines.append('SSLType IMAPS')
+        elif tls_mode == 'starttls':
+            lines.append('SSLType STARTTLS')
+        else:
+            lines.append('SSLType None')
+        if tls_mode != 'none':
             lines.append('CertificateFile /etc/ssl/certs/ca-certificates.crt')
+
+        # Client cert + key (mutual-TLS IMAP — Exchange with mTLS front-end,
+        # some paid providers, self-hosted Dovecot with cert-auth).
+        # Both filenames are stored under ${DATA}/${user}/.config/ and were
+        # written by the cert-upload route with secure_filename + chown.
+        client_cert = acct.get('client_cert')
+        client_key = acct.get('client_key')
+        if client_cert:
+            lines.append(f'ClientCertificate {config_dir_str}/{client_cert}')
+        if client_key:
+            lines.append(f'ClientKey {config_dir_str}/{client_key}')
+
+        # Timeout (mbsync default is 20s — expose so slow WAN paths + big
+        # first syncs don't drop with generic "connection lost").
+        timeout = acct.get('timeout_seconds')
+        if timeout:
+            lines.append(f'Timeout {int(timeout)}')
+
+        pattern = acct.get('folder_pattern') or '*'
 
         lines.extend([
             '',
@@ -321,7 +364,7 @@ def generate_mbsyncrc(username):
             f'Channel {safe_name}',
             f'Far :{safe_name}-remote:',
             f'Near :{safe_name}-local:',
-            'Patterns *',
+            f'Patterns {pattern}',
             'Create Near',
             'Expunge None',
             'SyncState *',
@@ -945,6 +988,205 @@ def update_credential(email):
     save_credential(username, email, credential)
     flash(f'Updated credential for {email}.')
     return redirect(url_for('dashboard'))
+
+
+# ------------------------------------------------------------------
+# Per-account settings (edit page + client-cert upload)
+# ------------------------------------------------------------------
+
+# TLS modes offered in the edit form. Values map 1:1 to the enum
+# generate_mbsyncrc emits into `SSLType` (ssl → IMAPS, starttls → STARTTLS,
+# none → None). Provider defaults still win if the field is left blank.
+TLS_MODES = [
+    ('ssl',      'SSL/TLS (IMAPS, port 993) — default'),
+    ('starttls', 'STARTTLS (usually port 143)'),
+    ('none',     'Plaintext (NOT recommended)'),
+]
+
+_ALLOWED_CERT_EXTS = {'.pem', '.crt', '.cer', '.key'}
+
+
+def _find_account(accounts, email):
+    """Return (index, account_dict) for email, or (None, None)."""
+    for i, acct in enumerate(accounts):
+        if acct['email'] == email:
+            return i, acct
+    return None, None
+
+
+@app.route('/account/<email>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_account(email):
+    """Per-account settings — display name, host/port, TLS, folders,
+    timeout, client cert paths. Password + OAuth are managed by their
+    own routes; this page links to them so an operator has ONE place
+    to reach every configuration knob for the account."""
+    username = session['username']
+    accounts = load_accounts(username)
+    idx, acct = _find_account(accounts, email)
+    if acct is None:
+        flash(f'Account {email} not found.')
+        return redirect(url_for('dashboard'))
+    provider = PROVIDERS.get(acct['provider'], {})
+
+    if request.method == 'POST':
+        # Blank field = "inherit provider default" (stored as None so the
+        # generator falls back on PROVIDERS[]).
+        def _blank_or(val):
+            v = (val or '').strip()
+            return v if v else None
+
+        acct['display_name']    = _blank_or(request.form.get('display_name'))
+        acct['host']            = _blank_or(request.form.get('host'))
+        port_raw = _blank_or(request.form.get('port'))
+        if port_raw:
+            try:
+                p = int(port_raw)
+                if not (1 <= p <= 65535):
+                    raise ValueError
+                acct['port'] = p
+            except ValueError:
+                flash('Port must be an integer 1..65535 — left unchanged.')
+                return render_template('edit_account.html', account=acct,
+                                       provider=provider, tls_modes=TLS_MODES,
+                                       providers=PROVIDERS)
+        else:
+            acct['port'] = None
+
+        tls = (request.form.get('tls_mode') or '').strip().lower()
+        acct['tls_mode'] = tls if tls in {'ssl', 'starttls', 'none'} else None
+
+        acct['folder_pattern']  = _blank_or(request.form.get('folder_pattern'))
+        timeout_raw = _blank_or(request.form.get('timeout_seconds'))
+        if timeout_raw:
+            try:
+                t = int(timeout_raw)
+                if not (1 <= t <= 3600):
+                    raise ValueError
+                acct['timeout_seconds'] = t
+            except ValueError:
+                flash('Timeout must be 1..3600 seconds — left unchanged.')
+                return render_template('edit_account.html', account=acct,
+                                       provider=provider, tls_modes=TLS_MODES,
+                                       providers=PROVIDERS)
+        else:
+            acct['timeout_seconds'] = None
+
+        accounts[idx] = acct
+        save_accounts(username, accounts)
+        generate_mbsyncrc(username)
+        flash(f'Saved settings for {email}.')
+        return redirect(url_for('edit_account', email=email))
+
+    return render_template('edit_account.html', account=acct,
+                           provider=provider, tls_modes=TLS_MODES,
+                           providers=PROVIDERS)
+
+
+def _save_cert_upload(username, email, field, form_field, allowed_ext_hint):
+    """Save an uploaded PEM under ${DATA}/${user}/.config/, chown to the
+    PAM user, and return the stored filename (or None on skip). Rejects
+    unrecognized extensions and empty uploads."""
+    f = request.files.get(form_field)
+    if not f or not f.filename:
+        return None, None
+    fname = secure_filename(f.filename)
+    ext = os.path.splitext(fname)[1].lower()
+    if ext not in _ALLOWED_CERT_EXTS:
+        return None, f'{field}: extension {ext!r} not allowed (use .pem/.crt/.cer/.key)'
+
+    safe_name = email.replace('@', '_at_').replace('.', '_')
+    stored = f'{safe_name}.{field}{ext}'
+    config_dir = get_user_config_dir(username)
+    dest = config_dir / stored
+    data = f.read()
+    if not data:
+        return None, f'{field}: uploaded file was empty'
+    # Sanity-check for PEM envelope (openssl-compatible). We don't do full
+    # cryptographic validation here — mbsync will reject a broken PEM at
+    # first-connect. A wrong-format upload just wastes a sync attempt.
+    if b'-----BEGIN' not in data:
+        return None, f'{field}: not a PEM file (no BEGIN marker)'
+    dest.write_bytes(data)
+    dest.chmod(0o600)
+    _chown_user(dest, username)
+    return stored, None
+
+
+@app.route('/account/<email>/cert', methods=['POST'])
+@login_required
+def upload_account_cert(email):
+    """Upload a client certificate + private key PEM for mutual-TLS IMAP.
+    Both fields are optional — uploading only a cert clears the previous
+    key path (rare, but valid if the key is embedded)."""
+    username = session['username']
+    accounts = load_accounts(username)
+    idx, acct = _find_account(accounts, email)
+    if acct is None:
+        flash(f'Account {email} not found.')
+        return redirect(url_for('dashboard'))
+
+    cert_name, err = _save_cert_upload(username, email, 'cert', 'cert_file', '.pem/.crt/.cer')
+    if err:
+        flash(err)
+        return redirect(url_for('edit_account', email=email))
+    key_name, err = _save_cert_upload(username, email, 'key', 'key_file', '.pem/.key')
+    if err:
+        flash(err)
+        return redirect(url_for('edit_account', email=email))
+
+    if cert_name:
+        acct['client_cert'] = cert_name
+    if key_name:
+        acct['client_key'] = key_name
+    if not (cert_name or key_name):
+        flash('No cert or key uploaded.')
+        return redirect(url_for('edit_account', email=email))
+
+    accounts[idx] = acct
+    save_accounts(username, accounts)
+    generate_mbsyncrc(username)
+    flash(f'Uploaded client cert/key for {email}.')
+    return redirect(url_for('edit_account', email=email))
+
+
+@app.route('/account/<email>/cert/remove', methods=['POST'])
+@login_required
+def remove_account_cert(email):
+    """Remove uploaded cert + key files and clear the paths from the
+    account. Idempotent — safe on an account that never had one."""
+    username = session['username']
+    accounts = load_accounts(username)
+    idx, acct = _find_account(accounts, email)
+    if acct is None:
+        flash(f'Account {email} not found.')
+        return redirect(url_for('dashboard'))
+    config_dir = get_user_config_dir(username)
+    for field in ('client_cert', 'client_key'):
+        fname = acct.get(field)
+        if fname:
+            path = config_dir / fname
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        acct[field] = None
+    accounts[idx] = acct
+    save_accounts(username, accounts)
+    generate_mbsyncrc(username)
+    flash(f'Removed client cert/key for {email}.')
+    return redirect(url_for('edit_account', email=email))
+
+
+@app.errorhandler(413)
+def _too_large(e):
+    """MAX_CONTENT_LENGTH tripped — the most common trigger is a bogus
+    huge cert upload. Give a useful hint instead of Flask's default."""
+    flash('Upload rejected: file exceeds 256 KiB. Client certs + keys '
+          'should be well under 20 KiB. Check you selected the right file.')
+    ref = request.referrer or url_for('dashboard')
+    return redirect(ref)
 
 
 @app.route('/account/<email>/schedule', methods=['POST'])
