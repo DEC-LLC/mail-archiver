@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.7
+Version:        1.0.8
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -115,6 +115,36 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.8-1
+- OAuth Apps management: registered Azure apps are now named + reusable
+  at two scopes (server-wide + per-user), with per-provider defaults and
+  per-account pinning. Solves the "different Azure app per family member
+  / per tenant / per email account" case.
+- Data model v2: server config at ${DATA}/.oauth2_config.json becomes
+  {apps: {srv-*: {...}}, defaults: {microsoft: srv-...}, _schema_version: 2}
+  Per-user config at ${DATA}/${user}/.config/oauth_apps.json (same shape,
+  usr-* prefix). Auto-migrates v1 legacy {microsoft: {client_id, secret}}
+  to a named app srv-microsoft-default on first read, save-back to disk.
+  Existing accounts (no oauth_app_id) resolve via the server default —
+  seamless upgrade for the current mvdiwan@hotmail.com flow.
+- Server Settings page rewritten: two-table view (Server-wide + Your
+  Private) with redacted secret hints, Make-default / Edit / Delete
+  buttons per row. Delete refuses if any account still pins that app.
+- Per-account edit page: OAuth section grows "OAuth App" dropdown
+  listing every visible app (scope-labeled, default-marked, tenant-
+  visible). Blank = provider default (user default > server default).
+  Currently-pinned app shown redacted above the picker.
+- Extended MicrosoftOAuth2 to accept per-app tenant (defaults 'common');
+  AUTHORITY URL derived from tenant so single-tenant apps + verified-
+  domain apps work without touching source.
+- oauth2_authorize / callback / refresh + the imaplib sync path all
+  route through resolve_oauth_app() so per-account overrides take
+  effect end-to-end. Callback pins the app_id it started with so
+  operator races on the settings page don't corrupt token exchange.
+- Delete-app safety: server-scope deletes walk every user's
+  accounts.json to find pinned references, refuse with a preview list.
+- Backward compat verified with an in-repo migration smoke test.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.7-1
 - Settings pages now show current configuration state — was previously
   silent overwrite. Every place where a credential/secret/cert can be

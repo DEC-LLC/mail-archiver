@@ -519,23 +519,23 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
 
         if provider.get('auth') == 'oauth2' or acct.get('auth_method') == 'oauth2':
             auth_method = 'oauth2'
-            # Load OAuth2 token
+            # Resolve per-account OAuth app (server-default / user-default /
+            # explicit override), refresh the token if stale, hand back the
+            # access token for XOAUTH2. Any failure here silently drops to
+            # a blank token so the request-scoped sync doesn't crash — the
+            # per-account edit page will surface the misconfig loudly.
             try:
-                from oauth2_microsoft import MicrosoftOAuth2
-                config_dir = get_user_config_dir(username)
-                oauth_config_file = Path(CONFIG['data_dir']) / '.oauth2_config.json'
-                if oauth_config_file.exists():
-                    with open(oauth_config_file) as f:
-                        oauth_cfg = json.load(f)
-                    oauth = MicrosoftOAuth2(
-                        client_id=oauth_cfg.get('client_id', ''),
-                        client_secret=oauth_cfg.get('client_secret', ''),
-                        redirect_uri=oauth_cfg.get('redirect_uri', ''),
-                        data_dir=CONFIG['data_dir'],
-                    )
-                    token_data = oauth.ensure_fresh_token(username, safe_name)
-                    if token_data:
-                        oauth2_token = token_data.get('access_token', '')
+                from oauth2_microsoft import (resolve_oauth_app,
+                                              build_microsoft_oauth2,
+                                              ensure_fresh_token)
+                redirect_uri = ''  # not needed for refresh, only for authorize
+                app_obj = resolve_oauth_app(CONFIG['data_dir'], username,
+                                            app_id=acct.get('oauth_app_id'),
+                                            provider='microsoft')
+                if app_obj:
+                    oauth = build_microsoft_oauth2(app_obj, redirect_uri)
+                    oauth2_token = ensure_fresh_token(oauth, CONFIG['data_dir'],
+                                                     username, acct['email'])
             except Exception:
                 pass
 
@@ -923,17 +923,18 @@ def add_account():
         # configured; otherwise fall through with a helpful flash.
         if provider_info['auth'] == 'oauth2':
             try:
-                from oauth2_microsoft import load_oauth2_config
-                cfg = load_oauth2_config(CONFIG['data_dir']).get('microsoft', {})
-                if cfg.get('client_id') and cfg.get('client_secret'):
+                from oauth2_microsoft import resolve_oauth_app
+                app_obj = resolve_oauth_app(CONFIG['data_dir'], username,
+                                            provider='microsoft')
+                if app_obj and app_obj.get('client_id') and app_obj.get('client_secret'):
                     flash(f'Added {email}. Signing in with Microsoft…')
                     return redirect(url_for('oauth2_authorize', email=email))
-                flash(f'Added {email}. Configure Microsoft OAuth2 credentials '
-                      f'in Settings → OAuth2, then click "Sign in with '
-                      f'Microsoft" on the account row.')
+                flash(f'Added {email}. No Microsoft OAuth2 app is configured yet — '
+                      f'go to Server Settings → OAuth Apps, add one, then click '
+                      f'"Sign in with Microsoft" on the account row.')
             except Exception:
-                flash(f'Added {email}. OAuth2 config not readable — check '
-                      f'Settings → OAuth2.')
+                flash(f'Added {email}. OAuth apps config not readable — check '
+                      f'Server Settings → OAuth Apps.')
             return redirect(url_for('dashboard'))
 
         flash(f'Added {email}. You can now sync it.')
@@ -1192,11 +1193,30 @@ def edit_account(email):
         else:
             acct['timeout_seconds'] = None
 
+        # oauth_app_id: only accept a value that actually resolves. Blank
+        # clears the pin and reverts this account to provider-default
+        # resolution (user default → server default).
+        oauth_app_id = _blank_or(request.form.get('oauth_app_id'))
+        if oauth_app_id:
+            from oauth2_microsoft import resolve_oauth_app
+            resolved = resolve_oauth_app(CONFIG['data_dir'], username,
+                                         app_id=oauth_app_id, provider='microsoft')
+            if not resolved or resolved.get('app_id') != oauth_app_id:
+                flash(f'OAuth app {oauth_app_id!r} not found — reverted to default.')
+                oauth_app_id = None
+        acct['oauth_app_id'] = oauth_app_id
+
         accounts[idx] = acct
         save_accounts(username, accounts)
         generate_mbsyncrc(username)
         flash(f'Saved settings for {email}.')
         return redirect(url_for('edit_account', email=email))
+
+    # Build the dropdown list of OAuth apps this account could use.
+    from oauth2_microsoft import list_oauth_apps
+    available_oauth_apps = list_oauth_apps(CONFIG['data_dir'],
+                                           username=username,
+                                           provider='microsoft')
 
     return render_template('edit_account.html', account=acct,
                            provider=provider, tls_modes=TLS_MODES,
@@ -1204,7 +1224,9 @@ def edit_account(email):
                            cred_hint=_credential_hint(username, email),
                            oauth_hint=_oauth2_token_hint(username, email),
                            cert_hint=_cert_hint(username, acct.get('client_cert')),
-                           key_hint=_cert_hint(username, acct.get('client_key')))
+                           key_hint=_cert_hint(username, acct.get('client_key')),
+                           available_oauth_apps=available_oauth_apps,
+                           current_oauth_app_id=acct.get('oauth_app_id') or '')
 
 
 def _save_cert_upload(username, email, field, form_field, allowed_ext_hint):
@@ -1904,65 +1926,270 @@ def scheduled_sync():
 
 # --- Microsoft OAuth2 Routes ---
 
-@app.route('/oauth2/settings', methods=['GET', 'POST'])
+def _resolve_oauth_for_account(username, email):
+    """Resolve the OAuth app tied to a specific account (by email). Used by
+    authorize/callback/refresh so each account can be pinned to its own app.
+    Returns (app_obj, account_dict) or (None, account_dict)."""
+    from oauth2_microsoft import resolve_oauth_app
+    accounts = load_accounts(username)
+    acct = None
+    for a in accounts:
+        if a['email'] == email:
+            acct = a
+            break
+    if acct is None:
+        return None, None
+    app_obj = resolve_oauth_app(CONFIG['data_dir'], username,
+                                app_id=acct.get('oauth_app_id'),
+                                provider='microsoft')
+    return app_obj, acct
+
+
+@app.route('/oauth2/settings', methods=['GET'])
 @login_required
 def oauth2_settings():
-    """Configure Microsoft OAuth2 client credentials (Azure AD app)."""
-    from oauth2_microsoft import load_oauth2_config, save_oauth2_config
+    """List OAuth Apps at both scopes (server + this user's private).
+    App CRUD lives at /oauth2/apps/*. Kept as GET-only landing page — the old
+    single-app editor form is gone; the multi-app model replaces it."""
+    from oauth2_microsoft import list_oauth_apps, load_oauth2_config, load_user_oauth2_config
 
-    if request.method == 'POST':
-        client_id = request.form.get('client_id', '').strip()
-        client_secret = request.form.get('client_secret', '').strip()
-        cfg = load_oauth2_config(CONFIG['data_dir'])
-        existing = cfg.get('microsoft', {})
-        # A blank client_id clears everything (rare but valid). A blank
-        # client_secret keeps the existing one — the "leave blank to keep"
-        # hint on the form now actually matches behavior. Refuse only the
-        # true no-op cases: no client_id + no existing secret to keep.
-        if not client_id:
-            flash('Client ID is required (leave blank to clear both).')
-            return redirect(url_for('oauth2_settings'))
-        new_secret = client_secret or existing.get('client_secret', '')
-        if not new_secret:
-            flash('Client Secret is required — no existing secret to keep.')
-            return redirect(url_for('oauth2_settings'))
-        cfg['microsoft'] = {'client_id': client_id, 'client_secret': new_secret}
-        save_oauth2_config(CONFIG['data_dir'], cfg)
-        if client_secret:
-            flash('Microsoft OAuth2 credentials saved (both fields).')
-        else:
-            flash('Client ID updated. Existing Client Secret preserved.')
-        return redirect(url_for('oauth2_settings'))
+    server_cfg = load_oauth2_config(CONFIG['data_dir'])
+    user_cfg = load_user_oauth2_config(CONFIG['data_dir'], session['username'])
 
-    config = load_oauth2_config(CONFIG['data_dir'])
-    ms_config = config.get('microsoft', {})
-    secret_val = ms_config.get('client_secret', '')
+    all_apps = list_oauth_apps(CONFIG['data_dir'], username=session['username'])
+    server_apps = [a for a in all_apps if a['scope'] == 'server']
+    user_apps = [a for a in all_apps if a['scope'] == 'user']
+
+    # Redact secrets for display
+    for a in server_apps + user_apps:
+        sec = a.get('client_secret', '')
+        a['secret_redacted'] = _redact_middle(sec) if sec else ''
+        a['secret_length'] = len(sec)
+        # Show CID head/tail too (not secret, but useful glance)
+        a['client_id_display'] = a.get('client_id', '')
+
     return render_template('oauth2_settings.html',
                            username=session['username'],
-                           client_id=ms_config.get('client_id', ''),
-                           has_secret=bool(secret_val),
-                           secret_redacted=_redact_middle(secret_val) if secret_val else '',
-                           secret_length=len(secret_val))
+                           server_apps=server_apps,
+                           user_apps=user_apps,
+                           server_defaults=(server_cfg.get('defaults') or {}),
+                           user_defaults=(user_cfg.get('defaults') or {}))
+
+
+def _load_scope_cfg(scope, username):
+    """Return (cfg, save_fn) for the given scope."""
+    from oauth2_microsoft import (load_oauth2_config, save_oauth2_config,
+                                  load_user_oauth2_config, save_user_oauth2_config)
+    if scope == 'server':
+        return load_oauth2_config(CONFIG['data_dir']), \
+               lambda c: save_oauth2_config(CONFIG['data_dir'], c)
+    return load_user_oauth2_config(CONFIG['data_dir'], username), \
+           lambda c: save_user_oauth2_config(CONFIG['data_dir'], username, c)
+
+
+def _find_app(app_id, username):
+    """Look up app by id in whichever scope its prefix indicates.
+    Returns (scope, cfg, app_dict, save_fn) or (None, None, None, None)."""
+    scope = 'user' if app_id.startswith('usr-') else 'server'
+    cfg, save = _load_scope_cfg(scope, username)
+    app = (cfg.get('apps') or {}).get(app_id)
+    if not app:
+        return None, None, None, None
+    return scope, cfg, app, save
+
+
+@app.route('/oauth2/apps/new', methods=['GET', 'POST'])
+@login_required
+def new_oauth_app():
+    """Create a new OAuth app at server-scope or user-scope."""
+    from oauth2_microsoft import (load_oauth2_config, load_user_oauth2_config,
+                                  new_app_id, KNOWN_PROVIDERS)
+
+    if request.method == 'POST':
+        scope = request.form.get('scope', 'user').strip()
+        if scope not in ('server', 'user'):
+            flash('Invalid scope.')
+            return redirect(url_for('oauth2_settings'))
+        provider = request.form.get('provider', 'microsoft').strip()
+        if provider not in KNOWN_PROVIDERS:
+            flash(f'Unsupported provider {provider!r}.')
+            return redirect(url_for('new_oauth_app'))
+        name = (request.form.get('name') or '').strip()
+        client_id = (request.form.get('client_id') or '').strip()
+        client_secret = (request.form.get('client_secret') or '').strip()
+        tenant = (request.form.get('tenant') or 'common').strip() or 'common'
+        if not (name and client_id and client_secret):
+            flash('Name, Client ID, and Client Secret are all required for new apps.')
+            return render_template('edit_app.html', app=None,
+                                   form={'scope': scope, 'provider': provider,
+                                         'name': name, 'client_id': client_id,
+                                         'tenant': tenant},
+                                   secret_redacted='', secret_length=0,
+                                   providers=KNOWN_PROVIDERS)
+
+        cfg, save = _load_scope_cfg(scope, session['username'])
+        taken = set((cfg.get('apps') or {}).keys())
+        app_id = new_app_id(scope, provider, name, taken)
+        cfg.setdefault('apps', {})[app_id] = {
+            'scope': scope, 'provider': provider, 'name': name,
+            'client_id': client_id, 'client_secret': client_secret,
+            'tenant': tenant,
+        }
+        # If this is the FIRST app of this provider in this scope, make it default.
+        defs = cfg.setdefault('defaults', {})
+        if provider not in defs:
+            defs[provider] = app_id
+        save(cfg)
+        flash(f'Added OAuth app "{name}" ({scope}-scope, id={app_id}).')
+        return redirect(url_for('oauth2_settings'))
+
+    return render_template('edit_app.html', app=None,
+                           form={'scope': 'user', 'provider': 'microsoft',
+                                 'name': '', 'client_id': '', 'tenant': 'common'},
+                           secret_redacted='', secret_length=0,
+                           providers=KNOWN_PROVIDERS)
+
+
+@app.route('/oauth2/apps/<app_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_oauth_app(app_id):
+    """Edit an existing OAuth app. Blank secret preserves existing (1.0.7 pattern)."""
+    from oauth2_microsoft import KNOWN_PROVIDERS
+    scope, cfg, app, save = _find_app(app_id, session['username'])
+    if not app:
+        flash(f'OAuth app {app_id!r} not found.')
+        return redirect(url_for('oauth2_settings'))
+
+    if request.method == 'POST':
+        name = (request.form.get('name') or '').strip()
+        client_id = (request.form.get('client_id') or '').strip()
+        client_secret = (request.form.get('client_secret') or '').strip()
+        tenant = (request.form.get('tenant') or 'common').strip() or 'common'
+        if not (name and client_id):
+            flash('Name and Client ID are required.')
+            return redirect(url_for('edit_oauth_app', app_id=app_id))
+        new_secret = client_secret or app.get('client_secret', '')
+        if not new_secret:
+            flash('Client Secret is required — no existing secret to preserve.')
+            return redirect(url_for('edit_oauth_app', app_id=app_id))
+        app['name'] = name
+        app['client_id'] = client_id
+        app['client_secret'] = new_secret
+        app['tenant'] = tenant
+        save(cfg)
+        if client_secret:
+            flash(f'Updated OAuth app "{name}" (both fields).')
+        else:
+            flash(f'Updated OAuth app "{name}" — existing Client Secret preserved.')
+        return redirect(url_for('oauth2_settings'))
+
+    sec = app.get('client_secret', '')
+    return render_template('edit_app.html', app_id=app_id, app=app,
+                           form={'scope': scope,
+                                 'provider': app.get('provider', 'microsoft'),
+                                 'name': app.get('name', ''),
+                                 'client_id': app.get('client_id', ''),
+                                 'tenant': app.get('tenant', 'common')},
+                           secret_redacted=_redact_middle(sec) if sec else '',
+                           secret_length=len(sec),
+                           providers=KNOWN_PROVIDERS)
+
+
+def _accounts_referencing_app(app_id):
+    """Walk every user's accounts.json under CONFIG['data_dir'], return list
+    of (username, email) pairs whose account.oauth_app_id == app_id."""
+    hits = []
+    root = Path(CONFIG['data_dir'])
+    if not root.is_dir():
+        return hits
+    for user_dir in root.iterdir():
+        if not user_dir.is_dir() or user_dir.name.startswith('.'):
+            continue
+        af = user_dir / '.config' / 'accounts.json'
+        if not af.exists():
+            continue
+        try:
+            with open(af) as f:
+                accts = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        for a in accts or []:
+            if a.get('oauth_app_id') == app_id:
+                hits.append((user_dir.name, a.get('email', '?')))
+    return hits
+
+
+@app.route('/oauth2/apps/<app_id>/delete', methods=['POST'])
+@login_required
+def delete_oauth_app(app_id):
+    """Delete an OAuth app. Refuses if any account (across all users) still
+    pins itself to it via oauth_app_id."""
+    from oauth2_microsoft import clear_default_if
+    scope, cfg, app, save = _find_app(app_id, session['username'])
+    if not app:
+        flash(f'OAuth app {app_id!r} not found.')
+        return redirect(url_for('oauth2_settings'))
+
+    refs = _accounts_referencing_app(app_id)
+    if refs:
+        preview = ', '.join(f'{u}:{e}' for u, e in refs[:5])
+        more = f' and {len(refs)-5} more' if len(refs) > 5 else ''
+        flash(f'Refused: {len(refs)} account(s) still use this app ({preview}{more}). '
+              f'Reassign those accounts first (Account → Settings → OAuth app).')
+        return redirect(url_for('oauth2_settings'))
+
+    del cfg['apps'][app_id]
+    clear_default_if(cfg, app_id)
+    save(cfg)
+    flash(f'Deleted OAuth app "{app.get("name", app_id)}".')
+    return redirect(url_for('oauth2_settings'))
+
+
+@app.route('/oauth2/apps/<app_id>/set_default', methods=['POST'])
+@login_required
+def set_default_oauth_app(app_id):
+    """Mark this app as its scope's default for its provider."""
+    from oauth2_microsoft import set_default_app
+    scope, cfg, app, save = _find_app(app_id, session['username'])
+    if not app:
+        flash(f'OAuth app {app_id!r} not found.')
+        return redirect(url_for('oauth2_settings'))
+    set_default_app(cfg, app_id)
+    save(cfg)
+    flash(f'"{app.get("name", app_id)}" is now the {scope} default for {app.get("provider")}.')
+    return redirect(url_for('oauth2_settings'))
 
 
 @app.route('/oauth2/authorize')
 @login_required
 def oauth2_authorize():
-    """Start Microsoft OAuth2 flow — redirect to Microsoft login."""
-    from oauth2_microsoft import get_microsoft_oauth2
+    """Start Microsoft OAuth2 flow — resolves the per-account OAuth app,
+    redirects to that app's Microsoft login URL (respects per-app tenant)."""
+    from oauth2_microsoft import build_microsoft_oauth2
 
     email = request.args.get('email', '')
     if not email:
         flash('Email address required for OAuth2.')
         return redirect(url_for('dashboard'))
 
+    username = session['username']
+    app_obj, acct = _resolve_oauth_for_account(username, email)
+    if acct is None:
+        flash(f'Account {email} not found.')
+        return redirect(url_for('dashboard'))
+    if not app_obj:
+        flash('No Microsoft OAuth2 app is configured — go to Server Settings → OAuth Apps to add one.')
+        return redirect(url_for('oauth2_settings'))
+
     try:
         redirect_uri = url_for('oauth2_callback', _external=True)
-        oauth2 = get_microsoft_oauth2(CONFIG['data_dir'], redirect_uri)
+        oauth2 = build_microsoft_oauth2(app_obj, redirect_uri)
         auth_url, state = oauth2.get_authorization_url()
-        # Store state + email in session for the callback
         session['oauth2_state'] = state
         session['oauth2_email'] = email
+        # Pin the callback to THIS app (per-account can change between now
+        # and the callback if operator races the settings page).
+        session['oauth2_app_id'] = app_obj.get('app_id')
         return redirect(auth_url)
     except ValueError as e:
         flash(str(e))
@@ -1972,8 +2199,10 @@ def oauth2_authorize():
 @app.route('/oauth2/callback')
 @login_required
 def oauth2_callback():
-    """Handle Microsoft OAuth2 callback — exchange code for tokens."""
-    from oauth2_microsoft import (get_microsoft_oauth2, save_oauth2_tokens)
+    """Handle Microsoft OAuth2 callback — exchange code for tokens against
+    the same app that started the flow."""
+    from oauth2_microsoft import (build_microsoft_oauth2, resolve_oauth_app,
+                                  save_oauth2_tokens)
 
     error = request.args.get('error')
     if error:
@@ -1982,37 +2211,45 @@ def oauth2_callback():
 
     code = request.args.get('code', '')
     state = request.args.get('state', '')
-
     if not code or state != session.get('oauth2_state'):
         flash('Invalid OAuth2 callback. Please try again.')
         return redirect(url_for('dashboard'))
 
     email = session.pop('oauth2_email', '')
+    app_id = session.pop('oauth2_app_id', None)
     session.pop('oauth2_state', None)
 
     if not email:
         flash('OAuth2 session expired. Please try again.')
         return redirect(url_for('dashboard'))
 
+    username = session['username']
+    app_obj = resolve_oauth_app(CONFIG['data_dir'], username,
+                                app_id=app_id, provider='microsoft')
+    if not app_obj:
+        flash('OAuth app disappeared between authorize and callback. Try again.')
+        return redirect(url_for('dashboard'))
+
     try:
         redirect_uri = url_for('oauth2_callback', _external=True)
-        oauth2 = get_microsoft_oauth2(CONFIG['data_dir'], redirect_uri)
+        oauth2 = build_microsoft_oauth2(app_obj, redirect_uri)
         tokens = oauth2.exchange_code(code)
-        save_oauth2_tokens(CONFIG['data_dir'], session['username'], email, tokens)
+        save_oauth2_tokens(CONFIG['data_dir'], username, email, tokens)
 
-        # Update account auth_type to oauth2
-        username = session['username']
         accounts = load_accounts(username)
         for acct in accounts:
             if acct['email'] == email:
                 acct['auth_type'] = 'oauth2'
+                # Pin the successful app so future syncs / refreshes use it
+                if app_id:
+                    acct['oauth_app_id'] = app_id
                 break
         else:
-            # Account doesn't exist yet — create it
             accounts.append({
                 'email': email,
                 'provider': 'hotmail',
                 'auth_type': 'oauth2',
+                'oauth_app_id': app_id or '',
                 'enabled': True,
                 'sync_interval': 'daily',
                 'added': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -2020,7 +2257,6 @@ def oauth2_callback():
         save_accounts(username, accounts)
         generate_mbsyncrc(username)
 
-        # Create maildir
         safe_name = email.replace('@', '_at_').replace('.', '_')
         maildir = Path(CONFIG['data_dir']) / username / safe_name
         maildir.mkdir(parents=True, exist_ok=True)
@@ -2036,18 +2272,20 @@ def oauth2_callback():
 @app.route('/oauth2/refresh/<email>')
 @login_required
 def oauth2_refresh(email):
-    """Manually refresh OAuth2 token for an account."""
-    from oauth2_microsoft import get_microsoft_oauth2, ensure_fresh_token
-
+    """Manually refresh OAuth2 token for an account using its resolved app."""
+    from oauth2_microsoft import build_microsoft_oauth2, ensure_fresh_token
+    username = session['username']
+    app_obj, acct = _resolve_oauth_for_account(username, email)
+    if not app_obj:
+        flash(f'No OAuth app resolved for {email}. Check Server Settings → OAuth Apps.')
+        return redirect(url_for('dashboard'))
     try:
         redirect_uri = url_for('oauth2_callback', _external=True)
-        oauth2 = get_microsoft_oauth2(CONFIG['data_dir'], redirect_uri)
-        token = ensure_fresh_token(oauth2, CONFIG['data_dir'],
-                                   session['username'], email)
+        oauth2 = build_microsoft_oauth2(app_obj, redirect_uri)
+        token = ensure_fresh_token(oauth2, CONFIG['data_dir'], username, email)
         flash(f'Token refreshed for {email}.')
     except ValueError as e:
         flash(f'Token refresh failed: {e}')
-
     return redirect(url_for('dashboard'))
 
 

@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — Microsoft OAuth2 Settings</title>
+    <title>Mail Archiver — OAuth Apps</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
@@ -20,83 +20,153 @@
             </div>
         </header>
 
-        <h2>Microsoft OAuth2 Settings</h2>
+        {% with messages = get_flashed_messages() %}
+        {% if messages %}
+        <div class="flash">
+            {% for message in messages %}<p>{{ message }}</p>{% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
 
-        <div class="card" style="max-width:700px;">
-            <p>To use Microsoft (Outlook/Hotmail) accounts with OAuth2, you need to register a free Microsoft Entra ID app (formerly &ldquo;Azure AD&rdquo; &mdash; renamed 2023, same portal). This gives you a Client ID and Client Secret that Mail Archiver uses to authenticate with Microsoft on your behalf.</p>
+        <h2>OAuth Apps</h2>
+        <p class="help-text">
+            Register one Azure app and share it across all Hotmail accounts, or add a separate app per family member for tenant isolation.
+            Each account can pin itself to a specific app on its Settings page (dropdown). Apps left blank fall back to the per-user default for the provider, then the server default.
+        </p>
 
-            <div style="background:#f0f7ff;border-left:4px solid #2196f3;padding:16px 20px;margin:20px 0;border-radius:0 6px 6px 0;">
-                <strong>Setup takes about 5 minutes. You only do this once.</strong>
-                <ol style="margin:12px 0 0 20px;line-height:1.8;">
-                    <li>Go to <a href="https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank">Microsoft Entra ID &rarr; App Registrations</a></li>
-                    <li>Click <strong>New Registration</strong></li>
-                    <li>Name: <code>Mail Archiver</code></li>
-                    <li>Supported account types: <strong>Accounts in any organizational directory and personal Microsoft accounts</strong> (required for personal @hotmail.com / @outlook.com accounts)</li>
-                    <li>Redirect URI: <strong>Web</strong> &rarr; <code>{{ request.url_root }}oauth2/callback</code></li>
-                    <li>Click <strong>Register</strong></li>
-                    <li>Copy the <strong>Application (client) ID</strong> &mdash; paste below</li>
-                    <li>Go to <strong>Certificates &amp; secrets</strong> &rarr; <strong>New client secret</strong>. <span style="background:#fff3cd;padding:2px 6px;border-radius:3px;"><strong>Set expiration to 24 months</strong> &mdash; Azure defaults to 180 days; if you accept that default your OAuth silently breaks in ~6 months.</span></li>
-                    <li>Copy the secret <strong>Value</strong> (not the Secret ID &mdash; common gotcha) &mdash; paste below</li>
-                    <li>Go to <strong>API permissions</strong> &rarr; <strong>Add a permission</strong> &rarr; <strong>APIs my organization uses</strong> &rarr; search <strong>Office 365 Exchange Online</strong> &rarr; <strong>Delegated</strong> &rarr; <strong>IMAP.AccessAsUser.All</strong>. <em>Tenant accounts:</em> click <strong>Grant admin consent</strong> after adding the permission. <em>Personal @hotmail.com / @outlook.com accounts:</em> skip that button &mdash; consent happens at first sign-in.</li>
-                </ol>
-                <p style="margin-top:12px;font-size:0.92em;color:#555;"><strong>Heads-up:</strong> if your Mail Archiver deployment uses a self-signed HTTPS cert, your browser will warn once at the OAuth callback step. Accept the exception and the callback completes normally.</p>
-            </div>
+        <p><a href="{{ url_for('new_oauth_app') }}" class="btn btn-primary">+ Add new OAuth App</a></p>
 
-            {% with messages = get_flashed_messages() %}
-            {% if messages %}
-            <div class="flash">
-                {% for message in messages %}
-                <p>{{ message }}</p>
-                {% endfor %}
-            </div>
-            {% endif %}
-            {% endwith %}
+        <!-- ==================== SERVER-WIDE APPS ==================== -->
+        <h3 style="margin-top:2em;">Server-wide OAuth Apps</h3>
+        <p class="help-text">Visible to every Linux user on this appliance. Anyone can select these apps for their accounts.</p>
 
-            <form method="post" action="{{ url_for('oauth2_settings') }}">
-                <div class="form-group">
-                    <label for="client_id">Application (Client) ID</label>
-                    <input type="text" id="client_id" name="client_id" value="{{ client_id }}"
-                           placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                           style="width:100%;font-family:monospace;">
-                </div>
-
-                <div class="form-group" style="margin-top:16px;">
-                    <label for="client_secret">Client Secret Value</label>
-                    {% if has_secret %}
-                    <p style="margin:4px 0 8px;padding:8px 12px;background:#f0f7ff;border-left:3px solid #2196f3;border-radius:0 4px 4px 0;">
-                        <strong>Currently set:</strong>
-                        <code style="font-family:monospace;">{{ secret_redacted }}</code>
-                        <span style="color:#666;font-size:0.9em;">({{ secret_length }} chars)</span>
-                    </p>
+        {% if server_apps %}
+        <table class="apps-table" style="width:100%;border-collapse:collapse;margin-top:8px;">
+            <thead><tr style="border-bottom:2px solid #ddd;text-align:left;">
+                <th style="padding:6px;">Name</th>
+                <th style="padding:6px;">Provider</th>
+                <th style="padding:6px;">Tenant</th>
+                <th style="padding:6px;">Client ID / Secret hint</th>
+                <th style="padding:6px;">Default?</th>
+                <th style="padding:6px;">Actions</th>
+            </tr></thead>
+            <tbody>
+            {% for a in server_apps %}
+            <tr style="border-bottom:1px solid #eee;">
+                <td style="padding:6px;"><strong>{{ a.name }}</strong><br>
+                    <code style="font-size:0.8em;color:#666;">{{ a.app_id }}</code></td>
+                <td style="padding:6px;">{{ a.provider }}</td>
+                <td style="padding:6px;"><code>{{ a.tenant }}</code></td>
+                <td style="padding:6px;font-family:monospace;font-size:0.85em;">
+                    id: <code>{{ a.client_id_display }}</code><br>
+                    secret: <code>{{ a.secret_redacted or '(none)' }}</code>
+                    <span style="color:#666;">({{ a.secret_length }} chars)</span>
+                </td>
+                <td style="padding:6px;">
+                    {% if a.is_default %}
+                    <span style="background:#4caf50;color:#fff;padding:2px 8px;border-radius:3px;">✓ default for {{ a.provider }}</span>
                     {% else %}
-                    <p style="margin:4px 0 8px;padding:8px 12px;background:#fff3cd;border-left:3px solid #ff9800;border-radius:0 4px 4px 0;color:#664d03;">
-                        <strong>Not configured.</strong> Microsoft OAuth2 sign-in will fail until you paste a secret below.
-                    </p>
+                    <form method="post" action="{{ url_for('set_default_oauth_app', app_id=a.app_id) }}" style="display:inline">
+                        <button type="submit" class="btn btn-small">Make default</button>
+                    </form>
                     {% endif %}
-                    <input type="password" id="client_secret" name="client_secret"
-                           placeholder="{{ 'Leave blank to keep the current secret' if has_secret else 'Paste your Azure app secret Value here' }}"
-                           style="width:100%;font-family:monospace;">
-                    {% if has_secret %}
-                    <small style="color:#666;">Leave blank to keep the existing secret. Enter a new value to replace it.</small>
+                </td>
+                <td style="padding:6px;">
+                    <a href="{{ url_for('edit_oauth_app', app_id=a.app_id) }}" class="btn btn-small">Edit</a>
+                    <form method="post" action="{{ url_for('delete_oauth_app', app_id=a.app_id) }}"
+                          style="display:inline"
+                          onsubmit="return confirm('Delete OAuth app {{ a.name }}? Accounts using it will need to be reassigned.');">
+                        <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p style="padding:10px 14px;background:#fff3cd;border-left:3px solid #ff9800;border-radius:0 4px 4px 0;color:#664d03;">
+            <strong>No server-wide OAuth apps configured.</strong> Add one so Hotmail accounts on this appliance can sign in.
+        </p>
+        {% endif %}
+
+        <!-- ==================== PER-USER APPS ==================== -->
+        <h3 style="margin-top:2em;">Your Private OAuth Apps ({{ username }})</h3>
+        <p class="help-text">Only visible to <strong>{{ username }}</strong>. Use for tenant isolation, work-account separation, or when you want to control the Azure app registration for just your own mailboxes.</p>
+
+        {% if user_apps %}
+        <table class="apps-table" style="width:100%;border-collapse:collapse;margin-top:8px;">
+            <thead><tr style="border-bottom:2px solid #ddd;text-align:left;">
+                <th style="padding:6px;">Name</th>
+                <th style="padding:6px;">Provider</th>
+                <th style="padding:6px;">Tenant</th>
+                <th style="padding:6px;">Client ID / Secret hint</th>
+                <th style="padding:6px;">Default?</th>
+                <th style="padding:6px;">Actions</th>
+            </tr></thead>
+            <tbody>
+            {% for a in user_apps %}
+            <tr style="border-bottom:1px solid #eee;">
+                <td style="padding:6px;"><strong>{{ a.name }}</strong><br>
+                    <code style="font-size:0.8em;color:#666;">{{ a.app_id }}</code></td>
+                <td style="padding:6px;">{{ a.provider }}</td>
+                <td style="padding:6px;"><code>{{ a.tenant }}</code></td>
+                <td style="padding:6px;font-family:monospace;font-size:0.85em;">
+                    id: <code>{{ a.client_id_display }}</code><br>
+                    secret: <code>{{ a.secret_redacted or '(none)' }}</code>
+                    <span style="color:#666;">({{ a.secret_length }} chars)</span>
+                </td>
+                <td style="padding:6px;">
+                    {% if a.is_default %}
+                    <span style="background:#4caf50;color:#fff;padding:2px 8px;border-radius:3px;">✓ your default for {{ a.provider }}</span>
+                    {% else %}
+                    <form method="post" action="{{ url_for('set_default_oauth_app', app_id=a.app_id) }}" style="display:inline">
+                        <button type="submit" class="btn btn-small">Make my default</button>
+                    </form>
                     {% endif %}
-                </div>
+                </td>
+                <td style="padding:6px;">
+                    <a href="{{ url_for('edit_oauth_app', app_id=a.app_id) }}" class="btn btn-small">Edit</a>
+                    <form method="post" action="{{ url_for('delete_oauth_app', app_id=a.app_id) }}"
+                          style="display:inline"
+                          onsubmit="return confirm('Delete OAuth app {{ a.name }}?');">
+                        <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p style="padding:8px 14px;background:#f5f5f5;border-left:3px solid #999;border-radius:0 4px 4px 0;color:#555;">
+            No private apps. You're using server-wide apps for all your accounts. Add one only if you want your own private Azure registration.
+        </p>
+        {% endif %}
 
-                <div style="margin-top:20px;">
-                    <button type="submit" class="btn btn-primary">Save Credentials</button>
-                    <a href="{{ url_for('dashboard') }}" class="btn btn-small" style="margin-left:12px;">Back to Dashboard</a>
-                </div>
-            </form>
-
-            {% if client_id and has_secret %}
-            <div style="margin-top:24px;padding-top:16px;border-top:1px solid #eee;">
-                <p style="color:#2e7d32;"><strong>✓ Microsoft OAuth2 is configured.</strong> You can now add Outlook/Hotmail accounts from the dashboard — click "Add Email Account" and select "Outlook / Hotmail".</p>
+        <!-- ==================== AZURE SETUP INSTRUCTIONS ==================== -->
+        <div class="card" style="max-width:800px;margin-top:2em;">
+            <h3>How to register an Azure app (5 min, one-time per app)</h3>
+            <div style="background:#f0f7ff;border-left:4px solid #2196f3;padding:16px 20px;margin:20px 0;border-radius:0 6px 6px 0;">
+                <ol style="margin:12px 0 0 20px;line-height:1.8;">
+                    <li>Go to <a href="https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank">Microsoft Entra ID → App Registrations</a></li>
+                    <li>Click <strong>New Registration</strong></li>
+                    <li>Name: <code>Mail Archiver</code> (or "Family Mail Archiver", etc.)</li>
+                    <li>Supported account types: <strong>Accounts in any organizational directory and personal Microsoft accounts</strong> (required for personal @hotmail.com / @outlook.com)</li>
+                    <li>Redirect URI: <strong>Web</strong> → <code>{{ request.url_root }}oauth2/callback</code></li>
+                    <li>Click <strong>Register</strong></li>
+                    <li>Copy the <strong>Application (client) ID</strong> — paste in the app's "Client ID" field here</li>
+                    <li>Go to <strong>Certificates & secrets</strong> → <strong>New client secret</strong>. <span style="background:#fff3cd;padding:2px 6px;border-radius:3px;"><strong>Set expiration to 24 months</strong></span></li>
+                    <li>Copy the secret <strong>Value</strong> (not the Secret ID — common gotcha) — paste in the app's "Client Secret" field here</li>
+                    <li>Go to <strong>API permissions</strong> → <strong>Add a permission</strong> → <strong>APIs my organization uses</strong> → search <strong>Office 365 Exchange Online</strong> → <strong>Delegated</strong> → <strong>IMAP.AccessAsUser.All</strong>. Personal MSAs: consent happens at first sign-in.</li>
+                </ol>
+                <p style="margin-top:12px;font-size:0.92em;color:#555;">
+                    <strong>Tenant field:</strong> use <code>common</code> for the standard "any org + personal MSA" registration. Use a specific tenant GUID or verified domain (e.g. <code>yourco.onmicrosoft.com</code>) only for single-tenant apps.
+                </p>
             </div>
-            {% endif %}
         </div>
 
-        <div style="margin-top:20px;">
+        <p style="margin-top:20px;">
             <a href="{{ url_for('dashboard') }}" class="btn">← Back to Dashboard</a>
-        </div>
+        </p>
     </div>
 </body>
 </html>

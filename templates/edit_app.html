@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Archiver — {{ 'Edit' if app else 'New' }} OAuth App</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-header">
+                <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+                <h1><a href="{{ url_for('dashboard') }}">Mail Archiver</a></h1>
+                <a href="{{ url_for('oauth2_settings') }}" class="btn btn-small">← OAuth Apps</a>
+            </div>
+        </header>
+
+        {% with messages = get_flashed_messages() %}
+        {% if messages %}
+        <div class="flash">
+            {% for msg in messages %}<p>{{ msg }}</p>{% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
+
+        <h2>{{ 'Edit' if app else 'New' }} OAuth App</h2>
+
+        <form method="post" action="{{ url_for('edit_oauth_app', app_id=app_id) if app else url_for('new_oauth_app') }}">
+            <fieldset>
+                <legend>App identity</legend>
+
+                <label for="scope">Scope</label>
+                {% if app %}
+                <p><code>{{ form.scope }}</code>
+                    <span class="help-text">(cannot change scope after creation — delete + recreate if needed)</span></p>
+                <input type="hidden" name="scope" value="{{ form.scope }}">
+                {% else %}
+                <select id="scope" name="scope">
+                    <option value="user" {% if form.scope == 'user' %}selected{% endif %}>Private (only you)</option>
+                    <option value="server" {% if form.scope == 'server' %}selected{% endif %}>Server-wide (all users on this appliance)</option>
+                </select>
+                <p class="help-text">Private apps are stored under your data dir; server-wide apps under /opt/mail-archiver and shared by every Linux user.</p>
+                {% endif %}
+
+                <label for="provider">Provider</label>
+                <select id="provider" name="provider" {% if app %}disabled{% endif %}>
+                    {% for p in providers %}
+                    <option value="{{ p }}" {% if form.provider == p %}selected{% endif %}>{{ p.title() }}</option>
+                    {% endfor %}
+                </select>
+                {% if app %}<input type="hidden" name="provider" value="{{ form.provider }}">{% endif %}
+
+                <label for="name">Friendly name</label>
+                <input type="text" id="name" name="name" required
+                       value="{{ form.name }}"
+                       placeholder="e.g. Family Microsoft App, or Work Tenant">
+
+                <label for="tenant">Microsoft Tenant</label>
+                <input type="text" id="tenant" name="tenant"
+                       value="{{ form.tenant }}"
+                       placeholder="common"
+                       style="font-family:monospace;">
+                <p class="help-text">
+                    Use <code>common</code> for personal @hotmail.com / @outlook.com + any-org apps.
+                    Use a specific tenant GUID or <code>yourco.onmicrosoft.com</code> for single-tenant apps.
+                </p>
+            </fieldset>
+
+            <fieldset style="margin-top:1em;">
+                <legend>Azure credentials</legend>
+
+                <label for="client_id">Application (Client) ID</label>
+                <input type="text" id="client_id" name="client_id" required
+                       value="{{ form.client_id }}"
+                       placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                       style="font-family:monospace;">
+
+                <label for="client_secret">Client Secret Value</label>
+                {% if app and secret_redacted %}
+                <p style="margin:4px 0 8px;padding:8px 12px;background:#f0f7ff;border-left:3px solid #2196f3;border-radius:0 4px 4px 0;">
+                    <strong>Currently set:</strong>
+                    <code style="font-family:monospace;">{{ secret_redacted }}</code>
+                    <span style="color:#666;font-size:0.9em;">({{ secret_length }} chars)</span>
+                </p>
+                {% elif app %}
+                <p style="margin:4px 0 8px;padding:8px 12px;background:#fff3cd;border-left:3px solid #ff9800;border-radius:0 4px 4px 0;color:#664d03;">
+                    <strong>Not configured.</strong> Sign-in will fail until you paste a secret below.
+                </p>
+                {% endif %}
+                <input type="password" id="client_secret" name="client_secret"
+                       {% if not app %}required{% endif %}
+                       placeholder="{{ 'Leave blank to keep the current secret' if (app and secret_redacted) else 'Paste your Azure app secret Value here' }}"
+                       style="font-family:monospace;">
+            </fieldset>
+
+            <div class="form-actions" style="margin-top:1em;">
+                <button type="submit" class="btn btn-primary">{{ 'Save Changes' if app else 'Create App' }}</button>
+                <a href="{{ url_for('oauth2_settings') }}" class="btn">Cancel</a>
+            </div>
+        </form>
+
+        {% if app %}
+        <hr style="margin:2em 0;">
+        <form method="post"
+              action="{{ url_for('delete_oauth_app', app_id=app_id) }}"
+              onsubmit="return confirm('Delete OAuth app {{ form.name }}? This is refused if any account is pinned to it.');">
+            <button type="submit" class="btn btn-danger">Delete this app</button>
+            <span class="help-text" style="margin-left:1em;">Delete is refused if any account still uses this app. Reassign accounts first.</span>
+        </form>
+        {% endif %}
+    </div>
+</body>
+</html>

@@ -83,6 +83,23 @@
                        style="width: 140px;">
                 <p class="help-text">Bump above 60 for slow WAN paths or first-time full syncs.</p>
 
+                {% if (account.auth_type == 'oauth2' or provider.auth == 'oauth2') %}
+                <label for="oauth_app_id">OAuth App</label>
+                <select id="oauth_app_id" name="oauth_app_id">
+                    <option value="">(provider default — auto-resolve)</option>
+                    {% for a in available_oauth_apps %}
+                    <option value="{{ a.app_id }}" {% if a.app_id == current_oauth_app_id %}selected{% endif %}>
+                        [{{ 'Server' if a.scope == 'server' else 'Yours' }}] {{ a.name }}
+                        {% if a.is_default %}★ default{% endif %}
+                        — tenant={{ a.tenant }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <p class="help-text">
+                    Which registered Azure app this account uses. Blank = your default for microsoft → server default. Manage apps at <a href="{{ url_for('oauth2_settings') }}">Server Settings → OAuth Apps</a>.
+                </p>
+                {% endif %}
+
                 <div class="form-actions">
                     <button type="submit" class="btn btn-primary">Save Settings</button>
                     <a href="{{ url_for('dashboard') }}" class="btn">Cancel</a>
@@ -98,6 +115,26 @@
 
             {% if account.auth_type == 'oauth2' or provider.auth == 'oauth2' %}
                 <p>This account uses <strong>Microsoft OAuth2</strong>. No password is stored locally — mbsync uses a rotating access token.</p>
+
+                <!-- OAuth App picker: which registered Azure app this account uses -->
+                <div style="margin:12px 0;padding:10px 14px;background:#fafafa;border:1px solid #e0e0e0;border-radius:4px;">
+                    <p style="margin:0 0 4px;"><strong>OAuth App:</strong>
+                        {% set current_app = None %}
+                        {% for a in available_oauth_apps %}{% if a.app_id == current_oauth_app_id %}{% set current_app = a %}{% endif %}{% endfor %}
+                        {% if current_oauth_app_id and current_app %}
+                            <code>{{ current_app.name }}</code>
+                            <span style="color:#666;font-size:0.9em;">[{{ current_app.scope }}] tenant=<code>{{ current_app.tenant }}</code></span>
+                        {% elif current_oauth_app_id %}
+                            <code style="color:#c62828;">{{ current_oauth_app_id }} (not found)</code>
+                            — falling back to provider default
+                        {% else %}
+                            <em>Provider default (auto-resolve)</em>
+                        {% endif %}
+                    </p>
+                    <p style="margin:4px 0 0;font-size:0.9em;color:#555;">
+                        Change with the picker in the main form below (Server &amp; protocol section). Manage the apps at <a href="{{ url_for('oauth2_settings') }}">Server Settings → OAuth Apps</a>.
+                    </p>
+                </div>
 
                 {% if oauth_hint.authorized %}
                 <div style="margin:8px 0 12px;padding:10px 14px;background:#e8f5e9;border-left:3px solid #4caf50;border-radius:0 4px 4px 0;">
