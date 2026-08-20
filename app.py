@@ -61,6 +61,11 @@ CONFIG = {
     'session_timeout': 3600,  # 1 hour
     'allowed_users': None,  # None = any PAM user, or list of usernames
     'auth_mode': os.environ.get('MAIL_ARCHIVER_AUTH', 'pam'),  # 'pam' or 'builtin'
+    # 1.0.15: batched sync — when an account's total message count exceeds
+    # this, split into per-folder batches sized <= threshold. Fresh mbsync
+    # process per batch = fresh IMAP/TLS/timeout window. 0 disables batching.
+    'batch_threshold': int(os.environ.get(
+        'MAIL_ARCHIVER_BATCH_THRESHOLD', '5000')),
 }
 
 SYNC_INTERVALS = {
@@ -83,7 +88,7 @@ PROVIDERS = {
     },
     'hotmail': {
         'name': 'Outlook / Hotmail',
-        'host': 'outlook.office365.com',
+        'host': 'outlook.office.com',
         'port': 993,
         'auth': 'oauth2',
         'auth_label': 'Microsoft Account',
@@ -93,7 +98,7 @@ PROVIDERS = {
     },
     'hotmail_apppass': {
         'name': 'Outlook / Hotmail (App Password)',
-        'host': 'outlook.office365.com',
+        'host': 'outlook.office.com',
         'port': 993,
         'auth': 'app_password',
         'auth_label': 'App Password',
@@ -235,14 +240,21 @@ def login_required(f):
 # --- Credential Storage ---
 
 def _chown_user(path, username):
-    """Set ownership to the system user if running in PAM mode."""
+    """Set ownership to the system user if running in PAM mode.
+
+    Best-effort: swallows OSError so callers running as the target user
+    (batcher measurement, sync worker) don't crash trying to chown their
+    own already-owned paths. Only root can chown to another uid; a
+    non-root process's chown to its own uid is a no-op that raises EPERM
+    for files it doesn't own.
+    """
     if CONFIG['auth_mode'] != 'pam':
         return
     try:
         import pwd
         pw = pwd.getpwnam(username)
         os.chown(str(path), pw.pw_uid, pw.pw_gid)
-    except (KeyError, ImportError):
+    except (KeyError, ImportError, OSError):
         pass
 
 
@@ -266,13 +278,41 @@ def load_accounts(username):
 
 
 def save_accounts(username, accounts):
-    """Save user's email account list."""
+    """Save user's email account list.
+
+    1.0.15: writes mode 0640 owned by <user>:mail-archiver so the gunicorn
+    worker (running AS mail-archiver) can enumerate account counts at
+    startup for the thread autoscaler (`gunicorn.conf.py::_total_accounts`).
+    Prior mode 0600 blocked that read with PermissionError, and the
+    autoscaler silently fell back to threads=4.
+    """
+    import grp
     config_dir = get_user_config_dir(username)
     accounts_file = config_dir / 'accounts.json'
     with open(accounts_file, 'w') as f:
         json.dump(accounts, f, indent=2)
-    os.chmod(str(accounts_file), 0o600)
+    os.chmod(str(accounts_file), 0o640)
     _chown_user(accounts_file, username)
+    # Best-effort group swap to mail-archiver — silently keep user group
+    # if it doesn't exist (dev checkout / no service install).
+    try:
+        gid = grp.getgrnam('mail-archiver').gr_gid
+        stat = os.stat(str(accounts_file))
+        os.chown(str(accounts_file), stat.st_uid, gid)
+    except (KeyError, OSError):
+        pass
+    # Parent .config dir + per-user data-root dir need group-execute so
+    # gunicorn can descend to accounts.json. Both normally 0700 owned by
+    # the user — flip to 0710 with mail-archiver group so the service
+    # traverses but can't list unrelated files inside.
+    try:
+        gid = grp.getgrnam('mail-archiver').gr_gid
+        for d in (config_dir, config_dir.parent):
+            st = os.stat(str(d))
+            os.chown(str(d), st.st_uid, gid)
+            os.chmod(str(d), 0o710)
+    except (KeyError, OSError):
+        pass
 
 
 def generate_mbsyncrc(username):
@@ -1557,6 +1597,117 @@ def _new_sync_job(username, target):
     return job_id
 
 
+def _plan_batches_for_account(username, account_email):
+    """Measure IMAP folder sizes and plan per-folder batches (1.0.15).
+
+    Returns {'total_msgs': int, 'batches': list[list[str]],
+             'folder_count': int} or None if measurement failed.
+
+    In PAM mode, this MUST run as the target PAM user because the IMAP
+    credentials (`.pass` + `.token` under ~<user>/.config/) are private
+    to that user — the mail-archiver service uid can't read them. So we
+    spawn a subprocess that drops privileges (subprocess.run with
+    user=uid/group=gid, kernel setuid via our ambient CAP_SETUID) and
+    have the child do the measurement + return the plan as JSON.
+
+    In builtin mode (single-user container), we run inline — no priv
+    boundary to cross.
+    """
+    if CONFIG['auth_mode'] != 'pam':
+        return _plan_batches_inline(username, account_email)
+
+    import pwd as _pwd
+    try:
+        pw = _pwd.getpwnam(username)
+    except KeyError:
+        return None
+    child = (
+        "import json, sys, os\n"
+        "sys.path.insert(0, '/opt/mail-archiver')\n"
+        "os.environ.setdefault('MAIL_ARCHIVER_AUTH', 'pam')\n"
+        "os.environ.setdefault('MAIL_ARCHIVER_DATA', %r)\n"
+        "os.environ.setdefault('MAIL_ARCHIVER_SECRET_FILE',\n"
+        "    '/opt/mail-archiver/.secret_key')\n"
+        "os.environ.setdefault('MAIL_ARCHIVER_BATCH_THRESHOLD', %r)\n"
+        "import app\n"
+        "plan = app._plan_batches_inline(%r, %r)\n"
+        "print(json.dumps(plan))\n"
+    ) % (CONFIG['data_dir'],
+         str(CONFIG.get('batch_threshold', 5000)),
+         username, account_email)
+    try:
+        result = subprocess.run(
+            ['python3', '-c', child],
+            user=pw.pw_uid, group=pw.pw_gid, cwd=pw.pw_dir,
+            env={
+                'HOME': pw.pw_dir, 'USER': username, 'LOGNAME': username,
+                'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+            },
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout.strip() or 'null')
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def _plan_batches_inline(username, account_email):
+    """The actual measurement — runs AS the target PAM user (post-drop),
+    or directly in builtin mode."""
+    from mail_batcher import measure_folders, plan_batches, BatcherError
+
+    accounts = load_accounts(username)
+    acct = next((a for a in accounts if a.get('email') == account_email), None)
+    if not acct or not acct.get('enabled', True):
+        return None
+
+    provider = PROVIDERS.get(acct['provider'], {})
+    host = acct.get('host') or provider.get('host', '')
+    port = int(acct.get('port') or provider.get('port', 993))
+    tls_default = 'ssl' if provider.get('tls', True) else 'none'
+    tls_mode = (acct.get('tls_mode') or tls_default).lower()
+    auth_type = acct.get('auth_type') or provider.get('auth', 'password')
+    pattern = acct.get('folder_pattern') or '*'
+
+    if auth_type == 'oauth2':
+        safe_name = account_email.replace('@', '_at_').replace('.', '_')
+        token_file = get_user_config_dir(username) / f'{safe_name}.token'
+        if not token_file.exists():
+            return None
+        try:
+            credential = token_file.read_text().strip()
+        except OSError:
+            return None
+    else:
+        try:
+            credential = load_credential(username, account_email)
+        except OSError:
+            return None
+    if not credential:
+        return None
+
+    try:
+        folders = measure_folders(
+            host=host, port=port, tls_mode=tls_mode,
+            email=account_email, credential=credential,
+            auth_type=auth_type, folder_pattern=pattern)
+    except BatcherError:
+        return None
+
+    total = sum(c for _, c in folders)
+    threshold = int(os.environ.get('MAIL_ARCHIVER_BATCH_THRESHOLD',
+                                   CONFIG.get('batch_threshold', 5000)))
+    if threshold <= 0 or total <= threshold:
+        return {'total_msgs': total, 'batches': [], 'folder_count': len(folders)}
+    batches = plan_batches(folders, threshold)
+    return {'total_msgs': total, 'batches': batches,
+            'folder_count': len(folders)}
+
+
 def _run_sync_background(job_id, username, account_email=None):
     """Threaded mbsync runner. Streams stderr into _SYNC_JOBS[job_id].
     Falls back to synchronous run_sync() when mbsync isn't installed
@@ -1631,35 +1782,109 @@ def _run_sync_background(job_id, username, account_email=None):
         with _SYNC_JOBS_LOCK:
             job['state'] = 'syncing'
         started = time.time()
-        proc = subprocess.Popen(cmd, **popen_kwargs)
         tail_lines = []
-        try:
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip('\n')
-                tail_lines.append(line)
-                if len(tail_lines) > 200:
-                    tail_lines.pop(0)
-                parsed = _parse_mbsync_line(line)
+
+        # 1.0.15: try to plan batches when syncing a single named account
+        # and threshold is set. Batching for `-a` (all accounts) is out of
+        # scope — mbsync per-channel semantics don't compose with a global
+        # -a run, and users click Sync Now on individual accounts anyway.
+        batch_plan = None
+        if account_email and CONFIG.get('batch_threshold', 0) > 0:
+            try:
+                batch_plan = _plan_batches_for_account(
+                    username, account_email)
+            except Exception as e:
+                # Measurement failure isn't fatal — fall through to
+                # single-mbsync path and let mbsync report the auth /
+                # network error the same way it always has.
                 with _SYNC_JOBS_LOCK:
-                    job['last_line'] = line
-                    if parsed:
-                        job['progress'] = parsed
-        finally:
-            proc.wait()
+                    job['last_line'] = f'batcher: measure failed: {e}'
+
+        def _line_cb(line):
+            tail_lines.append(line)
+            if len(tail_lines) > 200:
+                tail_lines.pop(0)
+            parsed = _parse_mbsync_line(line)
+            with _SYNC_JOBS_LOCK:
+                job['last_line'] = line
+                if parsed:
+                    # Reset per-batch, preserve batch_* fields set by cb
+                    p = dict(job.get('progress') or {})
+                    p.update(parsed)
+                    job['progress'] = p
+
+        if batch_plan and batch_plan['total_msgs'] > CONFIG['batch_threshold']:
+            from mail_batcher import run_batched_sync
+
+            def _prog_cb(update):
+                with _SYNC_JOBS_LOCK:
+                    p = dict(job.get('progress') or {})
+                    # Reset within-batch counters when a new batch starts
+                    for f in ('folders_done', 'folders_total',
+                              'msg_new_done', 'msg_new_total',
+                              'msg_flag_done', 'msg_flag_total'):
+                        p.pop(f, None)
+                    p.update({k: v for k, v in update.items()
+                             if k.startswith('batch_')})
+                    job['progress'] = p
+                    if 'state' in update and update['state'] in (
+                            'batch_retry', 'batch_failed'):
+                        job['last_line'] = (
+                            f"{update['state']} batch "
+                            f"{update.get('batch_current')}/"
+                            f"{update.get('batch_total')}")
+
+            safe_ch = re.sub(r'[^a-zA-Z0-9_]', '',
+                             account_email.replace('@', '_at_')
+                             .replace('.', '_'))
+            batch_rc = popen_kwargs.get('env', {}).get('HOME')
+            if batch_rc:
+                batch_rc = str(Path(batch_rc) / '.mbsyncrc')
+            else:
+                batch_rc = str(Path(CONFIG['data_dir']) / username / '.mbsyncrc')
+            sp_kwargs = {k: v for k, v in popen_kwargs.items()
+                         if k in ('user', 'group', 'cwd', 'env')}
+            rc = run_batched_sync(
+                channel=safe_ch,
+                mbsyncrc_path=batch_rc,
+                batches=batch_plan['batches'],
+                subprocess_kwargs=sp_kwargs,
+                progress_cb=_prog_cb,
+                line_cb=_line_cb,
+                per_batch_timeout=3600,
+            )
+        else:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            try:
+                for raw_line in proc.stdout:
+                    _line_cb(raw_line.rstrip('\n'))
+            finally:
+                proc.wait()
+            rc = proc.returncode
 
         duration = int(time.time() - started)
         raw_tail = '\n'.join(tail_lines[-20:])
         with _SYNC_JOBS_LOCK:
-            job['exit_code'] = proc.returncode
+            job['exit_code'] = rc
             job['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
             job['duration_s'] = duration
-            if proc.returncode == 0:
+            if rc == 0:
                 job['state'] = 'done'
                 status[key] = {
                     'state': 'ok',
                     'finished': job['finished'],
                     'exit_code': 0,
                     'error': '',
+                }
+            elif rc == 2:
+                # 1.0.15 batched sync: partial success (some batches failed
+                # after retry). Report as 'done' with a warning surfaced.
+                job['state'] = 'done'
+                status[key] = {
+                    'state': 'ok',
+                    'finished': job['finished'],
+                    'exit_code': 2,
+                    'error': 'Some folder batches failed — see log for details',
                 }
             else:
                 friendly = friendly_sync_error(raw_tail, account_email or '')
@@ -1668,7 +1893,7 @@ def _run_sync_background(job_id, username, account_email=None):
                 status[key] = {
                     'state': 'error',
                     'finished': job['finished'],
-                    'exit_code': proc.returncode,
+                    'exit_code': rc,
                     'error': friendly,
                     'raw_error': raw_tail,
                 }

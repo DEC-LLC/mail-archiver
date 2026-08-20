@@ -8,7 +8,7 @@ SRC_DIR="$(dirname "$SCRIPT_DIR")"
 # Single source of truth: repo-root VERSION file (bumped per release)
 VERSION="$(cat "$SRC_DIR/VERSION" | tr -d '[:space:]')"
 [ -n "$VERSION" ] || { echo "ERROR: VERSION file missing/empty at $SRC_DIR/VERSION" >&2; exit 1; }
-RELEASE="1"
+RELEASE="4"
 NAME="mail-archiver"
 
 echo "=== Building mail-archiver packages ==="
@@ -29,6 +29,7 @@ cp "$SRC_DIR/app.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/search_index.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/oauth2_microsoft.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/imap_sync.py" "$RPMBUILD_DIR/SOURCES/" 2>/dev/null || true
+cp "$SRC_DIR/mail_batcher.py" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/templates" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/static" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/mail-archiver.service" "$RPMBUILD_DIR/SOURCES/"
@@ -75,6 +76,7 @@ cp "$SRC_DIR/app.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/search_index.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/oauth2_microsoft.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/imap_sync.py" "$DEB_PKG/opt/mail-archiver/" 2>/dev/null || true
+cp "$SRC_DIR/mail_batcher.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/gunicorn.conf.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/generate-cert.sh" "$DEB_PKG/opt/mail-archiver/"
 chmod 0755 "$DEB_PKG/opt/mail-archiver/generate-cert.sh"

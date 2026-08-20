@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.14
+Version:        1.0.15
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -33,6 +33,7 @@ install -m 644 %{_sourcedir}/app.py %{buildroot}/opt/mail-archiver/app.py
 install -m 644 %{_sourcedir}/search_index.py %{buildroot}/opt/mail-archiver/search_index.py
 install -m 644 %{_sourcedir}/oauth2_microsoft.py %{buildroot}/opt/mail-archiver/oauth2_microsoft.py
 [ -f %{_sourcedir}/imap_sync.py ] && install -m 644 %{_sourcedir}/imap_sync.py %{buildroot}/opt/mail-archiver/imap_sync.py || true
+install -m 644 %{_sourcedir}/mail_batcher.py %{buildroot}/opt/mail-archiver/mail_batcher.py
 install -m 644 %{_sourcedir}/gunicorn.conf.py %{buildroot}/opt/mail-archiver/gunicorn.conf.py
 install -m 755 %{_sourcedir}/generate-cert.sh %{buildroot}/opt/mail-archiver/generate-cert.sh
 install -m 755 %{_sourcedir}/mail-archiver-cred %{buildroot}/usr/libexec/mail-archiver-cred
@@ -64,6 +65,7 @@ CRON
 /opt/mail-archiver/search_index.py
 /opt/mail-archiver/oauth2_microsoft.py
 /opt/mail-archiver/imap_sync.py
+/opt/mail-archiver/mail_batcher.py
 /opt/mail-archiver/gunicorn.conf.py
 /opt/mail-archiver/generate-cert.sh
 /usr/libexec/mail-archiver-cred
@@ -128,6 +130,19 @@ if [ -d "$EFFECTIVE_DATA" ]; then
             MAIL_ARCHIVER_AUTH=pam \
             MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key \
             python3 -c "import app; app.generate_mbsyncrc('$USR')" 2>/dev/null || true
+
+        # 1.0.15: fix accounts.json + parent dir chain perms so the
+        # gunicorn worker (running as mail-archiver) can descend to the
+        # accounts.json for the thread autoscaler. ALL three need
+        # mail-archiver group + traversal bits.
+        CFG_DIR=$(dirname "$ACCT")
+        USR_DIR=$(dirname "$CFG_DIR")
+        chgrp mail-archiver "$ACCT" 2>/dev/null || true
+        chmod 0640 "$ACCT" 2>/dev/null || true
+        chgrp mail-archiver "$CFG_DIR" 2>/dev/null || true
+        chmod 0710 "$CFG_DIR" 2>/dev/null || true
+        chgrp mail-archiver "$USR_DIR" 2>/dev/null || true
+        chmod 0710 "$USR_DIR" 2>/dev/null || true
     done
 fi
 
@@ -145,6 +160,33 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.15-1
+- Batched sync for large accounts. New env MAIL_ARCHIVER_BATCH_THRESHOLD
+  (default 5000). Before invoking mbsync, open ONE cheap IMAP connection
+  and STATUS every folder. When the total exceeds threshold, pack folders
+  smallest-first into batches <= threshold and run mbsync once per batch
+  with a temp mbsyncrc that overrides Patterns to that batch's folders.
+  Fresh mbsync per batch = fresh IMAP connection + fresh TLS session,
+  which eliminates the class of "3-hour sync fails at 90%" server-side
+  timeout errors. Failed batches retry once, then continue to the next
+  batch — partial progress > total failure (exit code 2 signals partial
+  success). Accounts smaller than the threshold take the single-mbsync
+  fast path unchanged. New module mail_batcher.py; plan_batches() is a
+  pure function for unit testing.
+- gunicorn.conf.py: print(..., flush=True) so the resolved worker/thread
+  count line appears in journalctl at boot (silent buffering bug in
+  1.0.14 hid the autoscaler decision from operators).
+- Postinst fixes accounts.json perms to 0640 <user>:mail-archiver + parent
+  .config dir to 0710 <user>:mail-archiver, so the gunicorn worker
+  (running as mail-archiver) can descend into ~/.config and enumerate
+  the account list for the thread autoscaler. New accounts written by
+  save_accounts() also get 0640 g+r from the start.
+- Fix Outlook/Hotmail personal-account IMAP host to outlook.office.com
+  (was outlook.office365.com — mismatched OAuth token audience caused
+  AUTHENTICATIONFAILED for personal MSA accounts). Aligns with the
+  1.0.9 OAuth scope alignment. Postinst regenerates all mbsyncrc files,
+  propagating the corrected host on upgrade.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.14-1
 - SSE progress stream: Sync Now + Sync All are now fire-and-poll —
   POST returns 202 with a job_id, and the browser opens an EventSource

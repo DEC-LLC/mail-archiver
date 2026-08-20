@@ -1,5 +1,5 @@
 Package: mail-archiver
-Version: 1.0.14-1
+Version: 1.0.15-4
 Architecture: all
 Maintainer: Madhav Diwan <madhav@decllc.biz>
 Depends: python3-flask, gunicorn, isync, python3-pam, libsasl2-modules-kdexoauth2

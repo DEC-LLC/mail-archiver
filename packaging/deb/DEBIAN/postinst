@@ -54,6 +54,37 @@ if [ -d "$EFFECTIVE_DATA" ]; then
             MAIL_ARCHIVER_AUTH=pam \
             MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key \
             python3 -c "import app; app.generate_mbsyncrc('$USR')" 2>/dev/null || true
+
+        # 1.0.15: fix accounts.json perms so the gunicorn worker (running
+        # as mail-archiver) can enumerate accounts for the thread
+        # autoscaler in gunicorn.conf.py::_total_accounts. Chain of dirs:
+        #   ${EFFECTIVE_DATA}/<user>/            (mail-archiver data root)
+        #   ${EFFECTIVE_DATA}/<user>/.config/
+        #   ${EFFECTIVE_DATA}/<user>/.config/accounts.json
+        # ALL three need mail-archiver group + traversal bits, because
+        # if any layer is 0700 owned by <user>:<user>, descent fails.
+        CFG_DIR=$(dirname "$ACCT")
+        USR_DIR=$(dirname "$CFG_DIR")
+        chgrp mail-archiver "$ACCT" 2>/dev/null || true
+        chmod 0640 "$ACCT" 2>/dev/null || true
+        chgrp mail-archiver "$CFG_DIR" 2>/dev/null || true
+        chmod 0710 "$CFG_DIR" 2>/dev/null || true
+        # Data-root per-user dir: it's NOT the Linux HOME — it's the
+        # mail-archiver data path (created 0700 by first-write). Adding
+        # mail-archiver group with execute-only lets the service descend
+        # but leaves listing / reading blocked to non-group members.
+        chgrp mail-archiver "$USR_DIR" 2>/dev/null || true
+        chmod 0710 "$USR_DIR" 2>/dev/null || true
+    done
+fi
+# Belt: force-fix any per-user data dir whose .config subtree exists —
+# covers users whose accounts.json is present but was skipped above (e.g.
+# unusual path form).
+if [ -d "$EFFECTIVE_DATA" ]; then
+    for U_DIR in "$EFFECTIVE_DATA"/*/; do
+        [ -d "${U_DIR}.config" ] || continue
+        chgrp mail-archiver "$U_DIR" 2>/dev/null || true
+        chmod 0710 "$U_DIR" 2>/dev/null || true
     done
 fi
 

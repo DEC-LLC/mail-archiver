@@ -163,7 +163,16 @@
         var totalMsgs = (p.msg_new_total || 0) + (p.msg_flag_total || 0);
         var doneMsgs  = (p.msg_new_done  || 0) + (p.msg_flag_done  || 0);
         var pct = totalMsgs ? Math.floor(100 * doneMsgs / totalMsgs) : 0;
-        var line = 'Syncing ';
+        var line = '';
+        // 1.0.15: prepend batch header on large-account batched sync
+        if (p.batch_total && p.batch_total > 1) {
+            line += 'Batch ' + p.batch_current + '/' + p.batch_total;
+            if (p.batch_folder_count) {
+                line += ' (' + p.batch_folder_count + ' folders)';
+            }
+            line += ' · ';
+        }
+        line += 'Syncing ';
         if (p.folders_total) {
             line += 'folder ' + p.folders_done + '/' + p.folders_total + ' — ';
         }

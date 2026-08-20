@@ -64,4 +64,5 @@ threads = max(_base, min(_cap, _base + _accts))
 timeout = 3600  # match mbsync 1h ceiling
 
 print(f'gunicorn: workers={workers} threads={threads} '
-      f'(accounts={_accts}, base={_base}, cap={_cap})')
+      f'(accounts={_accts}, base={_base}, cap={_cap})',
+      flush=True)
