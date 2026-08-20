@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.15
+Version:        1.0.16
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -146,6 +146,27 @@ if [ -d "$EFFECTIVE_DATA" ]; then
     done
 fi
 
+# 1.0.16: OAuth token files + legacy .pass credential files must be
+# readable+writable by BOTH the target Linux user (mbsync PassCmd cat)
+# AND the mail-archiver group (the Flask process that auto-refreshes
+# OAuth tokens BEFORE spawning mbsync). Pre-1.0.16 they landed as
+# 0600 mail-archiver:mail-archiver — target user couldn't read, and
+# refresh chain never ran. Fix: 0640 <user>:mail-archiver.
+if [ -d "$EFFECTIVE_DATA" ]; then
+    for U_DIR in "$EFFECTIVE_DATA"/*/; do
+        [ -d "${U_DIR}.config" ] || continue
+        USR=$(basename "$U_DIR")
+        for f in "${U_DIR}.config/"*.oauth2.json \
+                 "${U_DIR}.config/"*.token \
+                 "${U_DIR}.config/"*.pass; do
+            [ -f "$f" ] || continue
+            chown "${USR}:mail-archiver" "$f" 2>/dev/null || \
+                chgrp mail-archiver "$f" 2>/dev/null || true
+            chmod 0640 "$f" 2>/dev/null || true
+        done
+    done
+fi
+
 if systemctl is-active --quiet mail-archiver; then
     systemctl restart mail-archiver || true
 fi
@@ -160,6 +181,38 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.16-1
+- P0 FIX (OAuth auto-refresh): Every OAuth account failed to sync ~1h
+  after the user clicked "Sign in with Microsoft", because run_sync
+  fired mbsync with the stale access_token cached on disk at authorize
+  time (Microsoft MSA/AAD access tokens live 60 min). Users would have
+  had to click Sign in every hour — untenable for a background archive.
+  Fix: _refresh_oauth_tokens_before_sync runs INSIDE the Flask process
+  BEFORE every mbsync spawn (both run_sync and _run_sync_background /
+  SSE path). Uses the 90-day-lived refresh_token to mint fresh access
+  tokens; refresh_all_oauth_tokens in oauth2_microsoft persists them
+  atomically (tempfile+rename) with fcntl.flock across the read-check-
+  refresh-write critical section, so parallel mbsync spawns can't
+  clobber the rotated refresh_token. Guarantees offline_access in the
+  refresh scope even when the stored scope omits it (else Microsoft
+  returns an access_token but no refresh_token → chain silently breaks
+  after one more hour). Perms preserved: 0640 <user>:mail-archiver so
+  both mbsync (as target user) can `cat .token` and gunicorn (as
+  mail-archiver) can write refreshed values.
+- Refresh-token-invalid handling: On HTTP 400 error=invalid_grant
+  (refresh_token >90d old, revoked, or client_secret rotated), the
+  account's .oauth2.json gets needs_reauth=true, sync_status.json
+  surfaces "Microsoft sign-in expired. Click 'Sign in with Microsoft'
+  on the account settings page to renew." and the endpoint stops
+  being hammered until the user re-authorizes. New TokenNeedsReauth
+  exception + mark_token_needs_reauth helper in oauth2_microsoft.
+- Postinst: OAuth token files (*.oauth2.json, *.token) and legacy
+  *.pass credential files now chowned <user>:mail-archiver 0640 on
+  upgrade so the target user (mbsync PassCmd `cat`) AND the
+  mail-archiver group (Flask refresh writer + batcher measurement
+  subprocess) can both read+write. Closes the 1.0.15 follow-up about
+  legacy .pass files being 0600 mail-archiver:mail-archiver.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.15-1
 - Batched sync for large accounts. New env MAIL_ARCHIVER_BATCH_THRESHOLD
   (default 5000). Before invoking mbsync, open ONE cheap IMAP connection

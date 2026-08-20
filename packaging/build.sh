@@ -8,7 +8,7 @@ SRC_DIR="$(dirname "$SCRIPT_DIR")"
 # Single source of truth: repo-root VERSION file (bumped per release)
 VERSION="$(cat "$SRC_DIR/VERSION" | tr -d '[:space:]')"
 [ -n "$VERSION" ] || { echo "ERROR: VERSION file missing/empty at $SRC_DIR/VERSION" >&2; exit 1; }
-RELEASE="4"
+RELEASE="1"
 NAME="mail-archiver"
 
 echo "=== Building mail-archiver packages ==="

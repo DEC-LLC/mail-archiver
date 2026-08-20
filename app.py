@@ -710,11 +710,76 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
         }
 
 
+def _refresh_oauth_tokens_before_sync(username, account_email=None,
+                                       progress_log=None):
+    """Refresh every OAuth account's access token BEFORE spawning mbsync.
+
+    P0 bug fix (1.0.16). MSA/AAD access tokens live ~60 min; refresh
+    tokens live 90 days. Prior releases wrote the access_token to disk
+    at sign-in time and mbsync read it via `cat .token` — so every
+    OAuth sync failed with AUTHENTICATIONFAILED an hour after
+    authorize, until the user re-signed-in through the WebUI. Backgrounded
+    archive can't survive that.
+
+    This runs INSIDE the Flask process (as mail-archiver, gunicorn worker)
+    BEFORE any mbsync spawn, so:
+      * The refresh uses the mail-archiver user's write access to
+        <data>/<user>/.config/*.oauth2.json (0640 <user>:mail-archiver)
+      * mbsync-as-target-user later just reads the fresh .token file
+      * No drop-priv-then-write complication
+
+    Concurrency-safe via fcntl.flock on a sibling .lock file per account.
+
+    Returns the per-email report dict from
+    oauth2_microsoft.refresh_all_oauth_tokens(). Callers should surface
+    needs_reauth flags in the sync status.
+    """
+    try:
+        from oauth2_microsoft import refresh_all_oauth_tokens
+    except ImportError:
+        return {}
+    accounts = load_accounts(username)
+
+    def _log(msg):
+        # Prefix so the message is greppable in journalctl vs any other
+        # gunicorn output. flush=True because gunicorn's default buffering
+        # swallowed the 1.0.14 autoscaler log until 1.0.15 fixed the
+        # print(flush=True) — same class of bug, same defense.
+        try:
+            print(f'mail-archiver oauth-refresh: {msg}', flush=True)
+        except Exception:
+            pass
+        if progress_log is not None:
+            try:
+                progress_log(msg)
+            except Exception:
+                pass
+
+    return refresh_all_oauth_tokens(
+        data_dir=CONFIG['data_dir'],
+        username=username,
+        only_email=account_email,
+        accounts_iter=lambda: accounts,
+        logger=_log,
+    )
+
+
 def run_sync(username, account_email=None):
     """Trigger email sync for a user.
 
     Auto-detects sync backend: mbsync if available, imaplib fallback.
     """
+    # P0: refresh OAuth access tokens BEFORE spawning mbsync. Without
+    # this, mbsync fires with a stale (>1h old) token → AUTHENTICATIONFAILED.
+    # See _refresh_oauth_tokens_before_sync for full rationale.
+    try:
+        _refresh_oauth_tokens_before_sync(username, account_email)
+    except Exception as e:
+        # Refresh failure isn't fatal on its own — a per-account
+        # needs_reauth flag lands via the helper. Continue to mbsync;
+        # if the token really is dead, mbsync will surface it.
+        print(f'mail-archiver oauth-refresh: pre-sync refresh raised: {e}',
+              flush=True)
     import shlex
     config_dir = get_user_config_dir(username)
     archive_dir = Path(CONFIG['data_dir']) / username
@@ -1736,6 +1801,31 @@ def _run_sync_background(job_id, username, account_email=None):
         status[key] = {'state': 'syncing',
                        'started': time.strftime('%Y-%m-%d %H:%M:%S')}
         _write_sync_status_locked(status_file, status)
+
+        # P0 (1.0.16): refresh OAuth tokens BEFORE spawning mbsync AND
+        # BEFORE the batcher measurement (which also uses the token via
+        # imaplib). Any account whose refresh_token is dead lands a
+        # needs_reauth flag in its .oauth2.json — mbsync will still
+        # fire, hit AUTHENTICATIONFAILED, and report the same error the
+        # WebUI already surfaces. Don't fail the whole sync — the
+        # per-account reauth flag is the actionable signal.
+        try:
+            oauth_report = _refresh_oauth_tokens_before_sync(
+                username, account_email)
+            for e_addr, rep in (oauth_report or {}).items():
+                if rep.get('needs_reauth'):
+                    status[e_addr] = {
+                        'state': 'error',
+                        'finished': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'error': ('Microsoft sign-in expired. Click '
+                                  '"Sign in with Microsoft" on the '
+                                  'account settings page to renew.'),
+                        'needs_reauth': True,
+                    }
+                    _write_sync_status_locked(status_file, status)
+        except Exception as e:
+            with _SYNC_JOBS_LOCK:
+                job['last_line'] = f'oauth pre-refresh error: {e}'
 
         if account_email:
             safe_name = account_email.replace('@', '_at_').replace('.', '_')

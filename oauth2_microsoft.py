@@ -17,14 +17,31 @@ Legacy schema (v1) — `{"microsoft": {"client_id": "...", "client_secret": "...
 and set as the server default for provider=microsoft.
 """
 
+import fcntl
 import json
 import os
+import sys
+import tempfile
 import time
 import secrets
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
+
+
+class TokenNeedsReauth(Exception):
+    """Refresh token is invalid/revoked — user must click Sign in again.
+
+    Raised by ensure_fresh_token when Microsoft returns
+    error=invalid_grant on the refresh POST (refresh_token is >90 days
+    old, was revoked, or the app's client_secret was rotated). Callers
+    surface a re-authorize prompt in the WebUI rather than looping.
+    """
+    def __init__(self, email: str, detail: str = ''):
+        self.email = email
+        self.detail = detail
+        super().__init__(f'{email}: needs re-authorization ({detail})')
 
 
 # Scopes for IMAP access — provider-fixed for Microsoft.
@@ -104,22 +121,57 @@ class MicrosoftOAuth2:
             raise ValueError(f'OAuth2 error: {result.get("error_description", result["error"])}')
         return result
 
-    def refresh_access_token(self, refresh_token: str) -> dict:
+    def refresh_access_token(self, refresh_token: str, scope: str = None) -> dict:
+        """Refresh via the /token endpoint. `scope` overrides SCOPES so
+        callers can pass the exact scope Microsoft stamped on the prior
+        access_token (must always include `offline_access` or the response
+        omits refresh_token → chain breaks after 1 hour).
+
+        Raises TokenNeedsReauth on error=invalid_grant (refresh token
+        revoked/expired). Raises ValueError on any other error.
+        """
+        if not scope:
+            scope = ' '.join(SCOPES)
+        # Belt: always ensure offline_access is present on refresh, else
+        # Microsoft returns access_token but no refresh_token, silently
+        # ending the auto-refresh chain.
+        if 'offline_access' not in scope:
+            scope = scope + ' offline_access'
         data = urlencode({
             'client_id': self.client_id,
             'client_secret': self.client_secret,
             'refresh_token': refresh_token,
             'grant_type': 'refresh_token',
-            'scope': ' '.join(SCOPES),
+            'scope': scope,
         }).encode()
         req = Request(self._token_url, data=data, method='POST')
         req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        body = None
         try:
             with urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
+                body = resp.read()
+                result = json.loads(body)
+        except HTTPError as e:
+            body = e.read() if hasattr(e, 'read') else b''
+            try:
+                result = json.loads(body)
+            except Exception:
+                result = {'error': 'http_error',
+                          'error_description': f'HTTP {e.code}: {body[:200]!r}'}
+            if result.get('error') == 'invalid_grant':
+                # Refresh token itself is dead — no amount of retrying will
+                # fix this. Caller must trigger interactive reauth.
+                raise TokenNeedsReauth(
+                    email='',
+                    detail=result.get('error_description', 'invalid_grant')[:200])
+            raise ValueError(f'OAuth2 refresh HTTP error: '
+                             f'{result.get("error_description", result.get("error", str(e)))}')
         except URLError as e:
-            raise ValueError(f'Token refresh failed: {e}')
+            raise ValueError(f'Token refresh network failed: {e}')
         if 'error' in result:
+            if result['error'] == 'invalid_grant':
+                raise TokenNeedsReauth(email='',
+                                       detail=result.get('error_description', 'invalid_grant')[:200])
             raise ValueError(f'OAuth2 refresh error: {result.get("error_description", result["error"])}')
         return result
 
@@ -128,50 +180,122 @@ class MicrosoftOAuth2:
 # Per-account token storage (unchanged from v1.0.7)
 # ---------------------------------------------------------------------------
 
+def _atomic_write(path: Path, content: bytes, mode: int, uid, gid) -> None:
+    """Write `content` to `path` via tempfile + rename. Preserve mode/owner.
+    Never leaves a partial file — a crash mid-write keeps the old file intact.
+    """
+    d = path.parent
+    fd, tmp = tempfile.mkstemp(dir=str(d), prefix='.' + path.name + '.', suffix='.tmp')
+    try:
+        os.write(fd, content)
+        os.fsync(fd)
+        os.close(fd)
+        os.chmod(tmp, mode)
+        if uid is not None:
+            try:
+                os.chown(tmp, uid, gid)
+            except (PermissionError, OSError):
+                pass
+        os.rename(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_oauth2_tokens(data_dir: str, username: str, email: str, tokens: dict):
-    """Save OAuth2 tokens for an account. Chowns to target PAM user."""
+    """Save OAuth2 tokens for an account. Atomic + chowned to target PAM user.
+
+    Writes BOTH:
+      * <safe_name>.oauth2.json — full token blob (access + refresh + expiry)
+      * <safe_name>.token       — flat access token (mbsync PassCmd reads this)
+
+    Uses tempfile+rename so a mid-write crash never leaves a truncated
+    file that would nuke the refresh_token. Perms: 0640 <user>:mail-archiver
+    so BOTH the target user (who runs `cat .token` via mbsync PassCmd) AND
+    the mail-archiver gunicorn worker (who writes fresh tokens post-refresh
+    in the Flask process) can read+write.
+    """
+    import grp
     import pwd
     config_dir = Path(data_dir) / username / '.config'
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    target_uid = target_gid = None
+    target_uid = None
+    ma_gid = None
     try:
         pw = pwd.getpwnam(username)
-        target_uid, target_gid = pw.pw_uid, pw.pw_gid
-        try:
-            os.chown(config_dir, target_uid, target_gid)
-        except (PermissionError, OSError):
-            pass
+        target_uid = pw.pw_uid
     except KeyError:
         pass
+    try:
+        ma_gid = grp.getgrnam('mail-archiver').gr_gid
+    except KeyError:
+        pass
+    # Fall back to the target user's primary group if mail-archiver group
+    # doesn't exist yet (postinst hasn't run in dev tree).
+    write_gid = ma_gid if ma_gid is not None else (
+        pwd.getpwnam(username).pw_gid if target_uid is not None else -1)
+
+    if target_uid is not None:
+        try:
+            os.chown(str(config_dir), target_uid, write_gid if write_gid != -1 else target_uid)
+        except (PermissionError, OSError):
+            pass
 
     safe_name = email.replace('@', '_at_').replace('.', '_')
     token_file = config_dir / f'{safe_name}.oauth2.json'
+    pass_file = config_dir / f'{safe_name}.token'
+
     token_data = {
         'access_token': tokens.get('access_token', ''),
         'refresh_token': tokens.get('refresh_token', ''),
         'expires_at': int(time.time()) + int(tokens.get('expires_in', 3600)),
         'scope': tokens.get('scope', ''),
         'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'app_id': tokens.get('app_id') or tokens.get('_app_id') or '',
+        # Explicitly clear needs_reauth on successful save. If a refresh
+        # ever succeeds, we're back in the healthy loop.
+        'needs_reauth': False,
     }
-    with open(token_file, 'w') as f:
-        json.dump(token_data, f, indent=2)
-    token_file.chmod(0o600)
-    if target_uid is not None:
-        try:
-            os.chown(token_file, target_uid, target_gid)
-        except (PermissionError, OSError):
-            pass
+    # Preserve any prior keys we didn't touch (forwards-compat).
+    prior = load_oauth2_tokens(data_dir, username, email)
+    if 'app_id' in prior and not token_data['app_id']:
+        token_data['app_id'] = prior['app_id']
 
-    pass_file = config_dir / f'{safe_name}.token'
-    with open(pass_file, 'w') as f:
-        f.write(tokens['access_token'])
-    pass_file.chmod(0o600)
-    if target_uid is not None:
-        try:
-            os.chown(pass_file, target_uid, target_gid)
-        except (PermissionError, OSError):
-            pass
+    _atomic_write(token_file, json.dumps(token_data, indent=2).encode(),
+                  0o640, target_uid, write_gid)
+    _atomic_write(pass_file, token_data['access_token'].encode(),
+                  0o640, target_uid, write_gid)
+
+
+def mark_token_needs_reauth(data_dir: str, username: str, email: str,
+                            reason: str = '') -> None:
+    """Flip needs_reauth=True on the token file (refresh_token dead)."""
+    tokens = load_oauth2_tokens(data_dir, username, email)
+    if not tokens:
+        return
+    tokens['needs_reauth'] = True
+    tokens['reauth_reason'] = reason
+    tokens['reauth_flagged_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    import grp
+    import pwd
+    target_uid = None
+    write_gid = None
+    try:
+        target_uid = pwd.getpwnam(username).pw_uid
+    except KeyError:
+        pass
+    try:
+        write_gid = grp.getgrnam('mail-archiver').gr_gid
+    except KeyError:
+        write_gid = pwd.getpwnam(username).pw_gid if target_uid else -1
+    safe_name = email.replace('@', '_at_').replace('.', '_')
+    token_file = Path(data_dir) / username / '.config' / f'{safe_name}.oauth2.json'
+    _atomic_write(token_file, json.dumps(tokens, indent=2).encode(),
+                  0o640, target_uid, write_gid)
 
 
 def load_oauth2_tokens(data_dir: str, username: str, email: str) -> dict:
@@ -191,18 +315,178 @@ def is_token_expired(tokens: dict, buffer_seconds: int = 300) -> bool:
     return time.time() >= (tokens.get('expires_at', 0) - buffer_seconds)
 
 
+def _lock_path(data_dir: str, username: str, email: str) -> Path:
+    safe = email.replace('@', '_at_').replace('.', '_')
+    return Path(data_dir) / username / '.config' / f'{safe}.oauth2.lock'
+
+
 def ensure_fresh_token(oauth2: MicrosoftOAuth2, data_dir: str,
                        username: str, email: str) -> str:
-    tokens = load_oauth2_tokens(data_dir, username, email)
-    if not tokens or not tokens.get('refresh_token'):
-        raise ValueError(f'No OAuth2 tokens for {email}. Re-authenticate via the web UI.')
-    if is_token_expired(tokens):
-        new_tokens = oauth2.refresh_access_token(tokens['refresh_token'])
-        if 'refresh_token' not in new_tokens:
+    """Return a valid access_token, refreshing if expired-or-close-to-expiry.
+
+    Concurrency-safe: acquires an exclusive flock on a sibling .lock file
+    for the read-check-refresh-write critical section, so two parallel
+    mbsync spawns can't both refresh and clobber each other's rotated
+    refresh_token. The lock is short-lived (network + one small file
+    write) — typical hold time <1s.
+
+    Raises TokenNeedsReauth if Microsoft rejects the refresh_token
+    (invalid_grant) — caller should flag the account in the WebUI.
+    Raises ValueError on missing tokens or transient network errors.
+    """
+    lockp = _lock_path(data_dir, username, email)
+    lockp.parent.mkdir(parents=True, exist_ok=True)
+    # Touch the lock file first (own it so we can chmod after flock).
+    lf = open(str(lockp), 'a+')
+    try:
+        try:
+            os.chmod(str(lockp), 0o660)
+        except OSError:
+            pass
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            # Filesystem doesn't support flock — proceed unlocked.
+            # (Same degradation policy as _write_sync_status_locked in app.)
+            pass
+
+        # Re-read INSIDE the lock — another process may have refreshed
+        # while we were waiting on the flock.
+        tokens = load_oauth2_tokens(data_dir, username, email)
+        if not tokens or not tokens.get('refresh_token'):
+            raise ValueError(
+                f'No OAuth2 refresh_token for {email}. '
+                f'Click "Sign in with Microsoft" on the account settings '
+                f'page to complete first-time authorization.')
+
+        if tokens.get('needs_reauth'):
+            # We already know this account needs interactive reauth — don't
+            # hammer Microsoft again. Callers should surface a clear WebUI
+            # message rather than retrying.
+            raise TokenNeedsReauth(
+                email=email,
+                detail=tokens.get('reauth_reason', 'previously-flagged'))
+
+        if not is_token_expired(tokens):
+            return tokens['access_token']
+
+        # Refresh needed. Use the scope Microsoft stamped on the prior
+        # token (Microsoft echoes scope back on token response) so the
+        # refreshed access_token targets the same audience.
+        try:
+            new_tokens = oauth2.refresh_access_token(
+                tokens['refresh_token'],
+                scope=tokens.get('scope'))
+        except TokenNeedsReauth as e:
+            # Flip the flag so future sync attempts short-circuit fast.
+            e.email = email
+            mark_token_needs_reauth(data_dir, username, email, str(e.detail))
+            raise
+
+        # Microsoft rotates refresh_token on every refresh. If the response
+        # omits it (should not happen when scope includes offline_access,
+        # but belt+braces), keep the prior one — else the chain breaks.
+        if 'refresh_token' not in new_tokens or not new_tokens.get('refresh_token'):
             new_tokens['refresh_token'] = tokens['refresh_token']
+        # Preserve app_id / any tracking fields the caller wants persisted.
+        if tokens.get('app_id'):
+            new_tokens.setdefault('_app_id', tokens['app_id'])
+
         save_oauth2_tokens(data_dir, username, email, new_tokens)
         return new_tokens['access_token']
-    return tokens['access_token']
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            lf.close()
+        except OSError:
+            pass
+
+
+def refresh_all_oauth_tokens(data_dir: str, username: str,
+                              only_email: str = None,
+                              accounts_iter=None,
+                              redirect_uri_stub: str = 'https://localhost/callback',
+                              logger=None) -> dict:
+    """Refresh every OAuth account's access_token (or just `only_email`).
+
+    Returns a report dict:
+        {email: {'refreshed': bool, 'needs_reauth': bool, 'error': str|None,
+                 'expires_at': int|None}}
+
+    `accounts_iter` is a callable that returns the list of accounts (each
+    a dict with 'email', 'provider', 'auth_type', 'oauth_app_id'). Kept
+    injectable so app.py's load_accounts stays the source of truth.
+
+    `redirect_uri_stub` is only used by build_microsoft_oauth2 to satisfy
+    the constructor — refresh does not hit the redirect flow at all.
+
+    This function NEVER raises for one account's failure — it records
+    the failure per-email so callers can proceed with other accounts.
+    """
+    if accounts_iter is None:
+        raise ValueError('accounts_iter must be provided')
+    report = {}
+    for acct in accounts_iter():
+        email = acct.get('email')
+        if not email:
+            continue
+        if only_email and email != only_email:
+            continue
+        auth_type = acct.get('auth_type') or ''
+        if auth_type != 'oauth2':
+            continue
+        provider = acct.get('provider') or ''
+        # Right now we only support Microsoft OAuth — future providers
+        # would branch here.
+        if provider not in ('hotmail', 'outlook', 'microsoft', 'office365'):
+            # Still permit refresh if the app is a microsoft one — some
+            # accounts key on non-standard provider names.
+            pass
+        oauth_app_id = acct.get('oauth_app_id')
+        try:
+            app_obj = resolve_oauth_app(data_dir, username,
+                                        app_id=oauth_app_id,
+                                        provider='microsoft')
+            if not app_obj:
+                report[email] = {'refreshed': False, 'needs_reauth': False,
+                                 'error': 'no OAuth app resolved',
+                                 'expires_at': None}
+                continue
+            oauth = build_microsoft_oauth2(app_obj, redirect_uri_stub)
+            # ensure_fresh_token is a no-op if not close to expiry.
+            ensure_fresh_token(oauth, data_dir, username, email)
+            tok = load_oauth2_tokens(data_dir, username, email)
+            report[email] = {
+                'refreshed': True, 'needs_reauth': False, 'error': None,
+                'expires_at': tok.get('expires_at'),
+            }
+            if logger:
+                try:
+                    logger(f'oauth refresh: {email} expires_at={tok.get("expires_at")}')
+                except Exception:
+                    pass
+        except TokenNeedsReauth as e:
+            report[email] = {'refreshed': False, 'needs_reauth': True,
+                             'error': f'refresh_token invalid: {e.detail}',
+                             'expires_at': None}
+            if logger:
+                try:
+                    logger(f'oauth NEEDS_REAUTH: {email}: {e.detail}')
+                except Exception:
+                    pass
+        except Exception as e:
+            report[email] = {'refreshed': False, 'needs_reauth': False,
+                             'error': f'{type(e).__name__}: {e}',
+                             'expires_at': None}
+            if logger:
+                try:
+                    logger(f'oauth refresh FAILED for {email}: {e}')
+                except Exception:
+                    pass
+    return report
 
 
 # ---------------------------------------------------------------------------

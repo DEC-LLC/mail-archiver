@@ -88,6 +88,27 @@ if [ -d "$EFFECTIVE_DATA" ]; then
     done
 fi
 
+# 1.0.16: OAuth token files + legacy .pass credential files must be
+# readable+writable by BOTH the target Linux user (mbsync PassCmd cat)
+# AND the mail-archiver group (the Flask process that auto-refreshes
+# OAuth tokens BEFORE spawning mbsync). Pre-1.0.16 they landed as
+# 0600 mail-archiver:mail-archiver — target user couldn't read, and
+# refresh chain never ran. Fix: 0640 <user>:mail-archiver.
+if [ -d "$EFFECTIVE_DATA" ]; then
+    for U_DIR in "$EFFECTIVE_DATA"/*/; do
+        [ -d "${U_DIR}.config" ] || continue
+        USR=$(basename "$U_DIR")
+        for f in "${U_DIR}.config/"*.oauth2.json \
+                 "${U_DIR}.config/"*.token \
+                 "${U_DIR}.config/"*.pass; do
+            [ -f "$f" ] || continue
+            chown "${USR}:mail-archiver" "$f" 2>/dev/null || \
+                chgrp mail-archiver "$f" 2>/dev/null || true
+            chmod 0640 "$f" 2>/dev/null || true
+        done
+    done
+fi
+
 # Restart if already running so new gunicorn config + code take effect
 if systemctl is-active --quiet mail-archiver; then
     systemctl restart mail-archiver || true
