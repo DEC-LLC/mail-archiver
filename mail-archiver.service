@@ -51,7 +51,12 @@ PrivateTmp=true
 #                         PAM user, not by mail-archiver service user)
 #   CAP_SETUID/SETGID   — pam_unix account-phase seteuid/setegid
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETUID CAP_SETGID
-AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
+# SETUID/SETGID must be in Ambient (not just Bounding) so Python's
+# subprocess.run(user=..., group=...) can do the setuid before exec.
+# Kernel checks CAP_SETUID in CapEff; systemd promotes AmbientCapabilities
+# into CapPrm+CapEff+CapInh at drop-to-User= time. Without this, sync
+# fails at the subprocess call with PermissionError.
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETUID CAP_SETGID
 RestrictNamespaces=true
 # RestrictSUIDSGID left disabled — pam_unix helper is setuid/setgid.
 # RestrictSUIDSGID=true

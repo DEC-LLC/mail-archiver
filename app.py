@@ -701,31 +701,47 @@ def run_sync(username, account_email=None):
         else:
             mbsync_arg = '-a'
 
+        # Build subprocess.run kwargs. PAM-mode calls subprocess with
+        # user=uid, group=gid — the kernel does setuid at exec time from
+        # our ambient CAP_SETUID+CAP_SETGID. No shell wrapper needed:
+        # su(1) prompts for password when caller isn't root, and
+        # runuser(1) requires root on Debian (only setuid on Rocky/RHEL).
+        # Kernel-level setuid via subprocess kwargs is portable + clean.
+        subprocess_kwargs = {'capture_output': True, 'text': True,
+                             'timeout': 3600}
         if CONFIG['auth_mode'] == 'pam':
-            # Use runuser instead of su — su prompts for target user's password
-            # when the caller isn't root (the WebUI-triggered sync path runs as
-            # mail-archiver, not root, unlike the cron path). runuser skips the
-            # password prompt when the caller has CAP_SETUID (which we do).
-            # Fall back to su if runuser isn't installed.
-            runner = 'runuser' if shutil.which('runuser') else 'su'
-            if runner == 'runuser':
-                # `runuser -u <user> -- CMD [ARGS]` exec's directly, no
-                # shell. Cannot combine -u with -s/--shell — mutually
-                # exclusive per runuser(1). Passing mbsync as a distinct
-                # argv element (not a shell string) also removes any
-                # shell-quoting concerns about mbsync_arg.
-                cmd = ['runuser', '-u', username, '--', 'mbsync', mbsync_arg]
-            else:
-                cmd = ['su', '-s', '/bin/sh', '-', username, '-c',
-                       f'mbsync {shlex.quote(mbsync_arg)}']
+            import pwd as _pwd
+            try:
+                pw = _pwd.getpwnam(username)
+            except KeyError:
+                raise ValueError(
+                    f'PAM user {username!r} not present on this host — '
+                    f'cannot run mbsync as that identity')
+            cmd = ['mbsync', mbsync_arg]
+            subprocess_kwargs.update({
+                'user':  pw.pw_uid,
+                'group': pw.pw_gid,
+                'cwd':   pw.pw_dir,
+                # Fresh minimal env — inherited env from the mail-archiver
+                # service context would leak HOME=/var/lib/mail-archiver
+                # etc. mbsync + our PassCmd helper only need HOME (for
+                # ~/.mbsyncrc lookup), USER (for identity), and PATH (for
+                # the helper's /usr/libexec/mail-archiver-cred).
+                'env': {
+                    'HOME':    pw.pw_dir,
+                    'USER':    username,
+                    'LOGNAME': username,
+                    'SHELL':   pw.pw_shell or '/bin/sh',
+                    'PATH':    '/usr/local/sbin:/usr/local/bin:'
+                               '/usr/sbin:/usr/bin:/sbin:/bin',
+                },
+            })
         else:
             rc = archive_dir / '.mbsyncrc'
             cmd = ['mbsync', '-c', str(rc), mbsync_arg]
 
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=3600
-            )
+            result = subprocess.run(cmd, **subprocess_kwargs)
             if result.returncode == 0:
                 status[key] = {
                     'state': 'ok',

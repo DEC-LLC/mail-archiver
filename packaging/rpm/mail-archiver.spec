@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.12
+Version:        1.0.13
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -118,6 +118,25 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.13-1
+- Kernel-level setuid via subprocess kwargs — no more su/runuser wrapper.
+  Ends the ping-pong (1.0.5 su→runuser fallback, 1.0.12 fixed runuser
+  args) by doing what the original QA report actually recommended:
+  subprocess.run(user=uid, group=gid, cwd=home, env=…) drops privs
+  via the kernel using our ambient CAP_SETUID+CAP_SETGID. Portable —
+  runuser requires root on Debian (only setuid on Rocky/RHEL), su
+  prompts for password on non-root callers, both hit today.
+- Unit change (required companion to the code fix): promote CAP_SETUID
+  and CAP_SETGID from CapabilityBoundingSet-only to AmbientCapabilities
+  so systemd puts them in the Effective set for the mail-archiver
+  process. Without this, subprocess(user=…) raises PermissionError
+  because CapEff lacks SETUID. Verified live-current unit had only
+  4 caps in CapEff (0x0f) — adds 2 more (0xcf).
+- New sync env: pass a minimal explicit env {HOME, USER, LOGNAME,
+  SHELL, PATH} to mbsync when running as target user — otherwise
+  inheritance would leak HOME=/var/lib/mail-archiver, breaking the
+  PassCmd helper's per-user .oauth2 token lookup.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.12-1
 - HOTFIX: `runuser -u <user> -s /bin/sh -- mbsync ...` errors with
   "options --{shell,fast,command,session-command,login} and --user
