@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.0
+Version:        1.0.4
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0

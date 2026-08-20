@@ -5,7 +5,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_DIR="$(dirname "$SCRIPT_DIR")"
-VERSION="1.0.0"
+# Single source of truth: repo-root VERSION file (bumped per release)
+VERSION="$(cat "$SRC_DIR/VERSION" | tr -d '[:space:]')"
+[ -n "$VERSION" ] || { echo "ERROR: VERSION file missing/empty at $SRC_DIR/VERSION" >&2; exit 1; }
 RELEASE="1"
 NAME="mail-archiver"
 
@@ -30,8 +32,10 @@ cp -r "$SRC_DIR/templates" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/static" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/mail-archiver.service" "$RPMBUILD_DIR/SOURCES/"
 
-# Copy spec
-cp "$SCRIPT_DIR/rpm/mail-archiver.spec" "$RPMBUILD_DIR/SPECS/"
+# Copy spec (substitute Version/Release from the single source of truth)
+sed -e "s/^Version:.*/Version:        $VERSION/" \
+    -e "s/^Release:.*/Release:        $RELEASE%{?dist}/" \
+    "$SCRIPT_DIR/rpm/mail-archiver.spec" > "$RPMBUILD_DIR/SPECS/mail-archiver.spec"
 
 # Build
 rpmbuild --define "_topdir $RPMBUILD_DIR" -bb "$RPMBUILD_DIR/SPECS/mail-archiver.spec" 2>&1
@@ -75,8 +79,9 @@ cat > "$DEB_PKG/etc/cron.d/mail-archiver" << 'CRON'
 0 * * * * root cd /opt/mail-archiver && python3 app.py scheduled-sync >> /var/log/mail-archiver-sync.log 2>&1
 CRON
 
-# DEBIAN control files
-cp "$SCRIPT_DIR/deb/DEBIAN/control" "$DEB_PKG/DEBIAN/"
+# DEBIAN control files (substitute Version from single source of truth)
+sed -e "s/^Version:.*/Version: ${VERSION}-${RELEASE}/" \
+    "$SCRIPT_DIR/deb/DEBIAN/control" > "$DEB_PKG/DEBIAN/control"
 cp "$SCRIPT_DIR/deb/DEBIAN/postinst" "$DEB_PKG/DEBIAN/"
 chmod 755 "$DEB_PKG/DEBIAN/postinst"
 
