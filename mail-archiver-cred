@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""mail-archiver-cred — mbsync PassCmd helper.
+
+Called by mbsync as:
+    /usr/libexec/mail-archiver-cred <linux_username> <email>
+
+Prints the decrypted app-password / IMAP credential for that account to
+stdout, so mbsync can feed it to the IMAP server. Prints nothing (empty
+line) if the account has no stored credential, so mbsync tolerates the
+call and reports a normal AuthenticationFailed rather than crashing.
+
+Ships as a fixed system binary rather than an inlined `python3 -c "..."`
+PassCmd because:
+  * fixed sys.path (`/opt/mail-archiver` only) — the previous inlined form
+    used `sys.path.insert(0, '{archive_dir}/../..')` which resolves to
+    `/var/lib` or `/datapool`; any file the target PAM user drops under
+    the data dir named `app.py`, `PAM.py`, `email.py`, etc. would get
+    imported as mbsync ran, giving the user arbitrary Python execution.
+  * no shell interpolation of user-supplied values — username and email
+    arrive via argv (execve boundary), so LDAP usernames containing `'`
+    or `;` or `$(...)` can't inject into mbsync's `/bin/sh -c` context.
+
+Never exits non-zero — an empty print is safer for mbsync than a crash.
+"""
+
+import sys
+
+# Fixed sys.path — no interpolation, no traversal to writable dirs.
+sys.path.insert(0, '/opt/mail-archiver')
+
+try:
+    from app import load_credential
+except Exception:
+    print('')
+    sys.exit(0)
+
+if len(sys.argv) != 3:
+    print('')
+    sys.exit(0)
+
+username, email = sys.argv[1], sys.argv[2]
+
+try:
+    cred = load_credential(username, email) or ''
+except Exception:
+    cred = ''
+
+print(cred)

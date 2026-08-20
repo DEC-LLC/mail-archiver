@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.9
+Version:        1.0.10
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -22,6 +22,7 @@ mkdir -p %{buildroot}/opt/mail-archiver/templates
 mkdir -p %{buildroot}/opt/mail-archiver/static
 mkdir -p %{buildroot}/etc/systemd/system
 mkdir -p %{buildroot}/etc/cron.d
+mkdir -p %{buildroot}/usr/libexec
 
 # Application files
 install -m 644 %{_sourcedir}/app.py %{buildroot}/opt/mail-archiver/app.py
@@ -30,6 +31,7 @@ install -m 644 %{_sourcedir}/oauth2_microsoft.py %{buildroot}/opt/mail-archiver/
 [ -f %{_sourcedir}/imap_sync.py ] && install -m 644 %{_sourcedir}/imap_sync.py %{buildroot}/opt/mail-archiver/imap_sync.py || true
 install -m 644 %{_sourcedir}/gunicorn.conf.py %{buildroot}/opt/mail-archiver/gunicorn.conf.py
 install -m 755 %{_sourcedir}/generate-cert.sh %{buildroot}/opt/mail-archiver/generate-cert.sh
+install -m 755 %{_sourcedir}/mail-archiver-cred %{buildroot}/usr/libexec/mail-archiver-cred
 
 # Templates
 for t in %{_sourcedir}/templates/*.html; do
@@ -60,6 +62,7 @@ CRON
 /opt/mail-archiver/imap_sync.py
 /opt/mail-archiver/gunicorn.conf.py
 /opt/mail-archiver/generate-cert.sh
+/usr/libexec/mail-archiver-cred
 /opt/mail-archiver/templates/*.html
 /opt/mail-archiver/static/*.css
 /etc/systemd/system/mail-archiver.service
@@ -115,6 +118,38 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.10-1
+- Add-page OAuth picker (Item 1): /account/add now shows the same
+  OAuth-app dropdown that was previously only on /account/<email>/edit,
+  so onboarding a family Hotmail is one form (pick app + email + save)
+  instead of add → dashboard → Settings → pick → back → Sign in. JS
+  toggles the picker's visibility to match the provider's auth type.
+- imap_sync.py chown-on-write (T5 deferred from 1.0.5): ImapSyncer now
+  accepts chown_uid/chown_gid kwargs and best-effort chowns every
+  Maildir dir + message file + .synced_uids.json after write. app.py
+  resolves the target PAM user via pwd.getpwnam in _run_sync_imaplib
+  and threads uid/gid through. Prevents dual-uid corruption when
+  mbsync is later swapped onto the same Maildir tree.
+- PassCmd hardening (T8 deferred from 1.0.5): new
+  /usr/libexec/mail-archiver-cred helper — fixed sys.path
+  (/opt/mail-archiver, no traversal to writable dirs), argv-based
+  args (no shell interpolation of user data). generate_mbsyncrc now
+  emits PassCmd "/usr/libexec/mail-archiver-cred <shlex-quoted user>
+  <shlex-quoted email>" instead of the old inlined python3 -c form.
+  Closes two real vulnerabilities: (a) PAM user drops app.py under
+  ${DATA} and it gets imported during every mbsync sync, (b) LDAP
+  username with apostrophe or shell metacharacters injects into
+  mbsync's /bin/sh -c context.
+- sync_status.json flock (T11 deferred from 1.0.5): cron (root) and
+  WebUI (mail-archiver) writes now flock a sibling .lock + atomic
+  os.replace via tempfile-rename. Both directions of the race are
+  eliminated; degraded non-locked fallback preserved for filesystems
+  that don't support flock. New _write_sync_status_locked and
+  _read_sync_status_locked helpers.
+- Package: ships mail-archiver-cred at /usr/libexec/mail-archiver-cred
+  (mode 0755 root:root) in both RPM and DEB. build.sh + spec + DEB
+  layout updated to include the helper. No new runtime deps.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.9-1
 - HOTFIX (OAuth completion blocker for personal Microsoft accounts):
   Change IMAP scope from https://outlook.office365.com/... to

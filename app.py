@@ -15,6 +15,8 @@ import secrets
 import email
 import email.policy
 import re
+import shlex
+import fcntl
 from pathlib import Path
 from functools import wraps
 
@@ -319,7 +321,15 @@ def generate_mbsyncrc(username):
             lines.append(f'PassCmd "cat {config_dir_str}/{safe_name}.token"')
             lines.append('AuthMechs XOAUTH2')
         else:
-            lines.append(f'PassCmd "python3 -c \\"import sys; sys.path.insert(0,\'{archive_dir}/../..\'); from app import load_credential; print(load_credential(\'{username}\',\'{acct["email"]}\') or \'\')\\""')
+            # T8 hardening: hand off to /usr/libexec/mail-archiver-cred so
+            # username + email arrive via argv (no shell interpolation) and
+            # sys.path is fixed at /opt/mail-archiver (no writable-dir
+            # traversal). shlex.quote on the two args neutralizes any
+            # exotic characters so mbsync's /bin/sh -c sees each as one arg.
+            lines.append(
+                f'PassCmd "/usr/libexec/mail-archiver-cred '
+                f'{shlex.quote(username)} {shlex.quote(acct["email"])}"'
+            )
 
         # TLS mode is now per-account, three-valued: ssl | starttls | none.
         # mbsync accepts SSLType {IMAPS,STARTTLS,None}.
@@ -460,17 +470,76 @@ def load_credential(username, email):
 
 # --- Sync Operations ---
 
+def _write_sync_status_locked(status_file, state):
+    """Atomic + locked write of sync_status.json.
+
+    T11 fix: cron (root) and the WebUI (mail-archiver) both write this
+    file; unlocked writes let one process's truncate-then-write clobber
+    the other's finished-state update. This helper:
+      1. flock(LOCK_EX) on the target file itself (create-if-missing);
+      2. writes the new JSON to <path>.tmp;
+      3. os.replace() atomic rename (survives crashes cleanly);
+      4. best-effort chown the result to the account owner.
+
+    Falls back to a plain unlocked write on any locking error — degraded
+    is better than dead. Callers must not hold any other lock on the
+    file at the same time.
+    """
+    status_file = Path(status_file)
+    tmp = status_file.with_suffix(status_file.suffix + '.tmp')
+    lock_path = status_file.with_suffix(status_file.suffix + '.lock')
+    payload = json.dumps(state, indent=2)
+    try:
+        # Use a sibling .lock file so we can flock even on first-ever write
+        # (target file may not yet exist). Keep lock file around; empty.
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with open(tmp, 'w') as f:
+                f.write(payload)
+            os.replace(str(tmp), str(status_file))
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+    except (OSError, IOError):
+        # Locking failed (e.g. fs doesn't support flock) — degraded
+        # non-atomic path. Better than blocking the sync.
+        try:
+            with open(status_file, 'w') as f:
+                f.write(payload)
+        except OSError:
+            return
+
+
+def _read_sync_status_locked(status_file):
+    """Shared-lock read of sync_status.json. Returns {} on any error."""
+    status_file = Path(status_file)
+    if not status_file.exists():
+        return {}
+    lock_path = status_file.with_suffix(status_file.suffix + '.lock')
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            with open(status_file) as f:
+                return json.load(f)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+    except (OSError, IOError, json.JSONDecodeError):
+        # Unlocked fallback read
+        try:
+            with open(status_file) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+
 def get_sync_status(username):
     """Get sync status for all accounts."""
     config_dir = get_user_config_dir(username)
-    log_file = config_dir / 'sync.log'
     status_file = config_dir / 'sync_status.json'
-
-    status = {}
-    if status_file.exists():
-        with open(status_file) as f:
-            status = json.load(f)
-    return status
+    return _read_sync_status_locked(status_file)
 
 
 def _has_mbsync():
@@ -539,6 +608,23 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
             except Exception:
                 pass
 
+        # T5: in PAM mode, resolve the Linux user's uid/gid and pass to
+        # ImapSyncer so every Maildir dir + message file + .synced_uids.json
+        # write is chowned to the target user. Without this, when mbsync
+        # gets installed later and takes over the same Maildir, it can't
+        # rewrite mail-archiver-owned files → dual-uid corruption + dupes.
+        chown_uid, chown_gid = None, None
+        if CONFIG['auth_mode'] == 'pam':
+            try:
+                import pwd as _pwd
+                pw = _pwd.getpwnam(username)
+                chown_uid, chown_gid = pw.pw_uid, pw.pw_gid
+            except KeyError:
+                # PAM user vanished from /etc/passwd between login and sync.
+                # Skip chown — files land under mail-archiver, operator will
+                # need to re-chown by hand once user comes back.
+                pass
+
         syncer = ImapSyncer(
             host=provider.get('host', acct.get('host', '')),
             port=provider.get('port', acct.get('port', 993)),
@@ -548,6 +634,8 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
             local_dir=local_dir,
             auth_method=auth_method,
             oauth2_token=oauth2_token,
+            chown_uid=chown_uid,
+            chown_gid=chown_gid,
         )
 
         try:
@@ -598,8 +686,8 @@ def run_sync(username, account_email=None):
         'state': 'syncing',
         'started': time.strftime('%Y-%m-%d %H:%M:%S'),
     }
-    with open(status_file, 'w') as f:
-        json.dump(status, f, indent=2)
+    # T11: locked+atomic (cron and webui both write this file)
+    _write_sync_status_locked(status_file, status)
 
     # Auto-detect backend: mbsync (fast, Linux/Mac) or imaplib (portable)
     if not _has_mbsync():
@@ -663,8 +751,8 @@ def run_sync(username, account_email=None):
                 'error': str(e),
             }
 
-    with open(status_file, 'w') as f:
-        json.dump(status, f, indent=2)
+    # T11: locked+atomic (cron and webui both write this file)
+    _write_sync_status_locked(status_file, status)
     _chown_user(status_file, username)
 
     # Update search index after successful sync
@@ -854,32 +942,56 @@ def dashboard():
 def add_account():
     username = session['username']
 
+    # Item-1 (1.0.10): make the OAuth-app picker available at add-time so
+    # family onboarding is one form, not "add → dashboard → Settings →
+    # pick app → back → Sign in". Filter to microsoft-provider apps (only
+    # OAuth provider today).
+    from oauth2_microsoft import list_oauth_apps, resolve_oauth_app
+    available_oauth_apps = list_oauth_apps(
+        CONFIG['data_dir'], username=username, provider='microsoft'
+    )
+
+    def _render():
+        return render_template('add_account.html', providers=PROVIDERS,
+                               available_oauth_apps=available_oauth_apps)
+
     if request.method == 'POST':
         provider = request.form.get('provider', '')
         email = request.form.get('email', '').strip()
         credential = request.form.get('credential', '').strip()
+        oauth_app_id = request.form.get('oauth_app_id', '').strip() or None
 
         if not provider or not email:
             flash('Provider and email are required.')
-            return render_template('add_account.html', providers=PROVIDERS)
+            return _render()
 
         if provider not in PROVIDERS:
             flash('Unknown provider.')
-            return render_template('add_account.html', providers=PROVIDERS)
+            return _render()
 
         provider_info = PROVIDERS[provider]
 
         # For app_password providers, credential is required
         if provider_info['auth'] == 'app_password' and not credential:
             flash(f'{provider_info["auth_label"]} is required.')
-            return render_template('add_account.html', providers=PROVIDERS)
+            return _render()
+
+        # Validate the picked OAuth app if one was supplied (only meaningful
+        # for OAuth providers — silently ignore for password providers).
+        if oauth_app_id and provider_info['auth'] == 'oauth2':
+            if not resolve_oauth_app(CONFIG['data_dir'], username,
+                                     app_id=oauth_app_id,
+                                     provider='microsoft'):
+                flash(f'OAuth app "{oauth_app_id}" not found — dropping pin, '
+                      f'will fall back to default resolution.')
+                oauth_app_id = None
 
         accounts = load_accounts(username)
 
         # Check for duplicate
         if any(a['email'] == email and a['provider'] == provider for a in accounts):
             flash(f'{email} ({provider_info["name"]}) is already registered.')
-            return render_template('add_account.html', providers=PROVIDERS)
+            return _render()
 
         # Save credential
         if credential:
@@ -894,6 +1006,10 @@ def add_account():
             'sync_interval': 'daily',
             'added': time.strftime('%Y-%m-%d %H:%M:%S'),
         }
+        # Pin the chosen OAuth app at creation time so the immediate
+        # authorize redirect below picks it up too.
+        if oauth_app_id and provider_info['auth'] == 'oauth2':
+            new_account['oauth_app_id'] = oauth_app_id
 
         # Custom IMAP: user provides host and port
         if provider_info.get('custom_host'):
@@ -901,7 +1017,7 @@ def add_account():
             custom_port = request.form.get('custom_port', '993').strip()
             if not custom_host:
                 flash('IMAP server hostname is required for custom provider.')
-                return render_template('add_account.html', providers=PROVIDERS)
+                return _render()
             new_account['host'] = custom_host
             new_account['port'] = int(custom_port) if custom_port.isdigit() else 993
 
@@ -920,11 +1036,12 @@ def add_account():
         # OAuth2 accounts have no password to store — jump straight to the
         # Microsoft consent flow so the user isn't left staring at a "no
         # button to sign in" dashboard. Only redirect if OAuth is
-        # configured; otherwise fall through with a helpful flash.
+        # configured (either the freshly-picked app or a fallback default);
+        # otherwise fall through with a helpful flash.
         if provider_info['auth'] == 'oauth2':
             try:
-                from oauth2_microsoft import resolve_oauth_app
                 app_obj = resolve_oauth_app(CONFIG['data_dir'], username,
+                                            app_id=oauth_app_id,
                                             provider='microsoft')
                 if app_obj and app_obj.get('client_id') and app_obj.get('client_secret'):
                     flash(f'Added {email}. Signing in with Microsoft…')
@@ -940,7 +1057,7 @@ def add_account():
         flash(f'Added {email}. You can now sync it.')
         return redirect(url_for('dashboard'))
 
-    return render_template('add_account.html', providers=PROVIDERS)
+    return _render()
 
 
 @app.route('/account/<email>/remove', methods=['POST'])

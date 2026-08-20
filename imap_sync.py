@@ -41,7 +41,9 @@ class ImapSyncer:
                  auth_method: str = 'password',
                  oauth2_token: Optional[str] = None,
                  folders: Optional[list] = None,
-                 max_messages: int = 0):
+                 max_messages: int = 0,
+                 chown_uid: Optional[int] = None,
+                 chown_gid: Optional[int] = None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
@@ -52,6 +54,22 @@ class ImapSyncer:
         self.oauth2_token = oauth2_token
         self.folders = folders  # None = all folders
         self.max_messages = max_messages  # 0 = no limit
+        # T5 fix: when the Flask worker (mail-archiver uid) writes into a
+        # per-user Maildir, chown after each write so the target PAM user
+        # can rewrite / mbsync can later take over without dual-uid
+        # corruption. None disables chowning (container / builtin-auth mode).
+        self.chown_uid = chown_uid
+        self.chown_gid = chown_gid
+
+    def _chown(self, path):
+        """Best-effort chown to (chown_uid, chown_gid). Silent on failure —
+        wrong ownership is worse than dead sync, but not by much."""
+        if self.chown_uid is None or self.chown_gid is None:
+            return
+        try:
+            os.chown(str(path), self.chown_uid, self.chown_gid)
+        except (PermissionError, OSError):
+            pass
 
     def connect(self) -> imaplib.IMAP4_SSL:
         """Connect and authenticate to the IMAP server."""
@@ -109,8 +127,19 @@ class ImapSyncer:
 
         # Create Maildir structure: cur/ new/ tmp/
         folder_dir = self.local_dir / safe_name
+        # Ensure the local_dir + folder_dir themselves are owned by the
+        # target PAM user (T5) — they may have been created by prior runs
+        # under mail-archiver uid and would then be un-writable by mbsync.
+        if not self.local_dir.exists():
+            self.local_dir.mkdir(parents=True, exist_ok=True)
+        self._chown(self.local_dir)
+        if not folder_dir.exists():
+            folder_dir.mkdir(parents=True, exist_ok=True)
+        self._chown(folder_dir)
         for sub in ('cur', 'new', 'tmp'):
-            (folder_dir / sub).mkdir(parents=True, exist_ok=True)
+            subdir = folder_dir / sub
+            subdir.mkdir(parents=True, exist_ok=True)
+            self._chown(subdir)
 
         # Select folder
         try:
@@ -166,6 +195,7 @@ class ImapSyncer:
                 filename = self._message_filename(uid, raw)
                 dest = folder_dir / 'cur' / filename
                 dest.write_bytes(raw)
+                self._chown(dest)  # T5
 
                 synced_uids.add(uid)
                 result['new'] += 1
@@ -176,6 +206,7 @@ class ImapSyncer:
 
         # Save synced UIDs
         uid_file.write_text(json.dumps(sorted(synced_uids)))
+        self._chown(uid_file)  # T5
 
         return result
 

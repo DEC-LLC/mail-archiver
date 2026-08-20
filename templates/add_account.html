@@ -52,6 +52,32 @@
                        value="993" style="width:120px;">
             </div>
 
+            <!-- 1.0.10: OAuth app picker inline on add page.
+                 Only shown when the selected provider is oauth2 (JS below toggles).
+                 Blank = fall back to per-user default → server default per provider. -->
+            <div id="oauth-app-section" style="display:none;">
+                <label for="oauth_app_id">OAuth App</label>
+                <select id="oauth_app_id" name="oauth_app_id">
+                    <option value="">(default — auto-resolve: your default → server default)</option>
+                    {% for a in available_oauth_apps %}
+                    <option value="{{ a.app_id }}">
+                        [{{ 'Server' if a.scope == 'server' else 'Yours' }}] {{ a.name }}
+                        {% if a.is_default %}★ default{% endif %}
+                        — tenant={{ a.tenant }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <p class="help-text">
+                    Which registered Azure app this account should authenticate through.
+                    You can change this later on the account's Settings page.
+                    {% if not available_oauth_apps %}
+                    <strong>No OAuth apps configured yet</strong> — add one at
+                    <a href="{{ url_for('oauth2_settings') }}">Server Settings → OAuth Apps</a>
+                    or the auto-redirect below will land on the dashboard with a hint.
+                    {% endif %}
+                </p>
+            </div>
+
             <div id="credential-section">
                 <label for="credential" id="credential-label">App Password</label>
                 <input type="password" id="credential" name="credential"
@@ -75,15 +101,19 @@
         var credSection = document.getElementById('credential-section');
         var customSection = document.getElementById('custom-host-section');
 
+        var oauthSection = document.getElementById('oauth-app-section');
         if (opt.value) {
             label.textContent = opt.dataset.label;
             help.textContent = opt.dataset.help;
-            credSection.style.display = opt.dataset.auth === 'oauth2' ? 'none' : 'block';
+            var isOauth = opt.dataset.auth === 'oauth2';
+            credSection.style.display = isOauth ? 'none' : 'block';
+            oauthSection.style.display = isOauth ? 'block' : 'none';
             customSection.style.display = opt.dataset.custom === 'yes' ? 'block' : 'none';
         } else {
             label.textContent = 'App Password';
             help.textContent = '';
             credSection.style.display = 'block';
+            oauthSection.style.display = 'none';
             customSection.style.display = 'none';
         }
     }
