@@ -30,21 +30,28 @@ RestartSec=5
 # causing PAM auth to fail silently and users to hit an endless login loop.
 # For MAIL_ARCHIVER_AUTH=builtin only, you can safely set this to true via a
 # systemd drop-in override.
+# Hardening notes: NAS mode (MAIL_ARCHIVER_AUTH=pam) requires the app to
+# reach ARBITRARY user homes to write per-user ~/.mbsyncrc, chown per-user
+# config dirs, and drive PAM's setuid+setgid helpers. That inherently means
+# broad filesystem + capability access — the hardening below is the MINIMAL
+# working set. Do NOT re-add ProtectSystem=strict / ProtectHome=true /
+# NoNewPrivileges=true / RestrictSUIDSGID=true without splitting NAS-mode
+# and container-mode into two separate service files first.
 NoNewPrivileges=false
-ProtectSystem=strict
-ProtectHome=true
+ProtectSystem=no
+ProtectHome=no
 ReadWritePaths=/var/lib/mail-archiver /opt/mail-archiver/.secret_key /opt/mail-archiver/certs
 PrivateTmp=true
-# Cap set needed for PAM auth mode:
-#   CAP_CHOWN            — app.py _chown_user() sets ownership of per-user
-#                          config dirs on first login (user's uid/gid)
-#   CAP_DAC_READ_SEARCH  — pam_unix reads /etc/shadow (backup path if setgid
-#                          via unix_chkpwd is denied)
-#   CAP_SETUID/SETGID    — pam_unix's account-phase seteuid/setegid calls
-CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_CHOWN CAP_DAC_READ_SEARCH
+# Capabilities needed for NAS mode:
+#   CAP_CHOWN           — _chown_user() on first login (new user config dir)
+#   CAP_DAC_OVERRIDE    — write per-user ~/.mbsyncrc into another user's home
+#   CAP_DAC_READ_SEARCH — pam_unix reads /etc/shadow (backup path if setgid
+#                         via unix_chkpwd is denied by kernel)
+#   CAP_SETUID/SETGID   — pam_unix account-phase seteuid/setegid
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 RestrictNamespaces=true
-# RestrictSUIDSGID also disabled — pam_unix helper is setuid/setgid.
+# RestrictSUIDSGID left disabled — pam_unix helper is setuid/setgid.
 # RestrictSUIDSGID=true
 
 [Install]
