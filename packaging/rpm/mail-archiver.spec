@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.18
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -37,6 +37,7 @@ install -m 644 %{_sourcedir}/oauth2_microsoft.py %{buildroot}/opt/mail-archiver/
 [ -f %{_sourcedir}/imap_sync.py ] && install -m 644 %{_sourcedir}/imap_sync.py %{buildroot}/opt/mail-archiver/imap_sync.py || true
 install -m 644 %{_sourcedir}/mail_batcher.py %{buildroot}/opt/mail-archiver/mail_batcher.py
 install -m 644 %{_sourcedir}/admin.py %{buildroot}/opt/mail-archiver/admin.py
+install -m 644 %{_sourcedir}/sync_lifecycle.py %{buildroot}/opt/mail-archiver/sync_lifecycle.py
 install -m 644 %{_sourcedir}/gunicorn.conf.py %{buildroot}/opt/mail-archiver/gunicorn.conf.py
 install -m 644 %{_sourcedir}/VERSION %{buildroot}/opt/mail-archiver/VERSION
 install -m 755 %{_sourcedir}/generate-cert.sh %{buildroot}/opt/mail-archiver/generate-cert.sh
@@ -47,6 +48,10 @@ install -m 755 %{_sourcedir}/mail-archiver-cred %{buildroot}/usr/libexec/mail-ar
 # service which runs `systemctl restart mail-archiver` as root.
 install -m 644 %{_sourcedir}/systemd/mail-archiver-restart.path %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.path
 install -m 644 %{_sourcedir}/systemd/mail-archiver-restart.service %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.service
+# 1.1.0: parent slice for sync scopes + oauth-refresh timer/service
+install -m 644 %{_sourcedir}/systemd/mail-archiver-syncs.slice %{buildroot}/usr/lib/systemd/system/mail-archiver-syncs.slice
+install -m 644 %{_sourcedir}/systemd/mail-archiver-oauth-refresh.service %{buildroot}/usr/lib/systemd/system/mail-archiver-oauth-refresh.service
+install -m 644 %{_sourcedir}/systemd/mail-archiver-oauth-refresh.timer %{buildroot}/usr/lib/systemd/system/mail-archiver-oauth-refresh.timer
 install -m 644 %{_sourcedir}/tmpfiles.d/mail-archiver.conf %{buildroot}/usr/lib/tmpfiles.d/mail-archiver.conf
 
 # Templates
@@ -78,6 +83,7 @@ CRON
 /opt/mail-archiver/imap_sync.py
 /opt/mail-archiver/mail_batcher.py
 /opt/mail-archiver/admin.py
+/opt/mail-archiver/sync_lifecycle.py
 /opt/mail-archiver/gunicorn.conf.py
 /opt/mail-archiver/generate-cert.sh
 /opt/mail-archiver/VERSION
@@ -87,6 +93,9 @@ CRON
 /etc/systemd/system/mail-archiver.service
 /usr/lib/systemd/system/mail-archiver-restart.path
 /usr/lib/systemd/system/mail-archiver-restart.service
+/usr/lib/systemd/system/mail-archiver-syncs.slice
+/usr/lib/systemd/system/mail-archiver-oauth-refresh.service
+/usr/lib/systemd/system/mail-archiver-oauth-refresh.timer
 /usr/lib/tmpfiles.d/mail-archiver.conf
 %config(noreplace) /etc/cron.d/mail-archiver
 
@@ -245,6 +254,12 @@ systemctl daemon-reload 2>/dev/null || true
 systemctl enable mail-archiver-restart.path 2>/dev/null || true
 systemctl start mail-archiver-restart.path 2>/dev/null || true
 
+# 1.1.0: sync-scope parent slice + proactive OAuth-refresh timer
+systemctl enable mail-archiver-syncs.slice 2>/dev/null || true
+systemctl start mail-archiver-syncs.slice 2>/dev/null || true
+systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
+systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
+
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
 echo "Then: systemctl enable --now mail-archiver"
 echo ""
@@ -259,6 +274,69 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Fri Aug 21 2026 Madhav Diwan <madhav@decllc.biz> - 1.1.0-1
+- Sync lifecycle is now a first-class citizen. Runtime-model change,
+  not new user-facing features — dashboard/settings/OAuth flows are
+  unchanged for the operator. Semver minor bump because internals
+  moved substantially: the in-process _SYNC_JOBS dict is retired,
+  every mbsync invocation runs as a transient systemd scope, per-job
+  state is written to /run/mail-archiver/sync-jobs/<id>.json.
+- Headline: systemd-scoped mbsync (new sync_lifecycle.py module +
+  mail-archiver-syncs.slice unit). Each sync is
+  `systemd-run --scope --unit=mail-archiver-sync-<id>.scope
+  --slice=mail-archiver-syncs.slice --uid=<pam-uid> --gid=<pam-gid>
+  -- mbsync -V <channel>`. Consequences worth naming: (1) mbsync
+  SURVIVES gunicorn worker recycling (systemd owns the scope, not
+  gunicorn); (2) cross-worker visibility — any worker can serve any
+  job's SSE stream because state is on disk not in a per-process
+  dict; (3) Cancel Sync = `systemctl stop <scope>` — clean and
+  auditable, no signal-guessing; (4) the systemd-run --uid/--gid
+  drop-priv is the recommended replacement for the 1.0.13
+  subprocess(user=,group=)+Ambient CAP_SETUID dance (the caps
+  themselves are kept for now — 1.1.1 can consider removing).
+- File-backed job state at /run/mail-archiver/sync-jobs/<id>.json,
+  atomically written every ~2s via tempfile+rename. Schema includes
+  job_id / user / email / started / scope_unit / mbsync_pid / state
+  / progress (all batch_*, folder_chunk_*, folders_done, msg_new_*
+  fields) / exit_code / error / finished / last_updated. tmpfiles.d
+  config packaged; ensure_state_dir() runtime fallback for dev.
+- Cross-worker + logout/login SSE auto-reattach: dashboard route
+  enumerates active jobs for the logged-in user and renders each
+  account card with a `data-active-job` attribute; DOMContentLoaded
+  JS opens EventSource for every such panel. Same event stream any
+  worker can serve. New /api/sync/active endpoint returns the same
+  list as JSON for JS callers that want to reattach on-demand.
+- Folded 1.0.16 follow-up: proactive OAuth token refresh timer.
+  mail-archiver-oauth-refresh.timer fires oneshot service every 10
+  min (starting 5min after boot) — walks every *.oauth2.json, mints
+  fresh access_tokens for anything expiring within 15 min. New
+  `python3 oauth2_microsoft.py refresh-expiring` CLI entrypoint
+  drives the walk. Kills first-sync-after-idle latency: the sync
+  path no longer spends 200–500ms on the refresh POST because the
+  token is always fresh from the last timer tick.
+- Folded 1.0.17 follow-up: chunk-only progress mode. When the
+  intra-folder chunk loop is running, mail_batcher marks the
+  progress dict `chunk_mode=True`; app.py's _line_cb skips
+  overwriting folder_msg_done from mbsync's C:/M: totals (they
+  reset every chunk). Cleared when the chunk loop exits so post-run
+  line_cb writes still work.
+- Folded 1.0.18 follow-up: Storage card polish — client-side search
+  (filter by email substring), sort-by (bytes-desc | email | user),
+  top-20 cutoff with "Show all N accounts" toggle. Host card
+  sparkline shows "Collecting samples… (up to 15min after service
+  start)" placeholder when fewer than 3 samples in the ring.
+- Cancel-sync flow rewritten: primary path is `systemctl stop
+  mail-archiver-sync-<id>.scope`; fallback for batched-mode syncs
+  (mbsync children live under mail-archiver.service, not the scope)
+  is os.killpg on recorded mbsync_pid. State file flips to
+  `cancelled` so the SSE stream emits a clean error event and the
+  dashboard progress panel clears.
+- Retired: _SYNC_JOBS dict + _SYNC_JOBS_LOCK removed from app.py.
+  admin.py's _active_syncs() reads from sync_lifecycle.list_all_states()
+  instead. No migration needed — restart-time state loss was never a
+  regression from the 1.0.14 behavior, and existing on-disk state
+  files land in the new format on first write after upgrade.
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.18-1
 - Admin page (/admin) — PAM-group-gated observability + service control.
   Four cards: Service (version, uptime, workers, threads, restart-pending

@@ -485,21 +485,26 @@ def _oauth_token_summary(data_dir):
 
 
 def _active_syncs():
-    """Read _SYNC_JOBS from app.py (imported lazily to avoid circular imports)."""
+    """Enumerate active syncs from the file-backed lifecycle store (1.1.0).
+    Cross-worker visible — every worker reads the same state files.
+    Includes all users (admin scope). Also reports the systemd scope
+    unit name so the admin can inspect via journalctl if needed.
+    """
     try:
-        import app as main_app
-        with main_app._SYNC_JOBS_LOCK:
-            jobs = [
-                {
-                    'job_id': jid,
-                    'email': job.get('email', ''),
-                    'state': job.get('state', ''),
-                    'started': job.get('started', ''),
-                    'pid': job.get('pid'),
-                }
-                for jid, job in main_app._SYNC_JOBS.items()
-                if job.get('state') in ('running', 'starting')
-            ]
+        import sync_lifecycle as slc
+        jobs = []
+        for st in slc.list_all_states():
+            if st.get('state') not in ('running', 'starting'):
+                continue
+            jobs.append({
+                'job_id': st.get('job_id', ''),
+                'user': st.get('user', ''),
+                'email': st.get('email') or '__all__',
+                'state': st.get('state', ''),
+                'started': st.get('started', ''),
+                'pid': st.get('mbsync_pid'),
+                'scope_unit': st.get('scope_unit', ''),
+            })
         return jobs
     except (ImportError, AttributeError):
         return []
@@ -789,24 +794,39 @@ def oauth_refresh(user, email):
 @admin_bp.route('/sync/<job_id>/cancel', methods=['POST'])
 @requires_admin
 def sync_cancel(job_id):
-    """SIGTERM the mbsync PID group for the given job. Safe because
-    1.0.17 chunking makes cancel-and-resume painless.
+    """1.1.0: cancel via `systemctl stop mail-archiver-sync-<jobid>.scope`.
+    Clean, auditable, no signal-guessing. For batched syncs (1.0.15+
+    chunk loop) the scope hosts a placeholder while children run under
+    the mail-archiver.service unit — in that case we fall back to
+    os.killpg on the recorded mbsync_pid. Safe because 1.0.17 chunking
+    makes cancel-and-resume painless.
     """
     import signal
-    import app as main_app
+    import sync_lifecycle as slc
     try:
-        with main_app._SYNC_JOBS_LOCK:
-            job = main_app._SYNC_JOBS.get(job_id)
-        if not job:
+        state = slc.read_state(job_id)
+        if not state:
             return jsonify({'status': 'not_found'}), 404
-        pid = job.get('pid')
-        if not pid:
-            return jsonify({'status': 'no_pid'}), 400
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except OSError:
-            os.kill(pid, signal.SIGTERM)
-        return jsonify({'status': 'ok', 'pid': pid}), 200
+        # Try clean systemd stop first — always safe if scope exists.
+        stopped = slc.stop_scope(job_id)
+        # Also write cancelled state so the SSE stream emits an error
+        # event and the dashboard clears the progress panel.
+        slc.update_state(job_id, state='cancelled',
+                         finished=slc.iso_utc_now(),
+                         error='cancelled by operator')
+        # Batched-mode fallback: if the mbsync child is still running
+        # under mail-archiver.service (not our scope), signal its pgid.
+        pid = state.get('mbsync_pid')
+        if pid:
+            try:
+                os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        return jsonify({
+            'status': 'ok',
+            'scope_stopped': stopped,
+            'pid': pid,
+        }), 200
     except Exception as e:
         return jsonify({'status': 'error', 'detail': str(e)}), 500
 

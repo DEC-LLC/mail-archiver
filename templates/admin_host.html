@@ -41,8 +41,8 @@
         {% endif %}
     </div>
 
-    {% if load_history %}
     <h2>Load (1-min) — last 15 minutes</h2>
+    {% if load_history and load_history|length >= 3 %}
     <div class="sparkline">
         {% set maxv = load_history|map(attribute=1)|reject('none')|list|max(default=1) %}
         {% for _, v in load_history %}
@@ -51,6 +51,11 @@
             {% endif %}
         {% endfor %}
     </div>
+    {% else %}
+    <p style="color: #999; font-style: italic;">
+        Collecting samples… (up to 15&nbsp;min after service start).
+        {% if load_history %}({{ load_history|length }}/3 samples so far.){% endif %}
+    </p>
     {% endif %}
 
     <h2>Data-volume disk I/O</h2>

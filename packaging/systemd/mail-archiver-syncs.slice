@@ -1,0 +1,9 @@
+[Unit]
+Description=Mail Archiver sync scopes (transient mbsync invocations)
+Documentation=man:systemd.slice(5)
+Before=slices.target
+
+[Slice]
+# Reserved for future CPU/IO/memory quotas — kept default so an active
+# sync inherits system defaults today. Operators can drop-in override
+# via /etc/systemd/system/mail-archiver-syncs.slice.d/*.conf.

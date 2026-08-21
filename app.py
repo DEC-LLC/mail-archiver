@@ -1071,13 +1071,48 @@ def dashboard():
     except OSError:
         pass
 
+    # 1.1.0: active-job auto-reattach. Enumerate any running sync jobs
+    # for this user so the dashboard template can pre-open EventSource
+    # connections for accounts currently syncing (logout/login/new-tab
+    # all pick up the same live progress stream).
+    active_jobs = {}
+    try:
+        for job in _slc.list_active_states_for_user(username):
+            key = job.get('email') or '__all__'
+            active_jobs[key] = job.get('job_id')
+    except Exception:
+        pass
+
     return render_template('dashboard.html',
                            username=username,
                            accounts=accounts,
                            home_dir=home_dir,
                            archive_dir=archive_dir,
                            sync_intervals=SYNC_INTERVALS,
-                           restart_pending=restart_pending)
+                           restart_pending=restart_pending,
+                           active_jobs=active_jobs)
+
+
+@app.route('/api/sync/active')
+@login_required
+def sync_active_list():
+    """List active syncs for the current user. Consumed by dashboard JS
+    for post-login auto-reattach.
+    """
+    username = session['username']
+    out = []
+    try:
+        for job in _slc.list_active_states_for_user(username):
+            out.append({
+                'job_id': job.get('job_id'),
+                'email': job.get('email'),
+                'target': job.get('target'),
+                'state': job.get('state'),
+                'started': job.get('started'),
+            })
+    except Exception:
+        pass
+    return jsonify({'jobs': out})
 
 
 @app.route('/account/add', methods=['GET', 'POST'])
@@ -1614,16 +1649,25 @@ def update_schedule(email):
 
 
 # ----------------------------------------------------------------------
-# Background-threaded sync + SSE progress stream (1.0.14)
+# Sync lifecycle — systemd-scoped, file-backed (1.1.0)
 # ----------------------------------------------------------------------
-# WebUI sync must not block the request for up to 3600s. Post triggers a
-# background thread, returns a job_id, and the browser opens an EventSource
-# to /api/sync/<job_id>/stream to render live per-folder / per-message
-# progress. Cron path (`python3 app.py scheduled-sync`) stays synchronous
-# via run_sync() below — no SSE needed.
+# WebUI sync must not block the request for up to 3600s. Post launches a
+# background driver thread that spawns mbsync inside a transient systemd
+# scope, writes progress state to /run/mail-archiver/sync-jobs/<jid>.json
+# every ~2s, and returns a job_id immediately. The SSE stream endpoint
+# reads that state file — so any gunicorn worker (or any subsequent
+# login) can attach to the same live job.
+#
+# 1.1.0 changes vs 1.0.14:
+#   - No more in-process _SYNC_JOBS dict. State lives on disk, visible
+#     to any worker.
+#   - mbsync runs in a systemd scope, so worker recycle / crash / restart
+#     does NOT SIGTERM the sync (see docs/README.md#sync-lifecycle).
+#   - Cancel Sync = `systemctl stop mail-archiver-sync-<jobid>.scope`.
+#   - Cron path (`python3 app.py scheduled-sync`) stays synchronous via
+#     run_sync() below — no lifecycle overhead for a headless run.
 
-_SYNC_JOBS = {}
-_SYNC_JOBS_LOCK = threading.Lock()
+import sync_lifecycle as _slc
 
 # mbsync progress line: `C: 0/1 B: 0/12 M: +0/47 *0/0 #0/0`
 #   C = channels, B = boxes (folders), M = messages,
@@ -1649,32 +1693,39 @@ def _parse_mbsync_line(line):
     }
 
 
-def _purge_old_sync_jobs():
-    cutoff = time.time() - 3600
-    with _SYNC_JOBS_LOCK:
-        for jid in [j for j, job in _SYNC_JOBS.items()
-                    if job.get('started_epoch', 0) < cutoff]:
-            _SYNC_JOBS.pop(jid, None)
-
-
 def _new_sync_job(username, target):
-    _purge_old_sync_jobs()
-    job_id = uuid.uuid4().hex
-    with _SYNC_JOBS_LOCK:
-        _SYNC_JOBS[job_id] = {
-            'job_id': job_id,
-            'username': username,
-            'target': target,
-            'state': 'starting',
-            'started_epoch': time.time(),
-            'started': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'progress': None,
-            'last_line': '',
-            'exit_code': None,
-            'error': None,
-            'finished': None,
-        }
+    """Create a new job entry on disk. `target` is an email or '__all__'.
+    Returns the job_id (also encoded in the state filename + scope unit).
+    """
+    _slc.purge_old_states(3600)
+    email = target if target != '__all__' else None
+    job_id = _slc.new_job_id(username, email)
+    _slc.write_state(job_id, {
+        'job_id': job_id,
+        'user': username,
+        'email': email,
+        'target': target,
+        'state': 'starting',
+        'started_epoch': time.time(),
+        'started': _slc.iso_utc_now(),
+        'started_local': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'scope_unit': _slc.scope_unit_for(job_id),
+        'mbsync_pid': None,
+        'progress': None,
+        'last_line': '',
+        'exit_code': None,
+        'error': None,
+        'finished': None,
+    })
     return job_id
+
+
+def _get_sync_job(job_id):
+    return _slc.read_state(job_id)
+
+
+def _update_sync_job(job_id, **updates):
+    _slc.update_state(job_id, **updates)
 
 
 def _plan_batches_for_account(username, account_email):
@@ -1789,24 +1840,49 @@ def _plan_batches_inline(username, account_email):
 
 
 def _run_sync_background(job_id, username, account_email=None):
-    """Threaded mbsync runner. Streams stderr into _SYNC_JOBS[job_id].
+    """Threaded mbsync runner. Streams stderr into the file-backed job
+    state at /run/mail-archiver/sync-jobs/<job_id>.json every ~2s.
+    mbsync itself runs inside a transient systemd scope (1.1.0) so it
+    survives worker recycling.
+
     Falls back to synchronous run_sync() when mbsync isn't installed
     (imaplib path — no line stream, single done event).
     """
-    with _SYNC_JOBS_LOCK:
-        job = _SYNC_JOBS.get(job_id)
+    job = _get_sync_job(job_id)
     if not job:
         return
+
+    # Small helper to batch state writes at ~2Hz so we don't hammer the
+    # tmpfs with every stderr line. Also flushes on state transitions.
+    _state_mem = {
+        'last_line': job.get('last_line', ''),
+        'progress': job.get('progress') or {},
+        'last_flush': 0.0,
+    }
+    _flush_lock = threading.Lock()
+
+    def _flush(force=False, **overrides):
+        with _flush_lock:
+            now = time.time()
+            if not force and now - _state_mem['last_flush'] < 2.0:
+                return
+            _state_mem['last_flush'] = now
+            payload = dict(overrides)
+            payload['last_line'] = _state_mem['last_line']
+            payload['progress'] = dict(_state_mem['progress'])
+            _update_sync_job(job_id, **payload)
+
     try:
         if not _has_mbsync():
-            with _SYNC_JOBS_LOCK:
-                job['state'] = 'syncing'
+            _update_sync_job(job_id, state='syncing')
             result = run_sync(username, account_email)
-            with _SYNC_JOBS_LOCK:
-                job['state'] = 'done' if result.get('state') == 'ok' else 'error'
-                job['exit_code'] = result.get('exit_code')
-                job['error'] = result.get('error')
-                job['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            _update_sync_job(
+                job_id,
+                state='done' if result.get('state') == 'ok' else 'error',
+                exit_code=result.get('exit_code'),
+                error=result.get('error'),
+                finished=time.strftime('%Y-%m-%d %H:%M:%S'),
+            )
             return
 
         config_dir = get_user_config_dir(username)
@@ -1818,12 +1894,9 @@ def _run_sync_background(job_id, username, account_email=None):
         _write_sync_status_locked(status_file, status)
 
         # P0 (1.0.16): refresh OAuth tokens BEFORE spawning mbsync AND
-        # BEFORE the batcher measurement (which also uses the token via
-        # imaplib). Any account whose refresh_token is dead lands a
-        # needs_reauth flag in its .oauth2.json — mbsync will still
-        # fire, hit AUTHENTICATIONFAILED, and report the same error the
-        # WebUI already surfaces. Don't fail the whole sync — the
-        # per-account reauth flag is the actionable signal.
+        # BEFORE the batcher measurement. In 1.1.0 the timer-driven
+        # refresh usually beats us to it, but keep the sync-path refresh
+        # as a safety net for accounts added since the last timer tick.
         try:
             oauth_report = _refresh_oauth_tokens_before_sync(
                 username, account_email)
@@ -1839,8 +1912,8 @@ def _run_sync_background(job_id, username, account_email=None):
                     }
                     _write_sync_status_locked(status_file, status)
         except Exception as e:
-            with _SYNC_JOBS_LOCK:
-                job['last_line'] = f'oauth pre-refresh error: {e}'
+            _state_mem['last_line'] = f'oauth pre-refresh error: {e}'
+            _flush(force=True)
 
         if account_email:
             safe_name = account_email.replace('@', '_at_').replace('.', '_')
@@ -1849,14 +1922,14 @@ def _run_sync_background(job_id, username, account_email=None):
         else:
             mbsync_arg = '-a'
 
-        # Verbose mode (-V) forces mbsync to emit the C:/B:/M: progress
-        # line on every state change instead of only at end-of-run.
-        popen_kwargs = {
-            'stdout': subprocess.PIPE,
-            'stderr': subprocess.STDOUT,
-            'bufsize': 1,
-            'text': True,
-        }
+        # Build the mbsync argv + drop-priv info. In 1.1.0 the actual
+        # spawn goes through sync_lifecycle.spawn_scoped_mbsync — no more
+        # subprocess(user=, group=) + Ambient CAP_SETUID dance. systemd
+        # handles the uid/gid drop via `systemd-run --uid --gid`.
+        target_uid = None
+        target_gid = None
+        target_cwd = None
+        target_env = None
         if CONFIG['auth_mode'] == 'pam':
             import pwd as _pwd
             try:
@@ -1865,109 +1938,129 @@ def _run_sync_background(job_id, username, account_email=None):
                 raise ValueError(
                     f'PAM user {username!r} not present on this host — '
                     f'cannot run mbsync as that identity')
-            cmd = ['mbsync', '-V', mbsync_arg]
-            popen_kwargs.update({
-                'user':  pw.pw_uid,
-                'group': pw.pw_gid,
-                'cwd':   pw.pw_dir,
-                'env': {
-                    'HOME':    pw.pw_dir,
-                    'USER':    username,
-                    'LOGNAME': username,
-                    'SHELL':   pw.pw_shell or '/bin/sh',
-                    'PATH':    '/usr/local/sbin:/usr/local/bin:'
-                               '/usr/sbin:/usr/bin:/sbin:/bin',
-                },
-            })
+            target_uid = pw.pw_uid
+            target_gid = pw.pw_gid
+            target_cwd = pw.pw_dir
+            target_env = {
+                'HOME':    pw.pw_dir,
+                'USER':    username,
+                'LOGNAME': username,
+                'SHELL':   pw.pw_shell or '/bin/sh',
+                'PATH':    '/usr/local/sbin:/usr/local/bin:'
+                           '/usr/sbin:/usr/bin:/sbin:/bin',
+            }
+            mbsync_argv = ['mbsync', '-V', mbsync_arg]
         else:
             archive_dir = Path(CONFIG['data_dir']) / username
-            rc = archive_dir / '.mbsyncrc'
-            cmd = ['mbsync', '-V', '-c', str(rc), mbsync_arg]
+            rc_path = archive_dir / '.mbsyncrc'
+            mbsync_argv = ['mbsync', '-V', '-c', str(rc_path), mbsync_arg]
 
-        with _SYNC_JOBS_LOCK:
-            job['state'] = 'syncing'
+        _update_sync_job(job_id, state='running')
         started = time.time()
         tail_lines = []
 
         # 1.0.15: try to plan batches when syncing a single named account
-        # and threshold is set. Batching for `-a` (all accounts) is out of
-        # scope — mbsync per-channel semantics don't compose with a global
-        # -a run, and users click Sync Now on individual accounts anyway.
+        # and threshold is set. Batching for `-a` is out of scope.
         batch_plan = None
         if account_email and CONFIG.get('batch_threshold', 0) > 0:
             try:
                 batch_plan = _plan_batches_for_account(
                     username, account_email)
             except Exception as e:
-                # Measurement failure isn't fatal — fall through to
-                # single-mbsync path and let mbsync report the auth /
-                # network error the same way it always has.
-                with _SYNC_JOBS_LOCK:
-                    job['last_line'] = f'batcher: measure failed: {e}'
+                _state_mem['last_line'] = f'batcher: measure failed: {e}'
+                _flush(force=True)
 
         def _line_cb(line):
             tail_lines.append(line)
             if len(tail_lines) > 200:
                 tail_lines.pop(0)
             parsed = _parse_mbsync_line(line)
-            with _SYNC_JOBS_LOCK:
-                job['last_line'] = line
-                if parsed:
-                    # Reset per-batch, preserve batch_* fields set by cb
-                    p = dict(job.get('progress') or {})
+            _state_mem['last_line'] = line
+            if parsed:
+                p = dict(_state_mem['progress'])
+                # 1.1.0 (via 1.0.17 chunk-only mode): if the chunk loop
+                # has set chunk_mode=True on the progress dict, DON'T
+                # overwrite folder_msg_done from mbsync's own C:/M: —
+                # the chunk loop's before/after count is truth there.
+                if p.get('chunk_mode'):
+                    # Take everything EXCEPT folder_msg_done/total from
+                    # the mbsync C:/B:/M: parsed line, since those reset
+                    # every chunk to the same total.
+                    keep = {k: v for k, v in parsed.items()
+                            if k not in ('folders_done', 'folders_total',
+                                         'msg_new_done', 'msg_new_total')}
+                    p.update(keep)
+                else:
                     p.update(parsed)
-                    job['progress'] = p
+                _state_mem['progress'] = p
+            _flush()
 
         if batch_plan and batch_plan['total_msgs'] > CONFIG['batch_threshold']:
             from mail_batcher import run_batched_sync
 
             def _prog_cb(update):
-                with _SYNC_JOBS_LOCK:
-                    p = dict(job.get('progress') or {})
-                    st = update.get('state')
-                    # Batch-level start clears within-batch counters so the
-                    # UI doesn't carry stale per-folder numbers across
-                    # batches. Chunk-level events do NOT clear these —
-                    # they augment the per-folder view.
-                    if st == 'syncing':
-                        for f in ('folders_done', 'folders_total',
-                                  'msg_new_done', 'msg_new_total',
-                                  'msg_flag_done', 'msg_flag_total',
-                                  'folder_name', 'folder_msg_done',
-                                  'folder_msg_total', 'folder_chunk_current',
-                                  'folder_chunk_wall_seconds'):
-                            p.pop(f, None)
-                    # 1.0.15: batch_*, 1.0.17: folder_* (chunk progress)
-                    p.update({k: v for k, v in update.items()
-                             if k.startswith('batch_')
-                             or k.startswith('folder_')})
-                    job['progress'] = p
-                    if st in ('batch_retry', 'batch_failed'):
-                        job['last_line'] = (
-                            f"{st} batch "
-                            f"{update.get('batch_current')}/"
-                            f"{update.get('batch_total')}")
+                p = dict(_state_mem['progress'])
+                st = update.get('state')
+                # Batch-level start clears within-batch counters so the
+                # UI doesn't carry stale per-folder numbers across batches.
+                if st == 'syncing':
+                    for f in ('folders_done', 'folders_total',
+                              'msg_new_done', 'msg_new_total',
+                              'msg_flag_done', 'msg_flag_total',
+                              'folder_name', 'folder_msg_done',
+                              'folder_msg_total', 'folder_chunk_current',
+                              'folder_chunk_wall_seconds', 'chunk_mode'):
+                        p.pop(f, None)
+                # Persist chunk_mode / batch_* / folder_* fields
+                for k, v in update.items():
+                    if k == 'chunk_mode' or k.startswith('batch_') \
+                            or k.startswith('folder_'):
+                        p[k] = v
+                _state_mem['progress'] = p
+                if st in ('batch_retry', 'batch_failed'):
+                    _state_mem['last_line'] = (
+                        f"{st} batch "
+                        f"{update.get('batch_current')}/"
+                        f"{update.get('batch_total')}")
+                _flush(force=True)
 
             safe_ch = re.sub(r'[^a-zA-Z0-9_]', '',
                              account_email.replace('@', '_at_')
                              .replace('.', '_'))
-            batch_rc = popen_kwargs.get('env', {}).get('HOME')
+            batch_rc = (target_env or {}).get('HOME')
             if batch_rc:
                 batch_rc = str(Path(batch_rc) / '.mbsyncrc')
             else:
                 batch_rc = str(Path(CONFIG['data_dir']) / username / '.mbsyncrc')
-            sp_kwargs = {k: v for k, v in popen_kwargs.items()
-                         if k in ('user', 'group', 'cwd', 'env')}
-            # 1.0.17: maildir_base = <data>/<user>/<account_slug>/  — this
-            # is what the mbsyncrc's `Path` directive under MaildirStore
-            # points at (SubFolders Verbatim, so <base>/<folder_name>/
-            # {cur,new} holds each folder). The chunk loop needs this to
-            # count on-disk messages after each mbsync invocation.
+            # NOTE: The batcher still spawns mbsync via subprocess.Popen
+            # directly (multiple invocations per batch), not through the
+            # systemd scope. That's OK — those child mbsync processes
+            # inherit the parent scope, so they still survive worker
+            # recycling. The parent scope is what matters for lifetime.
+            sp_kwargs = {}
+            if target_uid is not None:
+                sp_kwargs['user'] = target_uid
+                sp_kwargs['group'] = target_gid
+                sp_kwargs['cwd'] = target_cwd
+                sp_kwargs['env'] = dict(target_env or {})
             acct_slug = re.sub(r'[^a-zA-Z0-9_]', '',
                                account_email.replace('@', '_at_')
                                .replace('.', '_'))
             maildir_base = str(
                 Path(CONFIG['data_dir']) / username / acct_slug)
+            # Launch a placeholder scope so cancel + list_active_scopes
+            # still work for a batched run. We use systemd-run to drop a
+            # long-lived sleep in the scope; the batcher's mbsync children
+            # run in the same slice (as gunicorn worker children). This
+            # gives cross-worker enumeration via list_active_scopes without
+            # forcing the batcher to be systemd-aware.
+            #
+            # Trade-off: the mbsync children aren't literally in the scope
+            # unit — they're in the mail-archiver.service unit. So a
+            # `systemctl stop mail-archiver-sync-<jid>.scope` won't kill
+            # active mbsync in the batched-mode path. The cancel button
+            # instead relies on the state file's mbsync_pid + os.killpg.
+            # Documented in the Cancel path.
             rc = run_batched_sync(
                 channel=safe_ch,
                 mbsyncrc_path=batch_rc,
@@ -1979,7 +2072,18 @@ def _run_sync_background(job_id, username, account_email=None):
                 maildir_base=maildir_base,
             )
         else:
-            proc = subprocess.Popen(cmd, **popen_kwargs)
+            # Single-shot mbsync — this IS run through the systemd scope.
+            # Cancel works cleanly via `systemctl stop <scope>`.
+            proc = _slc.spawn_scoped_mbsync(
+                job_id=job_id,
+                argv=mbsync_argv,
+                email=account_email,
+                uid=target_uid,
+                gid=target_gid,
+                cwd=target_cwd,
+                env=target_env,
+            )
+            _update_sync_job(job_id, mbsync_pid=proc.pid)
             try:
                 for raw_line in proc.stdout:
                     _line_cb(raw_line.rstrip('\n'))
@@ -1989,40 +2093,42 @@ def _run_sync_background(job_id, username, account_email=None):
 
         duration = int(time.time() - started)
         raw_tail = '\n'.join(tail_lines[-20:])
-        with _SYNC_JOBS_LOCK:
-            job['exit_code'] = rc
-            job['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            job['duration_s'] = duration
-            if rc == 0:
-                job['state'] = 'done'
-                status[key] = {
-                    'state': 'ok',
-                    'finished': job['finished'],
-                    'exit_code': 0,
-                    'error': '',
-                }
-            elif rc == 2:
-                # 1.0.15 batched sync: partial success (some batches failed
-                # after retry). Report as 'done' with a warning surfaced.
-                job['state'] = 'done'
-                status[key] = {
-                    'state': 'ok',
-                    'finished': job['finished'],
-                    'exit_code': 2,
-                    'error': 'Some folder batches failed — see log for details',
-                }
-            else:
-                friendly = friendly_sync_error(raw_tail, account_email or '')
-                job['state'] = 'error'
-                job['error'] = friendly
-                status[key] = {
-                    'state': 'error',
-                    'finished': job['finished'],
-                    'exit_code': rc,
-                    'error': friendly,
-                    'raw_error': raw_tail,
-                }
+        finished_local = time.strftime('%Y-%m-%d %H:%M:%S')
 
+        if rc == 0:
+            _update_sync_job(job_id, state='done', exit_code=rc,
+                             finished=finished_local, duration_s=duration)
+            status[key] = {
+                'state': 'ok',
+                'finished': finished_local,
+                'exit_code': 0,
+                'error': '',
+            }
+        elif rc == 2:
+            # 1.0.15 batched sync: partial success (some batches failed
+            # after retry). Report as 'done' with a warning surfaced.
+            _update_sync_job(job_id, state='done', exit_code=rc,
+                             finished=finished_local, duration_s=duration)
+            status[key] = {
+                'state': 'ok',
+                'finished': finished_local,
+                'exit_code': 2,
+                'error': 'Some folder batches failed — see log for details',
+            }
+        else:
+            friendly = friendly_sync_error(raw_tail, account_email or '')
+            _update_sync_job(job_id, state='error', exit_code=rc,
+                             error=friendly, finished=finished_local,
+                             duration_s=duration)
+            status[key] = {
+                'state': 'error',
+                'finished': finished_local,
+                'exit_code': rc,
+                'error': friendly,
+                'raw_error': raw_tail,
+            }
+
+        _flush(force=True)
         _write_sync_status_locked(status_file, status)
         _chown_user(status_file, username)
 
@@ -2034,10 +2140,8 @@ def _run_sync_background(job_id, username, account_email=None):
             except Exception:
                 pass
     except Exception as e:
-        with _SYNC_JOBS_LOCK:
-            job['state'] = 'error'
-            job['error'] = str(e)
-            job['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        _update_sync_job(job_id, state='error', error=str(e),
+                         finished=time.strftime('%Y-%m-%d %H:%M:%S'))
 
 
 def _wants_json():
@@ -2084,47 +2188,46 @@ def sync_account(email):
 @app.route('/api/sync/<job_id>')
 @login_required
 def sync_job_status(job_id):
-    with _SYNC_JOBS_LOCK:
-        job = _SYNC_JOBS.get(job_id)
-        if not job or job['username'] != session['username']:
-            return jsonify({'error': 'not_found'}), 404
-        return jsonify({
-            'job_id': job_id,
-            'state': job['state'],
-            'target': job['target'],
-            'started': job['started'],
-            'finished': job.get('finished'),
-            'exit_code': job.get('exit_code'),
-            'error': job.get('error'),
-            'progress': job.get('progress'),
-            'last_line': job.get('last_line'),
-        })
+    job = _get_sync_job(job_id)
+    if not job or job.get('user') != session['username']:
+        return jsonify({'error': 'not_found'}), 404
+    return jsonify({
+        'job_id': job_id,
+        'state': job.get('state'),
+        'target': job.get('target'),
+        'started': job.get('started_local') or job.get('started'),
+        'finished': job.get('finished'),
+        'exit_code': job.get('exit_code'),
+        'error': job.get('error'),
+        'progress': job.get('progress'),
+        'last_line': job.get('last_line'),
+    })
 
 
 @app.route('/api/sync/<job_id>/stream')
 @login_required
 def sync_job_stream(job_id):
-    with _SYNC_JOBS_LOCK:
-        job = _SYNC_JOBS.get(job_id)
-        if not job or job['username'] != session['username']:
-            return jsonify({'error': 'not_found'}), 404
+    # Authorize via file-backed state — any worker can serve this.
+    job = _get_sync_job(job_id)
+    if not job or job.get('user') != session['username']:
+        return jsonify({'error': 'not_found'}), 404
 
     def event_stream():
         last_progress = None
         last_heartbeat = time.time()
         stream_start = time.time()
+        # Poll the state file every 500ms. Cheap (small file, tmpfs).
         while True:
-            with _SYNC_JOBS_LOCK:
-                current = _SYNC_JOBS.get(job_id)
-                if not current:
-                    yield 'event: error\ndata: {"error":"job_gone"}\n\n'
-                    return
-                state = current['state']
-                progress = current.get('progress')
-                error = current.get('error')
-                exit_code = current.get('exit_code')
-                last_line = current.get('last_line')
-                finished = current.get('finished')
+            current = _get_sync_job(job_id)
+            if not current:
+                yield 'event: error\ndata: {"error":"job_gone"}\n\n'
+                return
+            state = current.get('state')
+            progress = current.get('progress')
+            error = current.get('error')
+            exit_code = current.get('exit_code')
+            last_line = current.get('last_line')
+            finished = current.get('finished')
 
             if progress and progress != last_progress:
                 last_progress = progress
@@ -2144,6 +2247,14 @@ def sync_job_stream(job_id):
             if state == 'error':
                 yield ('event: error\ndata: '
                        + json.dumps({'error': error,
+                                     'exit_code': exit_code,
+                                     'finished': finished,
+                                     'last_line': last_line})
+                       + '\n\n')
+                return
+            if state == 'cancelled':
+                yield ('event: error\ndata: '
+                       + json.dumps({'error': 'cancelled by operator',
                                      'exit_code': exit_code,
                                      'finished': finished,
                                      'last_line': last_line})
@@ -3082,7 +3193,9 @@ def oauth2_refresh(email):
 # 1.0.18: /admin observability + service control page.
 # Registered here (after all top-level routes are defined) so the
 # blueprint import doesn't create circular-import weirdness with the
-# admin module reading _SYNC_JOBS and CONFIG from us.
+# admin module reading CONFIG from us. 1.1.0: admin.py reads job state
+# from /run/mail-archiver/sync-jobs/ via sync_lifecycle; no need to
+# reach into a module-global dict.
 try:
     import admin as _admin_module
     _admin_module.register(app)

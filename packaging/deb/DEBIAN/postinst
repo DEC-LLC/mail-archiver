@@ -173,6 +173,16 @@ systemctl daemon-reload 2>/dev/null || true
 systemctl enable mail-archiver-restart.path 2>/dev/null || true
 systemctl start mail-archiver-restart.path 2>/dev/null || true
 
+# 1.1.0: sync-scope parent slice + proactive OAuth-refresh timer
+# Slice is loaded on-demand by systemd-run --slice=…, but presenting
+# it up-front means `systemctl status mail-archiver-syncs.slice` works
+# immediately after install. Timer starts refreshing tokens 5min after
+# boot then every 10min — kills first-sync-after-idle latency.
+systemctl enable mail-archiver-syncs.slice 2>/dev/null || true
+systemctl start mail-archiver-syncs.slice 2>/dev/null || true
+systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
+systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
+
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
 echo "Then: systemctl enable --now mail-archiver"
 echo ""

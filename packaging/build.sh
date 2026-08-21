@@ -31,6 +31,7 @@ cp "$SRC_DIR/oauth2_microsoft.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/imap_sync.py" "$RPMBUILD_DIR/SOURCES/" 2>/dev/null || true
 cp "$SRC_DIR/mail_batcher.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/admin.py" "$RPMBUILD_DIR/SOURCES/"
+cp "$SRC_DIR/sync_lifecycle.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/VERSION" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/templates" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/static" "$RPMBUILD_DIR/SOURCES/"
@@ -85,6 +86,7 @@ cp "$SRC_DIR/oauth2_microsoft.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/imap_sync.py" "$DEB_PKG/opt/mail-archiver/" 2>/dev/null || true
 cp "$SRC_DIR/mail_batcher.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/admin.py" "$DEB_PKG/opt/mail-archiver/"
+cp "$SRC_DIR/sync_lifecycle.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/gunicorn.conf.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/VERSION" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/generate-cert.sh" "$DEB_PKG/opt/mail-archiver/"
@@ -97,6 +99,10 @@ cp "$SRC_DIR/mail-archiver.service" "$DEB_PKG/etc/systemd/system/"
 # 1.0.18: restart trigger units + tmpfiles.d for /run/mail-archiver
 cp "$SCRIPT_DIR/systemd/mail-archiver-restart.path" "$DEB_PKG/lib/systemd/system/"
 cp "$SCRIPT_DIR/systemd/mail-archiver-restart.service" "$DEB_PKG/lib/systemd/system/"
+# 1.1.0: parent slice for sync scopes + oauth-refresh timer/service
+cp "$SCRIPT_DIR/systemd/mail-archiver-syncs.slice" "$DEB_PKG/lib/systemd/system/"
+cp "$SCRIPT_DIR/systemd/mail-archiver-oauth-refresh.service" "$DEB_PKG/lib/systemd/system/"
+cp "$SCRIPT_DIR/systemd/mail-archiver-oauth-refresh.timer" "$DEB_PKG/lib/systemd/system/"
 cp "$SCRIPT_DIR/tmpfiles.d/mail-archiver.conf" "$DEB_PKG/usr/lib/tmpfiles.d/"
 
 # Cron job

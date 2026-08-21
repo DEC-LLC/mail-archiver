@@ -274,7 +274,11 @@ def _run_folder_chunked(
 
     Returns 0 on success, non-zero on final failure. `line_cb` receives
     every stderr line from every chunk so the existing SSE parsing
-    (C:/B:/M:) keeps working.
+    (C:/B:/M:) keeps working — EXCEPT: during chunked runs we mark the
+    progress dict with `chunk_mode=True` so line_cb consumers (see
+    app.py `_line_cb`) can skip overwriting folder_msg_done with mbsync's
+    own C:/M: totals. Chunk-loop before/after counts are the truth here
+    because mbsync's totals reset every chunk to the folder's full size.
     """
     chunk = 0
     stuck = 0
@@ -284,6 +288,7 @@ def _run_folder_chunked(
         if progress_cb:
             progress_cb({
                 'state': 'chunk',
+                'chunk_mode': True,
                 'folder_name': folder_name,
                 'folder_msg_total': folder_total,
                 'folder_msg_done': before,
@@ -332,6 +337,7 @@ def _run_folder_chunked(
         if progress_cb:
             progress_cb({
                 'state': 'chunk',
+                'chunk_mode': True,
                 'folder_name': folder_name,
                 'folder_msg_total': folder_total,
                 'folder_msg_done': after,
@@ -341,14 +347,25 @@ def _run_folder_chunked(
         # Clean exit AND not wall-timeout AND we're at target or beyond
         # (or mbsync said "nothing to do"): done.
         if proc.returncode == 0 and not wall_expired:
+            if progress_cb:
+                # Clear chunk_mode when done so post-chunk line_cb writes
+                # (unlikely; mbsync exited) don't get suppressed.
+                progress_cb({'state': 'chunk', 'chunk_mode': False,
+                             'folder_name': folder_name})
             return 0
         # If we've caught up to (or past) the target and no error, done.
         if after >= folder_total and proc.returncode in (0, None) \
                 and not wall_expired:
+            if progress_cb:
+                progress_cb({'state': 'chunk', 'chunk_mode': False,
+                             'folder_name': folder_name})
             return 0
         if delta == 0:
             stuck += 1
             if stuck >= max_stuck:
+                if progress_cb:
+                    progress_cb({'state': 'chunk', 'chunk_mode': False,
+                                 'folder_name': folder_name})
                 return proc.returncode if proc.returncode else 2
         else:
             stuck = 0

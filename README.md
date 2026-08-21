@@ -321,6 +321,39 @@ Features we're building over time. Contributions and feature requests welcome.
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
 
+## Sync lifecycle (1.1.0)
+
+Every mbsync invocation runs as a transient **systemd scope** under a
+shared `mail-archiver-syncs.slice`. Per-job state lives on disk at
+`/run/mail-archiver/sync-jobs/<job_id>.json` and is atomically rewritten
+every ~2s while the sync runs.
+
+Consequences that matter to operators:
+
+- **Syncs survive WebUI restarts.** Systemd owns the scope, not
+  gunicorn. Worker recycle, service restart, even a crash of the
+  WebUI does not kill an in-flight sync.
+- **Cross-worker visible.** Any gunicorn worker can serve any job's
+  SSE stream because state is on disk, not in a per-process dict.
+  Log out of one tab, log back in on another — the live progress bar
+  reattaches automatically.
+- **Cancel is `systemctl stop`.** The Admin page's Cancel Sync button
+  runs `systemctl stop mail-archiver-sync-<id>.scope`. Clean and
+  auditable — journalctl records the whole thing.
+- **Enumerate active syncs anywhere.**
+  `systemctl list-units 'mail-archiver-sync-*.scope' --state=active`
+  reports every in-flight sync system-wide (across all users and all
+  gunicorn workers).
+
+The **`mail-archiver-oauth-refresh.timer`** wakes every 10 minutes
+(starting 5 min after boot) and proactively refreshes any OAuth access
+token expiring within the next 15 minutes. This keeps first-sync-after-idle
+snappy — the sync path doesn't have to pay the 200–500ms refresh POST.
+
+The cron path (`python3 app.py scheduled-sync`) stays synchronous — no
+scope, no state file, no SSE. A headless run doesn't need the lifecycle
+overhead.
+
 ## Author
 
 **DEC-LLC** (Diwan Enterprise Consulting LLC)

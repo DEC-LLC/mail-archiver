@@ -764,3 +764,117 @@ def clear_default_if(cfg: dict, app_id: str) -> dict:
         if did == app_id:
             del defs[provider]
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# CLI: `python3 oauth2_microsoft.py refresh-expiring` (1.1.0)
+# ---------------------------------------------------------------------------
+# Fired by the mail-archiver-oauth-refresh.timer every 10 min. Walks every
+# provisioned user's *.oauth2.json, refreshes any access token expiring
+# within the next 15 minutes. Kills first-sync-after-idle latency: the sync
+# path no longer needs to spend 200-500ms on the refresh POST because the
+# token is already fresh from the last timer tick.
+
+def _cli_refresh_expiring() -> int:
+    """Iterate MAIL_ARCHIVER_DATA/<user>/.config/*.oauth2.json, refresh any
+    within 15 min of expiry. Prints one line per account touched, plus a
+    summary. Returns 0 unless catastrophically broken (missing data dir).
+    """
+    data_dir = os.environ.get('MAIL_ARCHIVER_DATA',
+                              '/datapool/email-archive')
+    if not Path(data_dir).is_dir():
+        print(f'oauth-refresh: MAIL_ARCHIVER_DATA={data_dir} does not exist')
+        return 1
+    horizon = 15 * 60  # 15 minutes
+    now = time.time()
+    total = 0
+    refreshed = 0
+    needs_reauth = 0
+    errors = 0
+    skipped = 0
+    for user_dir in sorted(Path(data_dir).iterdir()):
+        if not user_dir.is_dir():
+            continue
+        cfg_dir = user_dir / '.config'
+        if not cfg_dir.is_dir():
+            continue
+        try:
+            token_files = sorted(cfg_dir.glob('*.oauth2.json'))
+        except OSError:
+            continue
+        for tf in token_files:
+            try:
+                data = json.loads(tf.read_text())
+            except (OSError, ValueError):
+                continue
+            total += 1
+            exp = int(data.get('expires_at') or 0)
+            if exp - now > horizon:
+                skipped += 1
+                continue
+            if data.get('needs_reauth'):
+                skipped += 1
+                continue
+            # Reconstruct email from filename slug
+            slug = tf.stem.replace('.oauth2', '')
+            email = slug.replace('_at_', '@')
+            # slug used '.' → '_' — the reverse is lossy for the domain
+            # (foo_com → foo.com is right, but foo_bar_com could be
+            # foo.bar.com or foo_bar.com). Try both by scanning accounts.json
+            accounts_file = cfg_dir / 'accounts.json'
+            found_email = None
+            try:
+                accts = json.loads(accounts_file.read_text())
+                iterable = (
+                    accts.values() if isinstance(accts, dict) else accts
+                )
+                for a in iterable:
+                    if isinstance(a, dict):
+                        ae = a.get('email', '')
+                        if ae and ae.replace('@', '_at_').replace('.', '_') == slug:
+                            found_email = ae
+                            break
+            except (OSError, ValueError):
+                pass
+            if not found_email:
+                # Best-effort fallback
+                found_email = email
+            try:
+                app_obj = resolve_oauth_app(
+                    data_dir, user_dir.name,
+                    app_id=data.get('_app_id') or data.get('app_id'),
+                    provider='microsoft',
+                )
+                if not app_obj:
+                    print(f'oauth-refresh: {user_dir.name}/{found_email}: '
+                          f'no app resolved — skipping')
+                    errors += 1
+                    continue
+                oauth = build_microsoft_oauth2(
+                    app_obj, 'https://localhost/callback')
+                ensure_fresh_token(oauth, data_dir, user_dir.name, found_email)
+                refreshed += 1
+                new_tok = load_oauth2_tokens(data_dir, user_dir.name, found_email)
+                new_exp = int(new_tok.get('expires_at') or 0)
+                print(f'oauth-refresh: {user_dir.name}/{found_email}: OK '
+                      f'expires_at={new_exp} '
+                      f'(+{int(new_exp - now)}s from now)')
+            except TokenNeedsReauth as e:
+                needs_reauth += 1
+                print(f'oauth-refresh: {user_dir.name}/{found_email}: '
+                      f'NEEDS_REAUTH ({e.detail})')
+            except Exception as e:
+                errors += 1
+                print(f'oauth-refresh: {user_dir.name}/{found_email}: '
+                      f'ERROR {type(e).__name__}: {e}')
+    print(f'oauth-refresh summary: total={total} refreshed={refreshed} '
+          f'needs_reauth={needs_reauth} errors={errors} skipped={skipped}')
+    return 0
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'refresh-expiring':
+        sys.exit(_cli_refresh_expiring())
+    print('Usage: oauth2_microsoft.py refresh-expiring',
+          file=sys.stderr)
+    sys.exit(2)

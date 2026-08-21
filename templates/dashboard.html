@@ -107,7 +107,8 @@
             {% endif %}
         </div>
 
-        <div id="sync-all-status" class="sync-progress hidden" data-target="__all__"></div>
+        <div id="sync-all-status" class="sync-progress hidden" data-target="__all__"
+             {% if active_jobs and active_jobs.get('__all__') %}data-active-job="{{ active_jobs['__all__'] }}"{% endif %}></div>
 
         {% if not accounts %}
         <div class="empty-state">
@@ -152,7 +153,8 @@
                 </div>
                 {% endif %}
 
-                <div class="sync-progress hidden" data-target="{{ acct.email }}"></div>
+                <div class="sync-progress hidden" data-target="{{ acct.email }}"
+                     {% if active_jobs and active_jobs.get(acct.email) %}data-active-job="{{ active_jobs[acct.email] }}"{% endif %}></div>
 
                 <div class="account-actions">
                     <button type="button" class="btn btn-small sync-now-btn" data-email="{{ acct.email }}" {% if not acct.enabled %}disabled{% endif %}>Sync Now</button>
@@ -269,6 +271,45 @@
             (msg.last_line ? '<div class="last-line">' + msg.last_line + '</div>' : '');
     }
 
+    // 1.1.0: split "start a new sync" from "attach to an existing job".
+    // Both share the SSE wiring below.
+    function _wireSSE(streamUrl, panel, target, isAll) {
+        var es = new EventSource(streamUrl);
+        es.addEventListener('progress', function (ev) {
+            try { renderProgress(panel, JSON.parse(ev.data)); } catch (e) {}
+        });
+        es.addEventListener('done', function (ev) {
+            try { renderDone(panel, JSON.parse(ev.data), isAll, target); }
+            catch (e) { renderDone(panel, {}, isAll, target); }
+            es.close();
+        });
+        es.addEventListener('error', function (ev) {
+            if (ev.data) {
+                try { renderError(panel, JSON.parse(ev.data), isAll, target); }
+                catch (e) { renderError(panel, {error: 'stream ended'}, isAll, target); }
+            } else if (es.readyState === EventSource.CLOSED) {
+                renderError(panel, {error: 'connection lost'}, isAll, target);
+            }
+            es.close();
+        });
+        es.addEventListener('ping', function () { /* keepalive */ });
+        es.addEventListener('timeout', function () {
+            renderError(panel, {error: 'stream timed out (>1h)'}, isAll, target);
+            es.close();
+        });
+    }
+
+    function attachToJob(jobId, panel, target) {
+        // Reattach to an already-running job (page-load / logout-login /
+        // second-tab). Sync state lives on disk in 1.1.0, any worker
+        // serves the same job_id.
+        panel.classList.remove('hidden', 'error', 'done');
+        panel.innerHTML = '<div>Reconnecting to in-flight sync…</div>';
+        var isAll = target === '__all__';
+        _wireSSE('/api/sync/' + encodeURIComponent(jobId) + '/stream',
+                 panel, target, isAll);
+    }
+
     function startSync(url, panel, target) {
         panel.classList.remove('hidden', 'error', 'done');
         panel.innerHTML = '<div>Starting sync…</div>';
@@ -281,35 +322,25 @@
             if (r.status !== 202) throw new Error('HTTP ' + r.status);
             return r.json();
         }).then(function (job) {
-            var es = new EventSource(job.stream_url);
-            es.addEventListener('progress', function (ev) {
-                try { renderProgress(panel, JSON.parse(ev.data)); } catch (e) {}
-            });
-            es.addEventListener('done', function (ev) {
-                try { renderDone(panel, JSON.parse(ev.data), isAll, target); }
-                catch (e) { renderDone(panel, {}, isAll, target); }
-                es.close();
-            });
-            es.addEventListener('error', function (ev) {
-                // Distinguish transport error (no ev.data) from server-emitted 'error' event
-                if (ev.data) {
-                    try { renderError(panel, JSON.parse(ev.data), isAll, target); }
-                    catch (e) { renderError(panel, {error: 'stream ended'}, isAll, target); }
-                } else if (es.readyState === EventSource.CLOSED) {
-                    renderError(panel, {error: 'connection lost'}, isAll, target);
-                }
-                es.close();
-            });
-            es.addEventListener('ping', function () { /* keepalive */ });
-            es.addEventListener('timeout', function () {
-                renderError(panel, {error: 'stream timed out (>1h)'}, isAll, target);
-                es.close();
-            });
+            _wireSSE(job.stream_url, panel, target, isAll);
         }).catch(function (e) {
             renderError(panel, {error: 'Could not start sync: ' + e.message},
                         isAll, target);
         });
     }
+
+    // On page load, auto-reattach to any sync jobs the server flagged
+    // as still running for this user's accounts. Belt+braces: also poll
+    // /api/sync/active as fallback if the server-side render missed
+    // something (e.g. sync started after page render but before this JS
+    // executes).
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('.sync-progress[data-active-job]').forEach(function (panel) {
+            var jobId = panel.getAttribute('data-active-job');
+            var target = panel.getAttribute('data-target');
+            if (jobId && target) attachToJob(jobId, panel, target);
+        });
+    });
 
     document.addEventListener('click', function (e) {
         var btn = e.target.closest('.sync-now-btn');

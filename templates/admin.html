@@ -98,26 +98,81 @@
                 <span class="k">Free:</span>       <span class="band-{{ storage_root.band }}">{{ (storage_root.avail / (1024**3))|round(1) }} GB ({{ storage_root.pct_free|round(1) }}%)</span>
             </div>
             {% endif %}
-            <table class="storage-table">
+            <!-- 1.1.0 polish: search + sort + top-20 with expand -->
+            <div style="margin: 0.5rem 0; display: flex; gap: 0.5rem; align-items: center;">
+                <input id="storage-filter" type="search" placeholder="Filter by email…"
+                       style="flex: 1; padding: 0.25rem 0.4rem; font-size: 0.85rem;"
+                       oninput="filterStorage()">
+                <label style="font-size: 0.8rem;">Sort:
+                    <select id="storage-sort" onchange="renderStorage()">
+                        <option value="bytes-desc">Size (largest first)</option>
+                        <option value="email">Email A→Z</option>
+                        <option value="user">User A→Z</option>
+                    </select>
+                </label>
+            </div>
+            <table class="storage-table" id="storage-table">
                 <thead><tr><th>User</th><th>Account</th><th class="num">Size</th></tr></thead>
-                <tbody>
-                {% for r in storage_rows[:10] %}
-                <tr>
-                    <td>{{ r.user }}</td>
-                    <td>{{ r.email }}</td>
-                    <td class="num">
-                        {% if r.computing and r.bytes == -1 %}<span class="computing">computing…</span>
-                        {% elif r.bytes == -1 %}—
-                        {% else %}{{ (r.bytes / (1024**2))|round(1) }} MB{% endif %}
-                    </td>
-                </tr>
-                {% endfor %}
-                </tbody>
+                <tbody id="storage-tbody"></tbody>
             </table>
-            {% if storage_rows|length > 10 %}
-            <p style="font-size: 0.8rem;">+ {{ storage_rows|length - 10 }} more — see Details</p>
-            {% endif %}
+            <p id="storage-truncated" style="font-size: 0.8rem; display:none;"></p>
+            <p id="storage-show-all" style="font-size: 0.8rem;">
+                <a href="#" onclick="toggleStorageShowAll(event)">Show all accounts</a>
+            </p>
         </div>
+        <script>
+        // Storage card client-side sort + filter + top-20 cutoff (1.1.0)
+        var STORAGE_ROWS = {{ storage_rows|tojson }};
+        var STORAGE_SHOW_ALL = false;
+        function fmtBytes(b, computing) {
+            if (computing && b === -1) return '<span class="computing">computing…</span>';
+            if (b === -1) return '—';
+            if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+            return (b / (1024*1024)).toFixed(1) + ' MB';
+        }
+        function renderStorage() {
+            var filter = (document.getElementById('storage-filter').value || '').toLowerCase();
+            var sortBy = document.getElementById('storage-sort').value;
+            var rows = STORAGE_ROWS.slice();
+            if (filter) rows = rows.filter(function (r) {
+                return (r.email || '').toLowerCase().indexOf(filter) !== -1
+                    || (r.user  || '').toLowerCase().indexOf(filter) !== -1;
+            });
+            if (sortBy === 'bytes-desc')
+                rows.sort(function (a, b) { return (b.bytes || 0) - (a.bytes || 0); });
+            else if (sortBy === 'email')
+                rows.sort(function (a, b) { return (a.email||'').localeCompare(b.email||''); });
+            else
+                rows.sort(function (a, b) { return (a.user||'').localeCompare(b.user||''); });
+            var cap = STORAGE_SHOW_ALL ? rows.length : 20;
+            var visible = rows.slice(0, cap);
+            var truncated = document.getElementById('storage-truncated');
+            var showAll = document.getElementById('storage-show-all');
+            if (rows.length > 20 && !STORAGE_SHOW_ALL) {
+                truncated.style.display = 'block';
+                truncated.textContent = '+ ' + (rows.length - 20) + ' more (top 20 by ' + sortBy + ')';
+                showAll.style.display = 'block';
+                showAll.firstElementChild.textContent = 'Show all ' + rows.length + ' accounts';
+            } else {
+                truncated.style.display = 'none';
+                showAll.style.display = STORAGE_SHOW_ALL ? 'block' : 'none';
+                if (STORAGE_SHOW_ALL) showAll.firstElementChild.textContent = 'Show top 20 only';
+            }
+            var tbody = document.getElementById('storage-tbody');
+            tbody.innerHTML = visible.map(function (r) {
+                return '<tr><td>' + (r.user || '') + '</td>'
+                     + '<td>' + (r.email || '') + '</td>'
+                     + '<td class="num">' + fmtBytes(r.bytes, r.computing) + '</td></tr>';
+            }).join('') || '<tr><td colspan="3" style="text-align:center; color:#999;">no matches</td></tr>';
+        }
+        function filterStorage() { renderStorage(); }
+        function toggleStorageShowAll(e) {
+            e.preventDefault();
+            STORAGE_SHOW_ALL = !STORAGE_SHOW_ALL;
+            renderStorage();
+        }
+        document.addEventListener('DOMContentLoaded', renderStorage);
+        </script>
 
         <!-- ===== Host card ===== -->
         <div class="card">
@@ -180,7 +235,7 @@
         <p style="font-size: 0.8rem; color: #999;">
             Admin group: <code>{{ admin_group }}</code> —
             grant with <code>sudo usermod -aG {{ admin_group }} &lt;user&gt;</code>.
-            Mail Archiver 1.0.18.
+            Mail Archiver {{ service.version }}.
         </p>
     </footer>
 </div>

@@ -1,0 +1,26 @@
+[Unit]
+Description=Mail Archiver — proactive OAuth token refresh
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/mail-archiver/oauth2_microsoft.py
+
+[Service]
+Type=oneshot
+User=mail-archiver
+Group=mail-archiver
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/mail-archiver/oauth2_microsoft.py refresh-expiring
+# Non-fatal on any single account's failure — the CLI returns 0 unless
+# something catastrophic happens. Journal has per-account results.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+# Lock down: read-only /opt, no need to write anywhere outside data dir
+ProtectSystem=strict
+ReadWritePaths=/datapool/email-archive /srv /var/log
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

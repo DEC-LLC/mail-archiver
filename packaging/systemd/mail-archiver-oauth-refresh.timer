@@ -1,0 +1,19 @@
+[Unit]
+Description=Mail Archiver — proactive OAuth token refresh timer
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# First run 5 min after boot, then every 10 min. MSA/AAD access tokens
+# live ~60 min — refreshing every 10 min with a 15-min "expiring window"
+# in the CLI guarantees we always spawn mbsync with a token that has
+# at least ~50 min of life left. Prevents first-sync-after-idle latency
+# spike (the refresh happens in background, not on the sync's critical
+# path).
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=2min
+Persistent=false
+Unit=mail-archiver-oauth-refresh.service
+
+[Install]
+WantedBy=timers.target
