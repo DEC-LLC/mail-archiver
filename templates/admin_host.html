@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Mail Archiver — Host Detail</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+    table.dtl { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
+    table.dtl th, table.dtl td { border-bottom: 1px solid #eee; padding: 0.35rem 0.5rem; text-align: left; }
+    table.dtl th { background: #f6f7f9; }
+    .num { text-align: right; font-family: monospace; }
+    .kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 0.75rem; font-size: 0.9rem; }
+    .kv .k { color: #666; }
+    .sparkline { display: inline-flex; height: 40px; align-items: flex-end; gap: 2px; }
+    .sparkline .bar { width: 6px; background: #388e3c; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>Host Detail</h1>
+        <div class="user-info">
+            <a href="{{ url_for('admin.index') }}" class="btn btn-small">← Admin</a>
+        </div>
+    </header>
+
+    <h2>Load + Memory + OS</h2>
+    <div class="kv">
+        <span class="k">Load (1/5/15):</span> <span>{{ load.load1 }} / {{ load.load5 }} / {{ load.load15 }}</span>
+        <span class="k">RAM total:</span>     <span>{{ (mem.total_kb / 1024)|round(0) }} MB</span>
+        <span class="k">RAM available:</span> <span>{{ (mem.available_kb / 1024)|round(0) }} MB</span>
+        <span class="k">RAM used:</span>      <span>{{ mem.pct_used|round(1) }}%</span>
+        {% if uptime_s %}
+        <span class="k">Host uptime:</span>   <span>{{ '%.1f'|format(uptime_s / 86400) }} days ({{ '%.0f'|format(uptime_s / 3600) }} h)</span>
+        {% endif %}
+        {% if os_release.PRETTY_NAME %}
+        <span class="k">OS:</span>            <span>{{ os_release.PRETTY_NAME }}</span>
+        {% endif %}
+        {% if os_release.VERSION %}
+        <span class="k">Version:</span>       <span>{{ os_release.VERSION }}</span>
+        {% endif %}
+    </div>
+
+    {% if load_history %}
+    <h2>Load (1-min) — last 15 minutes</h2>
+    <div class="sparkline">
+        {% set maxv = load_history|map(attribute=1)|reject('none')|list|max(default=1) %}
+        {% for _, v in load_history %}
+            {% if v is not none %}
+            <div class="bar" style="height: {{ ((v / (maxv if maxv > 0 else 1)) * 40)|round(0) }}px" title="{{ v }}"></div>
+            {% endif %}
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <h2>Data-volume disk I/O</h2>
+    {% if diskstats %}
+    <div class="kv">
+        <span class="k">Device:</span>    <span>{{ diskstats.device }}</span>
+        <span class="k">Reads:</span>     <span>{{ diskstats.reads }}</span>
+        <span class="k">Sectors read:</span>  <span>{{ diskstats.read_sectors }}</span>
+        <span class="k">Writes:</span>    <span>{{ diskstats.writes }}</span>
+        <span class="k">Sectors written:</span> <span>{{ diskstats.write_sectors }}</span>
+    </div>
+    {% else %}
+    <p>Disk stats unavailable (probably a virtual/overlay filesystem).</p>
+    {% endif %}
+
+    <h2>Network Interfaces</h2>
+    <table class="dtl">
+        <thead><tr><th>Interface</th><th class="num">RX bytes</th><th class="num">TX bytes</th></tr></thead>
+        <tbody>
+        {% for i in interfaces %}
+        <tr>
+            <td>{{ i.iface }}</td>
+            <td class="num">{{ (i.rx_bytes / (1024**2))|round(1) }} MB</td>
+            <td class="num">{{ (i.tx_bytes / (1024**2))|round(1) }} MB</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    {% if thermal %}
+    <h2>Thermal zones</h2>
+    <table class="dtl">
+        <thead><tr><th>Zone</th><th>Type</th><th class="num">°C</th></tr></thead>
+        <tbody>
+        {% for t in thermal %}
+        <tr><td>{{ t.zone }}</td><td>{{ t.type }}</td><td class="num">{{ t.temp_c|round(1) }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
+</body>
+</html>

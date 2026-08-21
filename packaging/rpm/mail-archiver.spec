@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.17
+Version:        1.0.18
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -27,6 +27,8 @@ mkdir -p %{buildroot}/opt/mail-archiver/static
 mkdir -p %{buildroot}/etc/systemd/system
 mkdir -p %{buildroot}/etc/cron.d
 mkdir -p %{buildroot}/usr/libexec
+mkdir -p %{buildroot}/usr/lib/systemd/system
+mkdir -p %{buildroot}/usr/lib/tmpfiles.d
 
 # Application files
 install -m 644 %{_sourcedir}/app.py %{buildroot}/opt/mail-archiver/app.py
@@ -34,9 +36,18 @@ install -m 644 %{_sourcedir}/search_index.py %{buildroot}/opt/mail-archiver/sear
 install -m 644 %{_sourcedir}/oauth2_microsoft.py %{buildroot}/opt/mail-archiver/oauth2_microsoft.py
 [ -f %{_sourcedir}/imap_sync.py ] && install -m 644 %{_sourcedir}/imap_sync.py %{buildroot}/opt/mail-archiver/imap_sync.py || true
 install -m 644 %{_sourcedir}/mail_batcher.py %{buildroot}/opt/mail-archiver/mail_batcher.py
+install -m 644 %{_sourcedir}/admin.py %{buildroot}/opt/mail-archiver/admin.py
 install -m 644 %{_sourcedir}/gunicorn.conf.py %{buildroot}/opt/mail-archiver/gunicorn.conf.py
+install -m 644 %{_sourcedir}/VERSION %{buildroot}/opt/mail-archiver/VERSION
 install -m 755 %{_sourcedir}/generate-cert.sh %{buildroot}/opt/mail-archiver/generate-cert.sh
 install -m 755 %{_sourcedir}/mail-archiver-cred %{buildroot}/usr/libexec/mail-archiver-cred
+
+# 1.0.18: restart trigger — path+service pair. WebUI (as mail-archiver)
+# touches /run/mail-archiver/restart-requested; path unit fires the
+# service which runs `systemctl restart mail-archiver` as root.
+install -m 644 %{_sourcedir}/systemd/mail-archiver-restart.path %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.path
+install -m 644 %{_sourcedir}/systemd/mail-archiver-restart.service %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.service
+install -m 644 %{_sourcedir}/tmpfiles.d/mail-archiver.conf %{buildroot}/usr/lib/tmpfiles.d/mail-archiver.conf
 
 # Templates
 for t in %{_sourcedir}/templates/*.html; do
@@ -66,12 +77,17 @@ CRON
 /opt/mail-archiver/oauth2_microsoft.py
 /opt/mail-archiver/imap_sync.py
 /opt/mail-archiver/mail_batcher.py
+/opt/mail-archiver/admin.py
 /opt/mail-archiver/gunicorn.conf.py
 /opt/mail-archiver/generate-cert.sh
+/opt/mail-archiver/VERSION
 /usr/libexec/mail-archiver-cred
 /opt/mail-archiver/templates/*.html
 /opt/mail-archiver/static/*.css
 /etc/systemd/system/mail-archiver.service
+/usr/lib/systemd/system/mail-archiver-restart.path
+/usr/lib/systemd/system/mail-archiver-restart.service
+/usr/lib/tmpfiles.d/mail-archiver.conf
 %config(noreplace) /etc/cron.d/mail-archiver
 
 %post
@@ -219,8 +235,22 @@ else
     rm -f /run/mail-archiver/restart-pending 2>/dev/null || true
 fi
 
+# 1.0.18: admin page + Restart button — set up group, runtime dir, and
+# the packaged path/service pair that turns a WebUI touch of
+# /run/mail-archiver/restart-requested into a root `systemctl restart`.
+getent group mail-archiver-admins >/dev/null || \
+    groupadd -r mail-archiver-admins 2>/dev/null || true
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/mail-archiver.conf 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable mail-archiver-restart.path 2>/dev/null || true
+systemctl start mail-archiver-restart.path 2>/dev/null || true
+
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
 echo "Then: systemctl enable --now mail-archiver"
+echo ""
+echo "Admin access: grant users membership in 'mail-archiver-admins':"
+echo "  sudo usermod -aG mail-archiver-admins <username>"
+echo "  (log out and back in for group membership to apply)"
 
 %preun
 if [ "$1" = "0" ]; then
@@ -229,6 +259,40 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.18-1
+- Admin page (/admin) — PAM-group-gated observability + service control.
+  Four cards: Service (version, uptime, workers, threads, restart-pending
+  banner, Restart Now button), Storage (statvfs on data root with
+  20%/5% warning bands + per-user/per-account du breakdown cached 5min
+  with async computation), Host (loadavg / meminfo / diskstats /
+  thermal / uptime / OS release), App (active syncs from _SYNC_JOBS,
+  OAuth tokens expiring <24h, accounts flagged needs_reauth, recent
+  sync-failure rate from the sync log tail). Each card links to a
+  detail page: /admin/storage (per-mount df + log/app footprint),
+  /admin/host (network interfaces, thermal zones, 15-min load
+  sparkline sampled 30s), /admin/app (full sync history table + Force
+  Refresh Now button per OAuth account + Cancel Sync button per
+  active job — safe because 1.0.17 chunking makes cancel-and-resume
+  painless).
+- Restart Now mechanism: WebUI touches /run/mail-archiver/restart-requested
+  as the mail-archiver user. New mail-archiver-restart.path unit
+  (PathExists) fires mail-archiver-restart.service (Type=oneshot, root)
+  which rm's the marker and runs `systemctl restart mail-archiver`.
+  Preserves the "WebUI has zero direct systemctl privileges" property
+  — the WebUI can only write one path; only root can execute the
+  restart. Journal has both mail-archiver-restart.service and
+  mail-archiver.service entries for a clean audit trail. Packaged units
+  at /usr/lib/systemd/system/; enabled by postinst.
+- Admin gate: MAIL_ARCHIVER_ADMIN_GROUP env (default 'mail-archiver-admins',
+  auto-created r by postinst — never adds users, operator decision).
+  Fallback to sudo/wheel if the configured group doesn't exist. Check
+  cached per-username 60s. Non-admin users get 403 with a usermod
+  hint. Dashboard header conditionally shows the Admin link only for
+  admins (jinja global 'is_admin').
+- tmpfiles.d config packaged (/usr/lib/tmpfiles.d/mail-archiver.conf)
+  creates /run/mail-archiver 0770 root:mail-archiver on boot AND at
+  install time (postinst runs systemd-tmpfiles --create).
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.17-1
 - Intra-folder chunked sync (mail_batcher.py): huge folders (default:
   > MAIL_ARCHIVER_CHUNK_THRESHOLD = 2500 msgs) now sync in

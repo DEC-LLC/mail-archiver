@@ -71,6 +71,9 @@
             <div class="user-info">
                 <span>{{ username }}</span>
                 <a href="{{ url_for('oauth2_settings') }}" class="btn btn-small" title="Server-wide settings (Microsoft OAuth2 credentials)">Server Settings</a>
+                {% if is_admin and is_admin() %}
+                <a href="{{ url_for('admin.index') }}" class="btn btn-small" title="Admin: service control, storage, host + app health (1.0.18)">Admin</a>
+                {% endif %}
                 <a href="{{ url_for('logout') }}" class="btn btn-small">Log Out</a>
             </div>
         </header>

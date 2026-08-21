@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Archiver — Admin</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+    .admin-grid { display: grid; grid-template-columns: 1fr 1fr;
+                  gap: 1rem; margin: 1rem 0; }
+    @media (max-width: 900px) { .admin-grid { grid-template-columns: 1fr; } }
+    .card { background: #fff; border: 1px solid #ccc; border-radius: 6px;
+            padding: 1rem; }
+    .card h2 { margin-top: 0; font-size: 1.1rem;
+               border-bottom: 1px solid #e2e2e2; padding-bottom: 0.4rem; }
+    .card .detail-link { float: right; font-size: 0.85rem; font-weight: normal; }
+    .kv { display: grid; grid-template-columns: max-content 1fr;
+          gap: 0.25rem 0.75rem; font-size: 0.9rem; }
+    .kv .k { color: #666; }
+    .band-green  { color: #2e7d32; }
+    .band-amber  { color: #f57c00; }
+    .band-red    { color: #c62828; font-weight: bold; }
+    .storage-table, .expiry-table {
+        width: 100%; border-collapse: collapse; font-size: 0.85rem;
+        margin-top: 0.5rem;
+    }
+    .storage-table th, .storage-table td,
+    .expiry-table th, .expiry-table td {
+        border-bottom: 1px solid #eee; padding: 0.3rem 0.4rem;
+        text-align: left;
+    }
+    .storage-table th { background: #f6f7f9; }
+    .storage-table .num { text-align: right; font-family: monospace; }
+    .computing { color: #999; font-style: italic; }
+    .banner-warn { background: #fff8e1; border: 1px solid #ffb300;
+                   padding: 0.75rem; border-radius: 4px; margin: 0.5rem 0; }
+    .banner-crit { background: #fbe9e7; border: 1px solid #d84315;
+                   padding: 0.75rem; border-radius: 4px; margin: 0.5rem 0; }
+    .btn-restart { background: #d84315; color: white; padding: 0.5rem 1rem;
+                   border-radius: 3px; border: none; cursor: pointer;
+                   font-size: 0.9rem; }
+    .btn-restart:hover { background: #bf360c; }
+    #restart-status { font-size: 0.85rem; margin-left: 0.5rem; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <div class="logo-header">
+            <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+            <h1>Mail Archiver — Admin</h1>
+        </div>
+        <div class="user-info">
+            <span>{{ username }} <em>(admin: {{ admin_group }})</em></span>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-small">Dashboard</a>
+            <a href="{{ url_for('logout') }}" class="btn btn-small">Log Out</a>
+        </div>
+    </header>
+
+    <div class="admin-grid">
+
+        <!-- ===== Service card ===== -->
+        <div class="card">
+            <h2>Service</h2>
+            <div class="kv">
+                <span class="k">Version:</span>       <span><strong>{{ service.version }}</strong></span>
+                <span class="k">State:</span>         <span>{{ service.active_state }}</span>
+                {% if service.uptime_s %}
+                <span class="k">Uptime:</span>        <span>{{ '%.0f'|format(service.uptime_s / 60) }} min</span>
+                {% endif %}
+                <span class="k">Workers:</span>       <span>{{ service.workers }}</span>
+                <span class="k">Thread cap:</span>    <span>{{ service.threads_base }}–{{ service.threads_max }}</span>
+            </div>
+            {% if service.restart_pending %}
+            <div class="banner-warn">
+                <strong>Restart pending</strong> — new binaries installed but running process is still on the previous version.
+                <br><small>Marker: {{ service.restart_pending }}</small>
+            </div>
+            {% endif %}
+            <p style="margin-top: 1rem;">
+                <button class="btn-restart" id="restart-btn" onclick="doRestart()">Restart Now</button>
+                <span id="restart-status"></span>
+            </p>
+        </div>
+
+        <!-- ===== Storage card ===== -->
+        <div class="card">
+            <h2>Storage
+                <a class="detail-link" href="{{ url_for('admin.storage_detail') }}">Details →</a>
+            </h2>
+            {% if storage_root.error %}
+            <p class="band-red">Error: {{ storage_root.error }}</p>
+            {% else %}
+            <div class="kv">
+                <span class="k">Data:</span>       <span><code>{{ storage_root.path }}</code></span>
+                <span class="k">Total:</span>      <span>{{ (storage_root.total / (1024**3))|round(1) }} GB</span>
+                <span class="k">Used:</span>       <span>{{ (storage_root.used / (1024**3))|round(1) }} GB</span>
+                <span class="k">Free:</span>       <span class="band-{{ storage_root.band }}">{{ (storage_root.avail / (1024**3))|round(1) }} GB ({{ storage_root.pct_free|round(1) }}%)</span>
+            </div>
+            {% endif %}
+            <table class="storage-table">
+                <thead><tr><th>User</th><th>Account</th><th class="num">Size</th></tr></thead>
+                <tbody>
+                {% for r in storage_rows[:10] %}
+                <tr>
+                    <td>{{ r.user }}</td>
+                    <td>{{ r.email }}</td>
+                    <td class="num">
+                        {% if r.computing and r.bytes == -1 %}<span class="computing">computing…</span>
+                        {% elif r.bytes == -1 %}—
+                        {% else %}{{ (r.bytes / (1024**2))|round(1) }} MB{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% if storage_rows|length > 10 %}
+            <p style="font-size: 0.8rem;">+ {{ storage_rows|length - 10 }} more — see Details</p>
+            {% endif %}
+        </div>
+
+        <!-- ===== Host card ===== -->
+        <div class="card">
+            <h2>Host
+                <a class="detail-link" href="{{ url_for('admin.host_detail') }}">Details →</a>
+            </h2>
+            <div class="kv">
+                <span class="k">Load:</span>       <span>{{ host.load.load1 }} / {{ host.load.load5 }} / {{ host.load.load15 }}</span>
+                <span class="k">RAM used:</span>   <span>{{ host.mem.pct_used|round(1) }}%</span>
+                <span class="k">RAM total:</span>  <span>{{ (host.mem.total_kb / 1024)|round(0) }} MB</span>
+                {% if host.thermal_c %}
+                <span class="k">Temp (max):</span> <span>{{ host.thermal_c|round(1) }}°C</span>
+                {% endif %}
+                {% if host.uptime_s %}
+                <span class="k">Host uptime:</span><span>{{ '%.1f'|format(host.uptime_s / 86400) }} days</span>
+                {% endif %}
+                {% if host.os.PRETTY_NAME %}
+                <span class="k">OS:</span>         <span>{{ host.os.PRETTY_NAME }}</span>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- ===== App card ===== -->
+        <div class="card">
+            <h2>App
+                <a class="detail-link" href="{{ url_for('admin.app_detail') }}">Details →</a>
+            </h2>
+            <div class="kv">
+                <span class="k">Active syncs:</span>
+                <span>{{ app_card.active_syncs|length }}</span>
+                <span class="k">Failure rate:</span>
+                <span>
+                    {% if app_card.failure_rate.rate is not none %}
+                    {{ (app_card.failure_rate.rate * 100)|round(1) }}%
+                    ({{ app_card.failure_rate.failures }} of {{ app_card.failure_rate.total }})
+                    {% else %}n/a{% endif %}
+                </span>
+                <span class="k">Tokens expiring &lt;24h:</span>
+                <span>{{ app_card.oauth_expiring_soon|length }}</span>
+                <span class="k">Needs re-auth:</span>
+                <span {% if app_card.needs_reauth %}class="band-red"{% endif %}>
+                    {{ app_card.needs_reauth|length }}
+                </span>
+            </div>
+            {% if app_card.needs_reauth %}
+            <div class="banner-crit">
+                <strong>{{ app_card.needs_reauth|length }} account(s) need re-authorization</strong>
+                <ul>
+                    {% for a in app_card.needs_reauth %}
+                    <li>{{ a.email }} ({{ a.user }})</li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+        </div>
+
+    </div>
+
+    <footer>
+        <p style="font-size: 0.8rem; color: #999;">
+            Admin group: <code>{{ admin_group }}</code> —
+            grant with <code>sudo usermod -aG {{ admin_group }} &lt;user&gt;</code>.
+            Mail Archiver 1.0.18.
+        </p>
+    </footer>
+</div>
+
+<script>
+function doRestart() {
+    var btn = document.getElementById('restart-btn');
+    var status = document.getElementById('restart-status');
+    if (!confirm('Restart the Mail Archiver service? Any in-flight syncs will be interrupted.')) {
+        return;
+    }
+    btn.disabled = true;
+    status.textContent = 'Requesting restart…';
+    fetch('/admin/restart', {
+        method: 'POST',
+        headers: {'Accept': 'application/json',
+                  'X-Requested-With': 'XMLHttpRequest'}
+    }).then(function (r) {
+        return r.json().then(function (j) { return {status: r.status, body: j}; });
+    }).then(function (res) {
+        if (res.status === 202) {
+            status.textContent = 'Restart requested — reloading in 5s…';
+            setTimeout(function () { window.location.reload(); }, 5000);
+        } else {
+            status.textContent = 'Error: ' + (res.body.detail || res.status);
+            btn.disabled = false;
+        }
+    }).catch(function (e) {
+        status.textContent = 'Network error: ' + e.message;
+        btn.disabled = false;
+    });
+}
+</script>
+</body>
+</html>

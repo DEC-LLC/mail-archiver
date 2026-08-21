@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Mail Archiver — Storage Detail</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+    table.dtl { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
+    table.dtl th, table.dtl td { border-bottom: 1px solid #eee; padding: 0.35rem 0.5rem; text-align: left; }
+    table.dtl th { background: #f6f7f9; }
+    .num { text-align: right; font-family: monospace; }
+    .band-green { color: #2e7d32; }
+    .band-amber { color: #f57c00; }
+    .band-red   { color: #c62828; font-weight: bold; }
+    .computing { color: #999; font-style: italic; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>Storage Detail</h1>
+        <div class="user-info">
+            <a href="{{ url_for('admin.index') }}" class="btn btn-small">← Admin</a>
+        </div>
+    </header>
+
+    <h2>Filesystems &gt; 1 GB</h2>
+    <table class="dtl">
+        <thead><tr><th>Mount</th><th>Device</th><th>Type</th><th class="num">Total</th><th class="num">Used</th><th class="num">Free</th><th>Free %</th></tr></thead>
+        <tbody>
+        {% for m in mounts %}
+        <tr>
+            <td><code>{{ m.path }}</code></td>
+            <td>{{ m.device }}</td>
+            <td>{{ m.fstype }}</td>
+            <td class="num">{{ (m.total / (1024**3))|round(1) }} GB</td>
+            <td class="num">{{ (m.used / (1024**3))|round(1) }} GB</td>
+            <td class="num">{{ (m.avail / (1024**3))|round(1) }} GB</td>
+            <td class="band-{{ m.band }}">{{ m.pct_free|round(1) }}%</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    <h2>Per-Account Sizes ({{ rows|length }})</h2>
+    <table class="dtl">
+        <thead><tr><th>User</th><th>Account</th><th>Path</th><th class="num">Size</th></tr></thead>
+        <tbody>
+        {% for r in rows %}
+        <tr>
+            <td>{{ r.user }}</td>
+            <td>{{ r.email }}</td>
+            <td><code>{{ r.path }}</code></td>
+            <td class="num">
+                {% if r.computing and r.bytes == -1 %}<span class="computing">computing…</span>
+                {% elif r.bytes == -1 %}—
+                {% else %}{{ (r.bytes / (1024**2))|round(1) }} MB{% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    <h2>Footprint</h2>
+    <div style="font-size: 0.9rem;">
+        <p>Data root: <code>{{ data_dir }}</code></p>
+        <p>App binaries (<code>/opt/mail-archiver</code>): {{ (app_size / (1024**2))|round(1) }} MB</p>
+        <p>Sync log (<code>/var/log/mail-archiver-sync.log</code>): {{ (logs_size / (1024**2))|round(2) }} MB</p>
+        {% if logs_size > 100 * 1024 * 1024 %}
+        <p class="band-amber">
+            Sync log &gt; 100 MB. Consider log rotation via <code>logrotate</code> —
+            <code>/etc/logrotate.d/mail-archiver</code> is not shipped by default.
+        </p>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>

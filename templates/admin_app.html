@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Mail Archiver — App Detail</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+    table.dtl { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
+    table.dtl th, table.dtl td { border-bottom: 1px solid #eee; padding: 0.35rem 0.5rem; text-align: left; }
+    table.dtl th { background: #f6f7f9; }
+    .band-red { color: #c62828; font-weight: bold; }
+    .band-amber { color: #f57c00; }
+    .btn-inline { font-size: 0.8rem; padding: 0.2rem 0.5rem; }
+    .status-error { color: #c62828; }
+    .status-ok { color: #2e7d32; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>App Detail</h1>
+        <div class="user-info">
+            <a href="{{ url_for('admin.index') }}" class="btn btn-small">← Admin</a>
+        </div>
+    </header>
+
+    <h2>Active syncs ({{ active_syncs|length }})</h2>
+    {% if active_syncs %}
+    <table class="dtl">
+        <thead><tr><th>Job</th><th>Account</th><th>State</th><th>Started</th><th>PID</th><th>Action</th></tr></thead>
+        <tbody>
+        {% for j in active_syncs %}
+        <tr>
+            <td><code>{{ j.job_id[:8] }}</code></td>
+            <td>{{ j.email }}</td>
+            <td>{{ j.state }}</td>
+            <td>{{ j.started }}</td>
+            <td>{{ j.pid or '—' }}</td>
+            <td>
+                {% if j.pid %}
+                <button class="btn btn-inline" onclick="cancelJob('{{ j.job_id }}')">Cancel</button>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No active syncs.</p>
+    {% endif %}
+
+    <h2>OAuth tokens expiring &lt; 24h ({{ expiring|length }})</h2>
+    {% if expiring %}
+    <table class="dtl">
+        <thead><tr><th>User</th><th>Account</th><th>Expires in</th><th>Action</th></tr></thead>
+        <tbody>
+        {% for t in expiring %}
+        <tr>
+            <td>{{ t.user }}</td>
+            <td>{{ t.email }}</td>
+            <td>{{ t.expires_in_min }} min</td>
+            <td>
+                <button class="btn btn-inline"
+                        onclick="refreshToken('{{ t.user }}', '{{ t.email }}')">
+                    Force Refresh
+                </button>
+                <span id="refresh-{{ t.user }}-{{ t.email }}"></span>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>None.</p>
+    {% endif %}
+
+    <h2>Accounts needing re-authorization ({{ needs_reauth|length }})</h2>
+    {% if needs_reauth %}
+    <table class="dtl">
+        <thead><tr><th>User</th><th>Account</th><th>Last updated</th></tr></thead>
+        <tbody>
+        {% for t in needs_reauth %}
+        <tr class="band-red">
+            <td>{{ t.user }}</td>
+            <td>{{ t.email }}</td>
+            <td>{{ t.last_updated }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    <p class="band-amber">
+        The user must click <strong>Sign in with Microsoft</strong> on the
+        account settings page to renew.
+    </p>
+    {% else %}
+    <p>None.</p>
+    {% endif %}
+
+    <h2>Recent sync history ({{ sync_status|length }})</h2>
+    <table class="dtl">
+        <thead><tr><th>User</th><th>Account</th><th>State</th><th>Finished</th><th>Exit</th><th>Error</th></tr></thead>
+        <tbody>
+        {% for s in sync_status %}
+        <tr class="status-{{ s.state }}">
+            <td>{{ s.user }}</td>
+            <td>{{ s.email }}</td>
+            <td>{{ s.state }}</td>
+            <td>{{ s.finished or '—' }}</td>
+            <td>{{ s.exit_code }}</td>
+            <td>{{ s.error }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    <h2>Failure rate (recent {{ failure_rate.total }} syncs)</h2>
+    <p>
+    {% if failure_rate.rate is not none %}
+        {{ failure_rate.failures }} failed / {{ failure_rate.total }} completed
+        = <strong>{{ (failure_rate.rate * 100)|round(1) }}%</strong>
+    {% else %}
+        No completed syncs in log window.
+    {% endif %}
+    </p>
+</div>
+
+<script>
+function refreshToken(user, email) {
+    var el = document.getElementById('refresh-' + user + '-' + email);
+    el.textContent = 'refreshing…';
+    fetch('/admin/oauth/' + encodeURIComponent(user) + '/' + encodeURIComponent(email) + '/refresh',
+          {method: 'POST'})
+      .then(function (r) { return r.json().then(function (j) { return {status: r.status, body: j}; }); })
+      .then(function (res) {
+          el.textContent = res.body.refreshed ? '✓ refreshed' : ('✗ ' + (res.body.detail || res.status));
+      })
+      .catch(function (e) { el.textContent = '✗ ' + e.message; });
+}
+function cancelJob(jobId) {
+    if (!confirm('Cancel this sync? Progress will be preserved and can resume on next Sync Now.')) return;
+    fetch('/admin/sync/' + encodeURIComponent(jobId) + '/cancel', {method: 'POST'})
+      .then(function () { setTimeout(function () { window.location.reload(); }, 500); });
+}
+</script>
+</body>
+</html>

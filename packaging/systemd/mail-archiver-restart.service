@@ -1,0 +1,13 @@
+[Unit]
+Description=Mail Archiver restart executor
+# Root-owned oneshot triggered by mail-archiver-restart.path when the
+# WebUI's /admin/restart endpoint touches /run/mail-archiver/restart-requested.
+# Preserves the "WebUI has zero direct systemctl privileges" property.
+After=mail-archiver.service
+
+[Service]
+Type=oneshot
+# Delete the marker BEFORE restart to avoid re-fire loop if the path
+# unit re-checks between our rm and the actual service bounce.
+ExecStart=/bin/rm -f /run/mail-archiver/restart-requested
+ExecStart=/bin/systemctl restart mail-archiver.service

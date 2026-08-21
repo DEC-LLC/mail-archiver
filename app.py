@@ -3079,6 +3079,17 @@ def oauth2_refresh(email):
     return redirect(url_for('dashboard'))
 
 
+# 1.0.18: /admin observability + service control page.
+# Registered here (after all top-level routes are defined) so the
+# blueprint import doesn't create circular-import weirdness with the
+# admin module reading _SYNC_JOBS and CONFIG from us.
+try:
+    import admin as _admin_module
+    _admin_module.register(app)
+except ImportError:
+    pass
+
+
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'scheduled-sync':

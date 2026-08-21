@@ -30,12 +30,17 @@ cp "$SRC_DIR/search_index.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/oauth2_microsoft.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/imap_sync.py" "$RPMBUILD_DIR/SOURCES/" 2>/dev/null || true
 cp "$SRC_DIR/mail_batcher.py" "$RPMBUILD_DIR/SOURCES/"
+cp "$SRC_DIR/admin.py" "$RPMBUILD_DIR/SOURCES/"
+cp "$SRC_DIR/VERSION" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/templates" "$RPMBUILD_DIR/SOURCES/"
 cp -r "$SRC_DIR/static" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/mail-archiver.service" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/gunicorn.conf.py" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/generate-cert.sh" "$RPMBUILD_DIR/SOURCES/"
 cp "$SRC_DIR/mail-archiver-cred" "$RPMBUILD_DIR/SOURCES/"
+# 1.0.18: systemd path/service pair + tmpfiles.d for restart trigger
+cp -r "$SCRIPT_DIR/systemd" "$RPMBUILD_DIR/SOURCES/"
+cp -r "$SCRIPT_DIR/tmpfiles.d" "$RPMBUILD_DIR/SOURCES/"
 
 # Copy spec (substitute Version/Release from the single source of truth)
 sed -e "s/^Version:.*/Version:        $VERSION/" \
@@ -69,6 +74,8 @@ mkdir -p "$DEB_PKG/opt/mail-archiver/static"
 mkdir -p "$DEB_PKG/etc/systemd/system"
 mkdir -p "$DEB_PKG/etc/cron.d"
 mkdir -p "$DEB_PKG/usr/libexec"
+mkdir -p "$DEB_PKG/lib/systemd/system"
+mkdir -p "$DEB_PKG/usr/lib/tmpfiles.d"
 mkdir -p "$DEB_PKG/DEBIAN"
 
 # Copy application files
@@ -77,7 +84,9 @@ cp "$SRC_DIR/search_index.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/oauth2_microsoft.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/imap_sync.py" "$DEB_PKG/opt/mail-archiver/" 2>/dev/null || true
 cp "$SRC_DIR/mail_batcher.py" "$DEB_PKG/opt/mail-archiver/"
+cp "$SRC_DIR/admin.py" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/gunicorn.conf.py" "$DEB_PKG/opt/mail-archiver/"
+cp "$SRC_DIR/VERSION" "$DEB_PKG/opt/mail-archiver/"
 cp "$SRC_DIR/generate-cert.sh" "$DEB_PKG/opt/mail-archiver/"
 chmod 0755 "$DEB_PKG/opt/mail-archiver/generate-cert.sh"
 cp "$SRC_DIR/mail-archiver-cred" "$DEB_PKG/usr/libexec/"
@@ -85,6 +94,10 @@ chmod 0755 "$DEB_PKG/usr/libexec/mail-archiver-cred"
 cp "$SRC_DIR/templates/"*.html "$DEB_PKG/opt/mail-archiver/templates/"
 cp "$SRC_DIR/static/"*.css "$DEB_PKG/opt/mail-archiver/static/"
 cp "$SRC_DIR/mail-archiver.service" "$DEB_PKG/etc/systemd/system/"
+# 1.0.18: restart trigger units + tmpfiles.d for /run/mail-archiver
+cp "$SCRIPT_DIR/systemd/mail-archiver-restart.path" "$DEB_PKG/lib/systemd/system/"
+cp "$SCRIPT_DIR/systemd/mail-archiver-restart.service" "$DEB_PKG/lib/systemd/system/"
+cp "$SCRIPT_DIR/tmpfiles.d/mail-archiver.conf" "$DEB_PKG/usr/lib/tmpfiles.d/"
 
 # Cron job
 cat > "$DEB_PKG/etc/cron.d/mail-archiver" << 'CRON'

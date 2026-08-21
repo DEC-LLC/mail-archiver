@@ -1,0 +1,13 @@
+[Unit]
+Description=Mail Archiver restart request watcher
+# Triggered by the admin /admin/restart endpoint touching this marker.
+# The WebUI (running as mail-archiver, no systemctl privileges) writes
+# the marker; the path unit picks it up and runs the sibling service
+# below as root, which does the actual `systemctl restart mail-archiver`.
+
+[Path]
+PathExists=/run/mail-archiver/restart-requested
+Unit=mail-archiver-restart.service
+
+[Install]
+WantedBy=multi-user.target

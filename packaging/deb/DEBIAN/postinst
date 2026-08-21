@@ -163,5 +163,19 @@ else
     rm -f /run/mail-archiver/restart-pending 2>/dev/null || true
 fi
 
+# 1.0.18: admin page + Restart button — set up group, runtime dir,
+# and the packaged path/service pair that turns a WebUI touch of
+# /run/mail-archiver/restart-requested into a root `systemctl restart`.
+getent group mail-archiver-admins >/dev/null || \
+    groupadd -r mail-archiver-admins 2>/dev/null || true
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/mail-archiver.conf 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable mail-archiver-restart.path 2>/dev/null || true
+systemctl start mail-archiver-restart.path 2>/dev/null || true
+
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
 echo "Then: systemctl enable --now mail-archiver"
+echo ""
+echo "Admin access: grant users membership in 'mail-archiver-admins':"
+echo "  sudo usermod -aG mail-archiver-admins <username>"
+echo "  (log out and back in for group membership to apply)"
