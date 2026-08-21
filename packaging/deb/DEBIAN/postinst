@@ -109,9 +109,58 @@ if [ -d "$EFFECTIVE_DATA" ]; then
     done
 fi
 
-# Restart if already running so new gunicorn config + code take effect
+# 1.0.17: deferred-restart when a sync is in flight. The install ALWAYS
+# succeeds — but if mbsync is actively downloading mail, restarting the
+# service would SIGTERM the whole cgroup and kill the sync mid-transfer
+# (this bit us during the 1.0.16 deploy: mbsync was pulling INBOX with
+# 19k messages when postinst restarted the service). New behavior:
+# detect active mbsync, drop /run/mail-archiver/restart-pending, print a
+# loud warning, log to journal. Operator restarts manually after syncs
+# complete. WebUI shows a persistent banner sourced from the marker.
+active_mbsync=0
 if systemctl is-active --quiet mail-archiver; then
-    systemctl restart mail-archiver || true
+    mainpid=$(systemctl show mail-archiver -p MainPID --value)
+    if [ -n "$mainpid" ] && [ "$mainpid" != "0" ]; then
+        cgroup=$(sed -n '1s|.*:.*:||p' /proc/$mainpid/cgroup 2>/dev/null)
+        if [ -n "$cgroup" ] && [ -d "/sys/fs/cgroup${cgroup}" ]; then
+            for p in $(cat /sys/fs/cgroup${cgroup}/cgroup.procs 2>/dev/null); do
+                [ -r /proc/$p/comm ] && \
+                    [ "$(cat /proc/$p/comm 2>/dev/null)" = "mbsync" ] && \
+                    active_mbsync=$((active_mbsync+1))
+            done
+        fi
+    fi
+fi
+
+if [ "$active_mbsync" -gt 0 ]; then
+    install -d /run/mail-archiver 2>/dev/null || mkdir -p /run/mail-archiver
+    NEW_VER=$(dpkg-query -W -f='${Version}' mail-archiver 2>/dev/null || echo unknown)
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $NEW_VER" \
+        > /run/mail-archiver/restart-pending
+    cat >&2 <<EOF
+================================================================
+ Mail Archiver upgrade installed — service NOT restarted.
+
+ Reason: $active_mbsync mbsync process(es) currently syncing mail.
+ A restart now would interrupt in-flight syncs mid-download.
+
+ The new binaries are on disk. The running service is still on
+ the previous version until you restart it.
+
+ When your syncs complete, run:
+   systemctl restart mail-archiver
+
+ The WebUI is also showing a restart-pending banner.
+================================================================
+EOF
+    logger -t mail-archiver -p daemon.warning \
+        "Upgrade installed; restart deferred — $active_mbsync active mbsync process(es). Run 'systemctl restart mail-archiver' after syncs finish." 2>/dev/null || true
+else
+    systemctl daemon-reload
+    if systemctl is-active --quiet mail-archiver; then
+        systemctl restart mail-archiver 2>/dev/null || true
+    fi
+    rm -f /run/mail-archiver/restart-pending 2>/dev/null || true
 fi
 
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."

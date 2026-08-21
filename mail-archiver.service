@@ -6,6 +6,10 @@ After=network.target
 Type=simple
 ExecStartPre=/opt/mail-archiver/generate-cert.sh /opt/mail-archiver/certs
 ExecStart=/usr/bin/gunicorn --config /opt/mail-archiver/gunicorn.conf.py app:app
+# 1.0.17: clear the deferred-restart marker whenever the service starts
+# clean (postinst-detected active sync => install left this file behind;
+# a manual `systemctl restart` after syncs complete drops it here).
+ExecStartPost=-/bin/rm -f /run/mail-archiver/restart-pending
 WorkingDirectory=/opt/mail-archiver
 Environment=MAIL_ARCHIVER_SECRET_FILE=/opt/mail-archiver/.secret_key
 Environment=MAIL_ARCHIVER_AUTH=pam

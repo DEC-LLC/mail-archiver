@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.0.16
+Version:        1.0.17
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -167,8 +167,56 @@ if [ -d "$EFFECTIVE_DATA" ]; then
     done
 fi
 
+# 1.0.17: deferred-restart when a sync is in flight. Install ALWAYS
+# succeeds; restart is deferred until the operator does it manually
+# (or the marker is cleared on next clean restart via ExecStartPost).
+# The 1.0.16 deploy killed an in-flight 19k-message INBOX sync because
+# postinst restarted the service mid-transfer — this closes that class
+# of bug without ever refusing an install.
+active_mbsync=0
 if systemctl is-active --quiet mail-archiver; then
-    systemctl restart mail-archiver || true
+    mainpid=$(systemctl show mail-archiver -p MainPID --value)
+    if [ -n "$mainpid" ] && [ "$mainpid" != "0" ]; then
+        cgroup=$(sed -n '1s|.*:.*:||p' /proc/$mainpid/cgroup 2>/dev/null)
+        if [ -n "$cgroup" ] && [ -d "/sys/fs/cgroup${cgroup}" ]; then
+            for p in $(cat /sys/fs/cgroup${cgroup}/cgroup.procs 2>/dev/null); do
+                [ -r /proc/$p/comm ] && \
+                    [ "$(cat /proc/$p/comm 2>/dev/null)" = "mbsync" ] && \
+                    active_mbsync=$((active_mbsync+1))
+            done
+        fi
+    fi
+fi
+
+if [ "$active_mbsync" -gt 0 ]; then
+    install -d /run/mail-archiver 2>/dev/null || mkdir -p /run/mail-archiver
+    NEW_VER=$(rpm -q --qf '%{VERSION}-%{RELEASE}' mail-archiver 2>/dev/null || echo unknown)
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $NEW_VER" \
+        > /run/mail-archiver/restart-pending
+    cat >&2 <<EOF
+================================================================
+ Mail Archiver upgrade installed — service NOT restarted.
+
+ Reason: $active_mbsync mbsync process(es) currently syncing mail.
+ A restart now would interrupt in-flight syncs mid-download.
+
+ The new binaries are on disk. The running service is still on
+ the previous version until you restart it.
+
+ When your syncs complete, run:
+   systemctl restart mail-archiver
+
+ The WebUI is also showing a restart-pending banner.
+================================================================
+EOF
+    logger -t mail-archiver -p daemon.warning \
+        "Upgrade installed; restart deferred — $active_mbsync active mbsync process(es). Run 'systemctl restart mail-archiver' after syncs finish." 2>/dev/null || true
+else
+    systemctl daemon-reload
+    if systemctl is-active --quiet mail-archiver; then
+        systemctl restart mail-archiver 2>/dev/null || true
+    fi
+    rm -f /run/mail-archiver/restart-pending 2>/dev/null || true
 fi
 
 echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
@@ -181,6 +229,28 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.17-1
+- Intra-folder chunked sync (mail_batcher.py): huge folders (default:
+  > MAIL_ARCHIVER_CHUNK_THRESHOLD = 2500 msgs) now sync in
+  MAIL_ARCHIVER_CHUNK_WALL_SECONDS chunks (default 180s each). Each
+  chunk = fresh mbsync = fresh IMAP + TLS + reset server-side idle
+  timer. mbsync's native maildir state means resume-mid-folder is
+  automatic (atomic per-message commit). Aborts after 2 consecutive
+  no-progress chunks. Fixes the case where a single 19,971-message
+  INBOX would fail as one long mbsync connection.
+- SSE progress dict + dashboard renderProgress extended with
+  folder_chunk_current / folder_chunk_wall_seconds /
+  folder_msg_done / folder_msg_total — chunk-level counters win
+  over the coarser C:/B:/M: parse when present.
+- Postinst defers service restart when sync is active: upgrade
+  always installs cleanly; if mbsync is running under the mail-archiver
+  cgroup, /run/mail-archiver/restart-pending is dropped, journal logs
+  a warning, WebUI shows an amber "restart pending" banner. Operator
+  runs `systemctl restart mail-archiver` after syncs complete —
+  ExecStartPost=-/bin/rm auto-clears the marker on restart. Fixes the
+  1.0.16 deploy that killed a mid-transfer INBOX sync (SIGTERM'd the
+  whole cgroup).
+
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.16-1
 - P0 FIX (OAuth auto-refresh): Every OAuth account failed to sync ~1h
   after the user clicked "Sign in with Microsoft", because run_sync

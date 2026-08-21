@@ -38,6 +38,27 @@
         overflow: hidden;
         text-overflow: ellipsis;
     }
+    /* 1.0.17: deferred-restart banner — persistent, amber, distinct from
+       one-shot flash messages. Set by postinst when upgrade landed
+       during in-flight mbsync; auto-clears on next `systemctl restart`. */
+    .restart-pending-banner {
+        margin: 0.75rem 0;
+        padding: 0.75rem 1rem;
+        background: #fff8e1;
+        border: 1px solid #ffb300;
+        border-left: 4px solid #ff8f00;
+        border-radius: 4px;
+        font-size: 0.9rem;
+        line-height: 1.4;
+        color: #6d4c00;
+    }
+    .restart-pending-banner strong { color: #4e3600; }
+    .restart-pending-banner code {
+        background: rgba(0,0,0,0.06);
+        padding: 0.1rem 0.35rem;
+        border-radius: 3px;
+        font-size: 0.85rem;
+    }
     </style>
 </head>
 <body>
@@ -53,6 +74,19 @@
                 <a href="{{ url_for('logout') }}" class="btn btn-small">Log Out</a>
             </div>
         </header>
+
+        {% if restart_pending %}
+        <div class="restart-pending-banner">
+            <strong>Mail Archiver update installed but not yet running.</strong>
+            A new version was installed while your sync was in progress —
+            your current syncs are protected. The running service is still
+            on the previous version until you restart it. When your syncs
+            complete, run
+            <code>sudo systemctl restart mail-archiver</code>
+            to activate the update.
+            <span style="opacity:0.7">({{ restart_pending }})</span>
+        </div>
+        {% endif %}
 
         {% with messages = get_flashed_messages() %}
         {% if messages %}
@@ -160,9 +194,20 @@
     // ------------------------------------------------------------------
     function renderProgress(panel, msg) {
         var p = msg.progress || {};
-        var totalMsgs = (p.msg_new_total || 0) + (p.msg_flag_total || 0);
-        var doneMsgs  = (p.msg_new_done  || 0) + (p.msg_flag_done  || 0);
-        var pct = totalMsgs ? Math.floor(100 * doneMsgs / totalMsgs) : 0;
+        // 1.0.17: chunk-level counters win when present (they're the
+        // most granular truth for a single-folder chunked sync).
+        // Fall back to mbsync's C:/B:/M: parsed counters otherwise.
+        var totalMsgs, doneMsgs, pct;
+        if (p.folder_chunk_current && p.folder_msg_total) {
+            totalMsgs = p.folder_msg_total;
+            doneMsgs  = p.folder_msg_done || 0;
+        } else {
+            totalMsgs = (p.msg_new_total || 0) + (p.msg_flag_total || 0);
+            doneMsgs  = (p.msg_new_done  || 0) + (p.msg_flag_done  || 0);
+        }
+        pct = totalMsgs ? Math.floor(100 * doneMsgs / totalMsgs) : 0;
+        if (pct > 100) pct = 100;
+
         var line = '';
         // 1.0.15: prepend batch header on large-account batched sync
         if (p.batch_total && p.batch_total > 1) {
@@ -172,14 +217,27 @@
             }
             line += ' · ';
         }
-        line += 'Syncing ';
-        if (p.folders_total) {
-            line += 'folder ' + p.folders_done + '/' + p.folders_total + ' — ';
-        }
-        if (p.msg_new_total) {
-            line += (p.msg_new_done || 0) + '/' + p.msg_new_total + ' new messages';
+        // 1.0.17: chunk header for intra-folder chunked sync
+        if (p.folder_chunk_current) {
+            var nm = p.folder_name || 'folder';
+            line += nm + ' — chunk ' + p.folder_chunk_current;
+            if (p.folder_chunk_wall_seconds) {
+                line += ' (' + Math.round(p.folder_chunk_wall_seconds/60)
+                     + 'm/chunk)';
+            }
+            line += ' · ' + (p.folder_msg_done || 0).toLocaleString()
+                 + ' / ' + (p.folder_msg_total || 0).toLocaleString()
+                 + ' msgs';
         } else {
-            line += 'starting…';
+            line += 'Syncing ';
+            if (p.folders_total) {
+                line += 'folder ' + p.folders_done + '/' + p.folders_total + ' — ';
+            }
+            if (p.msg_new_total) {
+                line += (p.msg_new_done || 0) + '/' + p.msg_new_total + ' new messages';
+            } else {
+                line += 'starting…';
+            }
         }
         panel.innerHTML =
             '<div class="sync-progress-line">' + line + '</div>' +

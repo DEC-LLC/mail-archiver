@@ -1057,12 +1057,27 @@ def dashboard():
     else:
         home_dir = archive_dir
 
+    # 1.0.17: postinst drops /run/mail-archiver/restart-pending when it
+    # detects an in-flight mbsync at upgrade time. Persistent amber banner
+    # tells the operator new bits are on disk but the running process is
+    # still on the previous version. ExecStartPost=-/bin/rm clears the
+    # marker on the next manual `systemctl restart`.
+    restart_pending = None
+    try:
+        marker = '/run/mail-archiver/restart-pending'
+        if os.path.exists(marker):
+            with open(marker) as f:
+                restart_pending = f.read().strip()
+    except OSError:
+        pass
+
     return render_template('dashboard.html',
                            username=username,
                            accounts=accounts,
                            home_dir=home_dir,
                            archive_dir=archive_dir,
-                           sync_intervals=SYNC_INTERVALS)
+                           sync_intervals=SYNC_INTERVALS,
+                           restart_pending=restart_pending)
 
 
 @app.route('/account/add', methods=['GET', 'POST'])
@@ -1909,18 +1924,27 @@ def _run_sync_background(job_id, username, account_email=None):
             def _prog_cb(update):
                 with _SYNC_JOBS_LOCK:
                     p = dict(job.get('progress') or {})
-                    # Reset within-batch counters when a new batch starts
-                    for f in ('folders_done', 'folders_total',
-                              'msg_new_done', 'msg_new_total',
-                              'msg_flag_done', 'msg_flag_total'):
-                        p.pop(f, None)
+                    st = update.get('state')
+                    # Batch-level start clears within-batch counters so the
+                    # UI doesn't carry stale per-folder numbers across
+                    # batches. Chunk-level events do NOT clear these —
+                    # they augment the per-folder view.
+                    if st == 'syncing':
+                        for f in ('folders_done', 'folders_total',
+                                  'msg_new_done', 'msg_new_total',
+                                  'msg_flag_done', 'msg_flag_total',
+                                  'folder_name', 'folder_msg_done',
+                                  'folder_msg_total', 'folder_chunk_current',
+                                  'folder_chunk_wall_seconds'):
+                            p.pop(f, None)
+                    # 1.0.15: batch_*, 1.0.17: folder_* (chunk progress)
                     p.update({k: v for k, v in update.items()
-                             if k.startswith('batch_')})
+                             if k.startswith('batch_')
+                             or k.startswith('folder_')})
                     job['progress'] = p
-                    if 'state' in update and update['state'] in (
-                            'batch_retry', 'batch_failed'):
+                    if st in ('batch_retry', 'batch_failed'):
                         job['last_line'] = (
-                            f"{update['state']} batch "
+                            f"{st} batch "
                             f"{update.get('batch_current')}/"
                             f"{update.get('batch_total')}")
 
@@ -1934,6 +1958,16 @@ def _run_sync_background(job_id, username, account_email=None):
                 batch_rc = str(Path(CONFIG['data_dir']) / username / '.mbsyncrc')
             sp_kwargs = {k: v for k, v in popen_kwargs.items()
                          if k in ('user', 'group', 'cwd', 'env')}
+            # 1.0.17: maildir_base = <data>/<user>/<account_slug>/  — this
+            # is what the mbsyncrc's `Path` directive under MaildirStore
+            # points at (SubFolders Verbatim, so <base>/<folder_name>/
+            # {cur,new} holds each folder). The chunk loop needs this to
+            # count on-disk messages after each mbsync invocation.
+            acct_slug = re.sub(r'[^a-zA-Z0-9_]', '',
+                               account_email.replace('@', '_at_')
+                               .replace('.', '_'))
+            maildir_base = str(
+                Path(CONFIG['data_dir']) / username / acct_slug)
             rc = run_batched_sync(
                 channel=safe_ch,
                 mbsyncrc_path=batch_rc,
@@ -1942,6 +1976,7 @@ def _run_sync_background(job_id, username, account_email=None):
                 progress_cb=_prog_cb,
                 line_cb=_line_cb,
                 per_batch_timeout=3600,
+                maildir_base=maildir_base,
             )
         else:
             proc = subprocess.Popen(cmd, **popen_kwargs)
