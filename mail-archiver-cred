@@ -30,7 +30,12 @@ sys.path.insert(0, '/opt/mail-archiver')
 
 try:
     from app import load_credential
-except Exception:
+except Exception as _e:
+    # 1.1.3: say WHY on stderr. mbsync forwards PassCmd stderr to its own,
+    # which app.py tails into the sync log — so a broken helper is now
+    # visible instead of looking like an empty password.
+    sys.stderr.write('mail-archiver-cred: cannot import app: '
+                     '%s: %s\n' % (type(_e).__name__, _e))
     print('')
     sys.exit(0)
 
@@ -42,7 +47,10 @@ username, email = sys.argv[1], sys.argv[2]
 
 try:
     cred = load_credential(username, email) or ''
-except Exception:
+except Exception as _e:
+    sys.stderr.write('mail-archiver-cred: cannot load credential for '
+                     '%s/%s: %s: %s\n'
+                     % (username, email, type(_e).__name__, _e))
     cred = ''
 
 print(cred)

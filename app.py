@@ -6,6 +6,7 @@ Supports PAM auth (for NAS/server deployments) or built-in auth (for containers)
 Set MAIL_ARCHIVER_AUTH=builtin for container mode, or =pam for NAS mode (default).
 """
 
+import sys
 import os
 import json
 import subprocess
@@ -45,14 +46,34 @@ def _https_redirect():
         url = request.url.replace('http://', 'https://', 1).replace(':8400', ':8443', 1)
         return _redir(url, code=301)
 
-# Load secret key from file if specified, else env var, else random
+# Load secret key from file if specified, else env var, else random.
+#
+# 1.1.3: track WHERE the key came from. A random per-process key is fine
+# for Flask session cookies but is catastrophic for credential
+# encryption — it silently derives a key that can never decrypt anything
+# already on disk. `_get_encryption_key` refuses to run in that mode
+# rather than hand back garbage (see the Layer-3 bug: mbsync's PassCmd
+# helper ran without MAIL_ARCHIVER_SECRET_FILE in its env, fell through
+# to a random key, produced an undecodable "password", and Gmail
+# answered `Invalid credentials`).
 _secret_file = os.environ.get('MAIL_ARCHIVER_SECRET_FILE')
+_secret_key_source = 'random'
 if _secret_file and os.path.exists(_secret_file):
-    with open(_secret_file) as _f:
-        app.secret_key = _f.read().strip()
+    try:
+        with open(_secret_file) as _f:
+            app.secret_key = _f.read().strip()
+        _secret_key_source = 'file'
+    except OSError as _e:
+        # Unreadable (mode 0640 root:mail-archiver and we lack the group)
+        # — do NOT silently degrade to a random key.
+        sys.stderr.write(
+            f'mail-archiver: cannot read secret key {_secret_file}: {_e}\n')
+        app.secret_key = secrets.token_hex(32)
+elif os.environ.get('MAIL_ARCHIVER_SECRET'):
+    app.secret_key = os.environ['MAIL_ARCHIVER_SECRET']
+    _secret_key_source = 'env'
 else:
-    app.secret_key = os.environ.get('MAIL_ARCHIVER_SECRET',
-                                     secrets.token_hex(32))
+    app.secret_key = secrets.token_hex(32)
 
 # Configuration — override via environment or config file
 CONFIG = {
@@ -442,9 +463,70 @@ def generate_mbsyncrc(username):
     _chown_user(mbsyncrc, username)
 
 
+def _supplementary_gids(username, primary_gid=None):
+    """Return the full supplementary-group gid list for `username`.
+
+    1.1.3: `subprocess.Popen(user=, group=)` sets EUID/EGID only — it does
+    NOT initialize supplementary groups, so a child spawned that way runs
+    with the parent's groups replaced by just the primary gid. mbsync's
+    PassCmd helper then cannot read /opt/mail-archiver/.secret_key (mode
+    0640 root:mail-archiver) and credential decryption fails. Pass the
+    result as Popen's `extra_groups=`.
+    """
+    import grp as _grp
+    gids = []
+    if primary_gid is not None:
+        gids.append(primary_gid)
+    try:
+        for g in _grp.getgrall():
+            if username in g.gr_mem and g.gr_gid not in gids:
+                gids.append(g.gr_gid)
+    except Exception:
+        pass
+    return gids
+
+
+def _mbsync_child_env(pw, username):
+    """Env for a kernel-setuid mbsync child.
+
+    Deliberately minimal — the service's own env would leak
+    HOME=/var/lib/mail-archiver — but it MUST carry the MAIL_ARCHIVER_*
+    settings that `mail-archiver-cred` needs when it re-imports app.py in
+    a fresh interpreter (1.1.3). Without MAIL_ARCHIVER_DATA the helper
+    looks for the .pass file under the compiled-in default path and finds
+    nothing (empty password); without MAIL_ARCHIVER_SECRET_FILE it derives
+    a random encryption key and returns undecryptable bytes.
+    """
+    env = {
+        'HOME':    pw.pw_dir,
+        'USER':    username,
+        'LOGNAME': username,
+        'SHELL':   pw.pw_shell or '/bin/sh',
+        'PATH':    '/usr/local/sbin:/usr/local/bin:'
+                   '/usr/sbin:/usr/bin:/sbin:/bin',
+        'MAIL_ARCHIVER_AUTH': CONFIG['auth_mode'],
+        'MAIL_ARCHIVER_DATA': str(CONFIG['data_dir']),
+    }
+    if _secret_file:
+        env['MAIL_ARCHIVER_SECRET_FILE'] = _secret_file
+    return env
+
+
 def _get_encryption_key():
-    """Derive a 32-byte encryption key from the Flask secret key."""
+    """Derive a 32-byte encryption key from the Flask secret key.
+
+    Raises RuntimeError when the secret key is a per-process random value
+    (1.1.3). Such a key cannot decrypt anything previously stored and
+    would produce credentials that no IMAP server accepts; failing loudly
+    here is what turns that into a diagnosable error instead of a
+    mysterious `Invalid credentials` from the mail provider.
+    """
     import hashlib
+    if _secret_key_source == 'random':
+        raise RuntimeError(
+            'no persistent secret key available (MAIL_ARCHIVER_SECRET_FILE '
+            'unset/unreadable and MAIL_ARCHIVER_SECRET empty) — refusing to '
+            'derive a credential key from an ephemeral random secret')
     secret = app.secret_key if isinstance(app.secret_key, bytes) else app.secret_key.encode()
     return hashlib.pbkdf2_hmac('sha256', secret, b'mail-archiver-cred-v1', 100000)
 
@@ -512,13 +594,22 @@ def load_credential(username, email):
         return None
     # Encrypted credentials are always base64 with length > 24 (16-byte IV + data)
     # Legacy plaintext passwords are short ASCII strings (app passwords, etc.)
+    import base64
     try:
-        import base64
         decoded = base64.b64decode(raw)
-        if len(decoded) > 16:
-            return _decrypt_credential(raw)
     except Exception:
-        pass
+        decoded = b''
+    if len(decoded) > 16:
+        # Definitely an encrypted blob. A failure here must NOT fall
+        # through to returning the ciphertext as if it were a password
+        # (1.1.3) — mbsync would hand that to the IMAP server verbatim.
+        try:
+            return _decrypt_credential(raw)
+        except Exception as e:
+            sys.stderr.write(
+                f'mail-archiver: cannot decrypt credential for '
+                f'{username}/{email}: {type(e).__name__}: {e}\n')
+            raise
     # Legacy plaintext file — return as-is
     return raw
 
@@ -840,20 +931,9 @@ def run_sync(username, account_email=None):
             subprocess_kwargs.update({
                 'user':  pw.pw_uid,
                 'group': pw.pw_gid,
+                'extra_groups': _supplementary_gids(username, pw.pw_gid),
                 'cwd':   pw.pw_dir,
-                # Fresh minimal env — inherited env from the mail-archiver
-                # service context would leak HOME=/var/lib/mail-archiver
-                # etc. mbsync + our PassCmd helper only need HOME (for
-                # ~/.mbsyncrc lookup), USER (for identity), and PATH (for
-                # the helper's /usr/libexec/mail-archiver-cred).
-                'env': {
-                    'HOME':    pw.pw_dir,
-                    'USER':    username,
-                    'LOGNAME': username,
-                    'SHELL':   pw.pw_shell or '/bin/sh',
-                    'PATH':    '/usr/local/sbin:/usr/local/bin:'
-                               '/usr/sbin:/usr/bin:/sbin:/bin',
-                },
+                'env':   _mbsync_child_env(pw, username),
             })
         else:
             rc = archive_dir / '.mbsyncrc'
@@ -1350,7 +1430,13 @@ def _credential_hint(username, email):
     cred_file = config_dir / f'{safe_name}.pass'
     if not cred_file.exists():
         return {'set': False, 'length': 0, 'redacted': '', 'age': ''}
-    plain = load_credential(username, email) or ''
+    try:
+        plain = load_credential(username, email) or ''
+    except Exception as e:
+        # Stored but undecryptable (1.1.3) — surface it in the UI rather
+        # than 500ing a read-only status endpoint.
+        return {'set': True, 'length': 0, 'redacted': f'(undecryptable: {e})',
+                'age': _mtime_hint(cred_file)}
     return {
         'set': True,
         'length': len(plain),
@@ -1780,11 +1866,10 @@ def _plan_batches_for_account(username, account_email):
     try:
         result = subprocess.run(
             ['python3', '-c', child],
-            user=pw.pw_uid, group=pw.pw_gid, cwd=pw.pw_dir,
-            env={
-                'HOME': pw.pw_dir, 'USER': username, 'LOGNAME': username,
-                'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-            },
+            user=pw.pw_uid, group=pw.pw_gid,
+            extra_groups=_supplementary_gids(username, pw.pw_gid),
+            cwd=pw.pw_dir,
+            env=_mbsync_child_env(pw, username),
             capture_output=True, text=True, timeout=60,
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -1827,7 +1912,7 @@ def _plan_batches_inline(username, account_email):
     else:
         try:
             credential = load_credential(username, account_email)
-        except OSError:
+        except Exception:
             return None
     if not credential:
         return None
@@ -1941,6 +2026,7 @@ def _run_sync_background(job_id, username, account_email=None):
         target_gid = None
         target_cwd = None
         target_env = None
+        target_groups = None
         if CONFIG['auth_mode'] == 'pam':
             import pwd as _pwd
             try:
@@ -1952,14 +2038,8 @@ def _run_sync_background(job_id, username, account_email=None):
             target_uid = pw.pw_uid
             target_gid = pw.pw_gid
             target_cwd = pw.pw_dir
-            target_env = {
-                'HOME':    pw.pw_dir,
-                'USER':    username,
-                'LOGNAME': username,
-                'SHELL':   pw.pw_shell or '/bin/sh',
-                'PATH':    '/usr/local/sbin:/usr/local/bin:'
-                           '/usr/sbin:/usr/bin:/sbin:/bin',
-            }
+            target_env = _mbsync_child_env(pw, username)
+            target_groups = _supplementary_gids(username, pw.pw_gid)
             mbsync_argv = ['mbsync', '-V', mbsync_arg]
         else:
             archive_dir = Path(CONFIG['data_dir']) / username
@@ -2052,6 +2132,8 @@ def _run_sync_background(job_id, username, account_email=None):
             if target_uid is not None:
                 sp_kwargs['user'] = target_uid
                 sp_kwargs['group'] = target_gid
+                if target_groups:
+                    sp_kwargs['extra_groups'] = list(target_groups)
                 sp_kwargs['cwd'] = target_cwd
                 sp_kwargs['env'] = dict(target_env or {})
             acct_slug = re.sub(r'[^a-zA-Z0-9_]', '',
@@ -2091,6 +2173,7 @@ def _run_sync_background(job_id, username, account_email=None):
                 email=account_email,
                 uid=target_uid,
                 gid=target_gid,
+                extra_groups=target_groups,
                 cwd=target_cwd,
                 env=target_env,
             )

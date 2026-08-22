@@ -230,6 +230,7 @@ def spawn_scoped_mbsync(
     email: Optional[str],
     uid: Optional[int] = None,
     gid: Optional[int] = None,
+    extra_groups: Optional[List[int]] = None,
     cwd: Optional[str] = None,
     env: Optional[dict] = None,
 ) -> subprocess.Popen:
@@ -265,6 +266,11 @@ def spawn_scoped_mbsync(
         kw['user'] = uid
     if gid is not None:
         kw['group'] = gid
+    if extra_groups:
+        # 1.1.3: user=/group= set EUID/EGID only. Without extra_groups the
+        # child loses every supplementary group — including mail-archiver,
+        # which the PassCmd helper needs to read .secret_key.
+        kw['extra_groups'] = list(extra_groups)
     if cwd is not None:
         kw['cwd'] = cwd
     if _env is not None:

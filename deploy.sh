@@ -22,7 +22,7 @@ scp "$SCRIPT_DIR/static/"*.css "$TARGET:$INSTALL_DIR/static/"
 
 # Generate secret key if not present
 echo "Checking secret key..."
-ssh "$TARGET" "test -f $INSTALL_DIR/.secret_key || ( python3 -c 'import secrets; print(secrets.token_hex(32))' > $INSTALL_DIR/.secret_key && chmod 600 $INSTALL_DIR/.secret_key )"
+ssh "$TARGET" "test -f $INSTALL_DIR/.secret_key || python3 -c 'import secrets; print(secrets.token_hex(32))' > $INSTALL_DIR/.secret_key; chown root:mail-archiver $INSTALL_DIR/.secret_key; chmod 0640 $INSTALL_DIR/.secret_key"
 
 # Install systemd service
 echo "Installing systemd service..."
