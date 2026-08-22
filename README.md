@@ -59,6 +59,26 @@ Mail Archiver runs as a systemd service in the background. It starts automatical
 
 Every person gets their own login and their own private archive. One installation serves your whole family or small office — each user registers their own account, adds their own email providers, and searches only their own mail. Connect from any device on your network.
 
+### Admin access
+
+The Admin page (sync observability, cancel, service restart) is gated on
+membership of a Unix group — by default `mail-archiver-admins`, overridable
+with `MAIL_ARCHIVER_ADMIN_GROUP`.
+
+**The package creates this group empty**, so immediately after install
+nobody is an admin and the Admin link is simply not rendered. Grant it:
+
+```bash
+sudo gpasswd -a <username> mail-archiver-admins
+```
+
+Takes effect within 60 seconds (the membership check is cached); no
+restart or re-login needed. Confirm with `id <username>`.
+
+If the configured group does not exist at all, Mail Archiver falls back to
+`sudo`, then `wheel`. That fallback does **not** apply when the group
+exists but is empty — which is the normal state after a package install.
+
 ## Quick Start (Container)
 
 ```bash
@@ -144,7 +164,9 @@ When you open the search page with no query, it shows your 10 most recent emails
 
 ## HTTPS
 
-Mail Archiver ships with HTTPS enabled by default. On first start, a self-signed TLS certificate is automatically generated. Your browser will show a security warning — that's expected for self-signed certs, but the connection is encrypted.
+Mail Archiver ships with HTTPS enabled by default. On first start it generates a self-signed certificate as a fallback, then — on every start — looks for a real CA-issued certificate for this host and prefers it automatically.
+
+**Why it prefers a real certificate:** a self-signed cert stops being click-through acceptable as soon as any other service on the same hostname sends an HSTS header. HSTS is scoped to the *hostname* and ignores the port, so a management UI on `:443` pins the policy for `:8443` too, and browsers then refuse to offer a security exception at all (Firefox: `MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT`, with no "Accept the Risk" button). If that happens to you, install a CA-issued cert as below.
 
 **Default ports:**
 - `8443` — HTTPS (when certs are present)
@@ -166,28 +188,42 @@ Then restart: `sudo systemctl restart mail-archiver`
 
 **Windows:** Set the `MAIL_ARCHIVER_PORT` environment variable before launching the EXE.
 
-### Using Let's Encrypt (for internet-facing installs)
+### Using a CA-issued certificate
 
-If you have a domain name pointing to your server, you can replace the self-signed cert with a real one:
+`install-tls-cert.sh` runs on every service start and installs the best certificate it can find for this host, so a renewed cert is picked up on the next restart with no manual copying.
+
+A certificate is used only if it is genuinely CA-issued (not self-signed), unexpired, has a private key that matches, and carries this host's FQDN in its SAN. The newest such certificate wins, and the full chain is installed — clients need the intermediate to build a trust path. If nothing qualifies, the self-signed fallback is left alone.
+
+**Where it looks, in order:**
+
+1. `MAIL_ARCHIVER_TLS_CERT` / `MAIL_ARCHIVER_TLS_KEY` — an explicit pair always wins.
+2. Globs listed in `/etc/mail-archiver/tls-sources.conf`, one per line (see `tls-sources.conf.example`).
+3. Built-in locations: certbot (`/etc/letsencrypt/live/*/fullchain.pem`), generic Debian (`/etc/ssl/certs/<fqdn>.{crt,pem}`), RHEL (`/etc/pki/tls/certs/<fqdn>.crt`), cockpit, and OpenMediaVault.
+
+**Let's Encrypt** needs no configuration — certbot's default layout is found automatically:
 
 ```bash
-# Install certbot
-sudo apt install certbot    # Debian/Ubuntu
-sudo dnf install certbot    # Rocky/RHEL
+sudo apt install certbot                     # Debian/Ubuntu
+sudo dnf install certbot                     # Rocky/RHEL
 
-# Get a certificate
 sudo certbot certonly --standalone -d mail.yourdomain.com --agree-tos
-
-# Copy certs to Mail Archiver
-sudo cp /etc/letsencrypt/live/mail.yourdomain.com/fullchain.pem /opt/mail-archiver/certs/mail-archiver.crt
-sudo cp /etc/letsencrypt/live/mail.yourdomain.com/privkey.pem /opt/mail-archiver/certs/mail-archiver.key
-sudo chown mail-archiver:mail-archiver /opt/mail-archiver/certs/*
-
-# Restart
 sudo systemctl restart mail-archiver
 ```
 
-Certbot auto-renews. Set up a cron or timer to copy renewed certs and restart the service.
+**An internal or corporate CA** whose layout isn't covered — point at it explicitly:
+
+```bash
+sudo systemctl edit mail-archiver
+```
+```ini
+[Service]
+Environment=MAIL_ARCHIVER_TLS_CERT=/etc/ssl/mycompany/mail.fullchain.pem
+Environment=MAIL_ARCHIVER_TLS_KEY=/etc/ssl/mycompany/mail.key
+```
+
+or add the glob to `/etc/mail-archiver/tls-sources.conf` so it is discovered along with the built-ins. The private key is located automatically — conventional names first, then a scan of the certificate's directory and the standard private directories, with every candidate confirmed by comparing public keys.
+
+To see what it chose: `sudo journalctl -u mail-archiver | grep install-tls-cert`.
 
 ### Disabling HTTPS
 
@@ -321,29 +357,43 @@ Features we're building over time. Contributions and feature requests welcome.
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
 
-## Sync lifecycle (1.1.0)
+## Sync lifecycle (1.1.4)
 
-Every mbsync invocation runs as a transient **systemd scope** under a
-shared `mail-archiver-syncs.slice`. Per-job state lives on disk at
-`/run/mail-archiver/sync-jobs/<job_id>.json` and is atomically rewritten
-every ~2s while the sync runs.
+Every mbsync invocation is spawned directly as the target user
+(`subprocess.Popen(user=…, group=…, extra_groups=…)`, kernel setuid via
+the service's ambient `CAP_SETUID`/`CAP_SETGID`) in its own session.
+Per-job state lives on disk at `/run/mail-archiver/sync-jobs/<job_id>.json`
+and is atomically rewritten every ~2s while the sync runs.
+
+> **History:** 1.1.0 ran each sync as a transient **systemd scope** via
+> `systemd-run --scope --uid=…`. That requires a polkit `manage-units`
+> authorization which headless NAS installs cannot satisfy — no auth agent
+> — so every WebUI "Sync now" failed with *Interactive authentication
+> required* (polkit present) or *Access denied* (polkit absent). 1.1.1
+> reverted to the direct-spawn mechanism described above. If you read
+> older notes referring to `mail-archiver-sync-<id>.scope` units, they no
+> longer exist.
 
 Consequences that matter to operators:
 
-- **Syncs survive WebUI restarts.** Systemd owns the scope, not
-  gunicorn. Worker recycle, service restart, even a crash of the
-  WebUI does not kill an in-flight sync.
+- **Syncs survive WebUI restarts — the download, not the bookkeeping.**
+  mbsync runs in its own session, so a worker recycle or service restart
+  does not kill it and mail keeps landing. The job's final state write is
+  lost, though: the job is then reaped as orphaned and shown as failed
+  even though the transfer completed. Avoid restarting during a sync.
 - **Cross-worker visible.** Any gunicorn worker can serve any job's
   SSE stream because state is on disk, not in a per-process dict.
   Log out of one tab, log back in on another — the live progress bar
   reattaches automatically.
-- **Cancel is `systemctl stop`.** The Admin page's Cancel Sync button
-  runs `systemctl stop mail-archiver-sync-<id>.scope`. Clean and
-  auditable — journalctl records the whole thing.
-- **Enumerate active syncs anywhere.**
-  `systemctl list-units 'mail-archiver-sync-*.scope' --state=active`
-  reports every in-flight sync system-wide (across all users and all
-  gunicorn workers).
+- **Cancel signals the process group.** The Admin page's Cancel Sync
+  button sends `SIGTERM` to the recorded mbsync process group
+  (`os.killpg`). The pid is in the job's state file.
+- **Orphaned jobs self-heal.** A job whose owning worker died is
+  detected (by owner pid and boot id, not by a timer) and moved to an
+  error state, so the UI never sits forever on "Reconnecting to
+  in-flight sync…".
+- **Enumerate active syncs anywhere.** Read the state files:
+  `grep -l '"state": "running"' /run/mail-archiver/sync-jobs/*.json`.
 
 The **`mail-archiver-oauth-refresh.timer`** wakes every 10 minutes
 (starting 5 min after boot) and proactively refreshes any OAuth access

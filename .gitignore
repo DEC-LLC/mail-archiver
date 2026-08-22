@@ -1,0 +1,13 @@
+# Build artifacts — packages are built by packaging/build.sh and published,
+# not tracked. Keeping them in git bloats the repo and makes every release
+# commit a binary diff.
+packaging/*.deb
+packaging/*.rpm
+packaging/rpmbuild/
+packaging/deb/opt/
+packaging/deb/etc/
+packaging/deb/usr/
+
+# Python
+__pycache__/
+*.py[cod]
