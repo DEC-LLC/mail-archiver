@@ -41,6 +41,7 @@ install -m 644 %{_sourcedir}/sync_lifecycle.py %{buildroot}/opt/mail-archiver/sy
 install -m 644 %{_sourcedir}/gunicorn.conf.py %{buildroot}/opt/mail-archiver/gunicorn.conf.py
 install -m 644 %{_sourcedir}/VERSION %{buildroot}/opt/mail-archiver/VERSION
 install -m 755 %{_sourcedir}/generate-cert.sh %{buildroot}/opt/mail-archiver/generate-cert.sh
+install -m 755 %{_sourcedir}/install-omv-cert.sh %{buildroot}/opt/mail-archiver/install-omv-cert.sh
 install -m 755 %{_sourcedir}/mail-archiver-cred %{buildroot}/usr/libexec/mail-archiver-cred
 
 # 1.0.18: restart trigger — path+service pair. WebUI (as mail-archiver)
@@ -86,6 +87,7 @@ CRON
 /opt/mail-archiver/sync_lifecycle.py
 /opt/mail-archiver/gunicorn.conf.py
 /opt/mail-archiver/generate-cert.sh
+/opt/mail-archiver/install-omv-cert.sh
 /opt/mail-archiver/VERSION
 /usr/libexec/mail-archiver-cred
 /opt/mail-archiver/templates/*.html
