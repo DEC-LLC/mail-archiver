@@ -26,6 +26,7 @@ process group and the killpg is clean.
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
@@ -183,11 +184,82 @@ def list_states_for_user(user: str) -> List[dict]:
     return [s for s in list_all_states() if s.get('user') == user]
 
 
+ACTIVE_STATES = ('starting', 'running')
+
+# A job may legitimately sit in 'starting' with no pid recorded yet while
+# the worker is still forking mbsync. Only treat a pid-less job as dead
+# once it has been that way longer than this.
+STARTING_GRACE_SECONDS = 180
+
+
+def _state_epoch(st: dict) -> Optional[float]:
+    """Best-effort epoch for a state's last_updated (ISO8601 UTC)."""
+    lu = st.get('last_updated') or ''
+    try:
+        return calendar.timegm(time.strptime(lu, '%Y-%m-%dT%H:%M:%SZ'))
+    except (ValueError, TypeError):
+        return None
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, ProcessLookupError):
+        return False
+
+
+def is_state_orphaned(st: dict) -> bool:
+    """True when a job CLAIMS to be starting/running but nothing is
+    actually running for it.
+
+    1.1.3: without this, a job whose worker died (gunicorn worker
+    recycle, `systemctl restart mail-archiver`, host reboot) keeps its
+    'starting'/'running' state forever — purge_old_states deliberately
+    never reaps non-terminal jobs — and the WebUI sits on
+    "Reconnecting to in-flight sync…" indefinitely with no sync running.
+    """
+    if st.get('state') not in ACTIVE_STATES:
+        return False
+    pid = st.get('mbsync_pid')
+    if pid:
+        return not _pid_alive(pid)
+    # No pid recorded yet — dead only if it has been stuck past the grace.
+    ts = _state_epoch(st)
+    if ts is None:
+        return True
+    return (time.time() - ts) > STARTING_GRACE_SECONDS
+
+
+def reap_orphaned_states() -> int:
+    """Move orphaned starting/running jobs to 'error' so the UI stops
+    reconnecting to them and purge_old_states can eventually clean up.
+    Returns the number reaped.
+    """
+    reaped = 0
+    for st in list_all_states():
+        if not is_state_orphaned(st):
+            continue
+        update_state(
+            st['job_id'],
+            state='error',
+            finished=time.strftime('%Y-%m-%d %H:%M:%S'),
+            error=('Sync did not finish — the mail-archiver service was '
+                   'restarted or the worker exited while this sync was '
+                   'in flight. No sync is running; start a new one.'),
+        )
+        reaped += 1
+    return reaped
+
+
 def list_active_states_for_user(user: str) -> List[dict]:
-    """Only jobs currently running/starting (not done/error/cancelled)."""
-    active = ('starting', 'running')
+    """Jobs genuinely in flight for `user`.
+
+    Reaps orphans first (1.1.3) so a dead job never shows as active.
+    """
+    reap_orphaned_states()
     return [s for s in list_states_for_user(user)
-            if s.get('state') in active]
+            if s.get('state') in ACTIVE_STATES]
 
 
 def is_authorized(state: Optional[dict], user: str) -> bool:
@@ -202,16 +274,18 @@ def purge_old_states(max_age_seconds: int = 3600) -> int:
     """Delete DONE / ERROR job files older than max_age_seconds.
     Running jobs are never purged regardless of age.
     """
+    reap_orphaned_states()
     cutoff = time.time() - max_age_seconds
     deleted = 0
     for st in list_all_states():
         if st.get('state') not in ('done', 'error', 'cancelled'):
             continue
-        # last_updated is ISO8601 UTC; parse to epoch — best-effort
-        lu = st.get('last_updated', '')
-        try:
-            ts = time.mktime(time.strptime(lu, '%Y-%m-%dT%H:%M:%SZ'))
-        except (ValueError, TypeError):
+        # last_updated is ISO8601 UTC. 1.1.3: was time.mktime(), which
+        # interprets the UTC struct as LOCAL time — states aged out early
+        # or late by the host's UTC offset. calendar.timegm is the
+        # correct inverse of time.gmtime().
+        ts = _state_epoch(st)
+        if ts is None:
             continue
         if ts < cutoff:
             if delete_state(st['job_id']):
@@ -313,11 +387,7 @@ def scope_is_active(job_id: str) -> bool:
     pid = st.get('mbsync_pid')
     if not pid:
         return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, ProcessLookupError):
-        return False
+    return _pid_alive(pid)
 
 
 def list_active_scopes() -> List[str]:
@@ -329,11 +399,7 @@ def list_active_scopes() -> List[str]:
     out: List[str] = []
     for st in list_all_states():
         pid = st.get('mbsync_pid')
-        if not pid:
-            continue
-        try:
-            os.kill(int(pid), 0)
-        except (OSError, ValueError, ProcessLookupError):
+        if not pid or not _pid_alive(pid):
             continue
         out.append(scope_unit_for(st.get('job_id', '')))
     return out
