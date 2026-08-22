@@ -374,6 +374,17 @@ def generate_mbsyncrc(username):
                 f'PassCmd "/usr/libexec/mail-archiver-cred '
                 f'{shlex.quote(username)} {shlex.quote(acct["email"])}"'
             )
+            # 1.1.2: pin AuthMechs to LOGIN for app-password + plain-password
+            # accounts. mbsync 1.5.x auto-picks the strongest SASL mechanism
+            # the server advertises — for newer Gmail accounts that is
+            # XOAUTH2, which then fails/hangs when handed an app-password
+            # instead of an OAuth bearer token (crash: drv_imap.c:2033
+            # assertion; hang: idle after "Authenticating with SASL mechanism
+            # XOAUTH2" waiting for continuation prompts that never come).
+            # LOGIN + TLS is safe (password transits inside the SSL/TLS
+            # tunnel) and universally supported by Gmail, iCloud, Fastmail,
+            # generic IMAP.
+            lines.append('AuthMechs LOGIN')
 
         # TLS mode is now per-account, three-valued: ssl | starttls | none.
         # mbsync accepts SSLType {IMAPS,STARTTLS,None}.
