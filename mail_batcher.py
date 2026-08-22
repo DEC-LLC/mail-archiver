@@ -50,6 +50,7 @@ import os
 import re
 import shlex
 import subprocess
+import sync_lifecycle as _sl
 import tempfile
 import time
 from pathlib import Path
@@ -307,8 +308,7 @@ def _run_folder_chunked(
         start = time.time()
         wall_expired = False
         try:
-            for raw in proc.stdout:
-                line = raw.rstrip('\n')
+            for line in _sl.iter_mbsync_lines(proc.stdout):
                 if line_cb:
                     try:
                         line_cb(line)
@@ -532,8 +532,7 @@ def run_batched_sync(
                     proc = subprocess.Popen(cmd, **kw)
                     start = time.time()
                     try:
-                        for raw in proc.stdout:
-                            line = raw.rstrip('\n')
+                        for line in _sl.iter_mbsync_lines(proc.stdout):
                             if line_cb:
                                 try:
                                     line_cb(line)

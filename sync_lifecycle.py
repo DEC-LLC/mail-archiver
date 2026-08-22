@@ -27,6 +27,7 @@ process group and the killpg is clean.
 from __future__ import annotations
 
 import calendar
+import codecs
 import json
 import os
 import re
@@ -202,11 +203,37 @@ def _state_epoch(st: dict) -> Optional[float]:
 
 
 def _pid_alive(pid) -> bool:
+    """True iff `pid` is a live process.
+
+    1.1.4: MUST NOT use a bare `os.kill(pid, 0)` + `except OSError`. mbsync
+    runs as the target PAM user while we run as mail-archiver, so signalling
+    it raises PermissionError (EPERM) — which PROVES the process exists.
+    Treating that as "dead" made the orphan reaper kill off healthy,
+    actively-downloading syncs. Check /proc first (ownership-independent).
+    """
     try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, ProcessLookupError):
+        pid = int(pid)
+    except (TypeError, ValueError):
         return False
+    if pid <= 0:
+        return False
+    if os.path.isdir('/proc'):
+        return os.path.exists(f'/proc/{pid}')
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True          # exists, just not ours to signal
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def current_boot_id() -> str:
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
 
 
 def is_state_orphaned(st: dict) -> bool:
@@ -221,10 +248,29 @@ def is_state_orphaned(st: dict) -> bool:
     """
     if st.get('state') not in ACTIVE_STATES:
         return False
-    pid = st.get('mbsync_pid')
-    if pid:
-        return not _pid_alive(pid)
-    # No pid recorded yet — dead only if it has been stuck past the grace.
+
+    # Wrong boot => nothing from that boot survives. Unambiguous.
+    boot = st.get('boot_id')
+    cur_boot = current_boot_id()
+    if boot and cur_boot and boot != cur_boot:
+        return True
+
+    # mbsync itself alive => definitely in flight.
+    if _pid_alive(st.get('mbsync_pid')):
+        return False
+
+    # 1.1.4: owner_pid is the worker that runs the job. It is authoritative
+    # for the windows where no mbsync pid exists yet but real work IS
+    # happening — notably folder measurement for batch planning, which sets
+    # state='running' BEFORE spawning mbsync and can easily run for minutes
+    # on a large mailbox. While the owner lives, the job is not orphaned.
+    owner = st.get('owner_pid')
+    if owner is not None:
+        return not _pid_alive(owner)
+
+    # Legacy state file with no owner_pid: fall back to the age heuristic.
+    if st.get('mbsync_pid'):
+        return True
     ts = _state_epoch(st)
     if ts is None:
         return True
@@ -291,6 +337,55 @@ def purge_old_states(max_age_seconds: int = 3600) -> int:
             if delete_state(st['job_id']):
                 deleted += 1
     return deleted
+
+
+def iter_mbsync_lines(stream):
+    """Yield logical lines from mbsync, splitting on BOTH \n and \r.
+
+    1.1.4: mbsync -V renders its progress counter in place — the format is
+    `\rC: %d/%d  B: %d/%d  M: +%d/%d *%d/%d #%d/%d`, a LEADING carriage
+    return and no trailing newline (verified against the isync 1.4.4 and
+    1.5.1 binaries). `for line in proc.stdout` splits on \n only, so for
+    the whole synchronize phase — the entire bulk of a large sync — it
+    yields nothing at all. The WebUI therefore froze on the last
+    newline-terminated line ("far side: N messages, 0 recent") and
+    progress stayed empty until the run finished.
+
+    Reads via os.read on the raw fd so a partial write is delivered
+    immediately; `stream.read(n)` would block for n chars. The caller must
+    not otherwise read `stream`.
+    """
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        # Not a real pipe (in-memory stream, test double). Fall back to
+        # plain iteration, still splitting embedded carriage returns.
+        for raw in stream:
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', 'replace')
+            for part in re.split(r'[\r\n]', raw):
+                if part.strip():
+                    yield part
+        return
+
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    buf = ''
+    while True:
+        try:
+            chunk = os.read(fd, 4096)
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        buf += decoder.decode(chunk)
+        parts = re.split(r'[\r\n]', buf)
+        buf = parts.pop()          # trailing fragment, not yet terminated
+        for part in parts:
+            if part.strip():
+                yield part
+    buf += decoder.decode(b'', True)
+    if buf.strip():
+        yield buf
 
 
 # ---------------------------------------------------------------

@@ -1807,6 +1807,11 @@ def _new_sync_job(username, target):
         'started': _slc.iso_utc_now(),
         'started_local': time.strftime('%Y-%m-%d %H:%M:%S'),
         'scope_unit': _slc.scope_unit_for(job_id),
+        # 1.1.4: the worker that owns this job, plus the boot it belongs to.
+        # The orphan reaper uses these to tell "worker died" from "worker is
+        # busy measuring folders and has not spawned mbsync yet".
+        'owner_pid': os.getpid(),
+        'boot_id': _slc.current_boot_id(),
         'mbsync_pid': None,
         'progress': None,
         'last_line': '',
@@ -2179,8 +2184,8 @@ def _run_sync_background(job_id, username, account_email=None):
             )
             _update_sync_job(job_id, mbsync_pid=proc.pid)
             try:
-                for raw_line in proc.stdout:
-                    _line_cb(raw_line.rstrip('\n'))
+                for raw_line in _slc.iter_mbsync_lines(proc.stdout):
+                    _line_cb(raw_line.rstrip())
             finally:
                 proc.wait()
             rc = proc.returncode
