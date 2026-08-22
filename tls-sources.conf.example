@@ -1,0 +1,18 @@
+# Extra TLS certificate locations for Mail Archiver, one glob per line.
+#
+# install-tls-cert.sh searches these IN ADDITION to its built-in defaults
+# (certbot, generic Debian/RHEL layouts, cockpit, OpenMediaVault) and picks
+# the newest certificate that is CA-issued, unexpired, key-matched, and
+# carries this host's FQDN in its SAN.
+#
+# Use this to support a platform we do not ship a rule for, without
+# patching the script. Private keys are located automatically next to the
+# certificate or in the usual private directories; if your layout is
+# unusual, set MAIL_ARCHIVER_TLS_CERT and MAIL_ARCHIVER_TLS_KEY instead
+# (an explicit pair always wins).
+#
+# Install to /etc/mail-archiver/tls-sources.conf
+#
+# Examples:
+#/etc/ssl/mycompany/*.fullchain.pem
+#/opt/vendor-appliance/pki/tls/server.crt

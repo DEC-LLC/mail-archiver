@@ -5,10 +5,15 @@ After=network.target
 [Service]
 Type=simple
 ExecStartPre=/opt/mail-archiver/generate-cert.sh /opt/mail-archiver/certs
-# Prefer the host's CA-issued OMV certificate over the self-signed one.
-# Runs after generate-cert.sh so there is always a cert to fall back to.
-# Re-checked on every start, so a renewed OMV cert is picked up too.
-ExecStartPre=-/opt/mail-archiver/install-omv-cert.sh /opt/mail-archiver/certs
+# Prefer a real CA-issued certificate over the self-signed fallback.
+# Runs after generate-cert.sh so there is always a cert to fall back to,
+# and on every start so renewals are picked up. Host-agnostic: set
+# MAIL_ARCHIVER_TLS_CERT/_KEY below, or list globs in
+# /etc/mail-archiver/tls-sources.conf, for any platform not covered by
+# the script's built-in locations.
+#Environment=MAIL_ARCHIVER_TLS_CERT=/path/to/fullchain.pem
+#Environment=MAIL_ARCHIVER_TLS_KEY=/path/to/privkey.pem
+ExecStartPre=-/opt/mail-archiver/install-tls-cert.sh /opt/mail-archiver/certs
 ExecStart=/usr/bin/gunicorn --config /opt/mail-archiver/gunicorn.conf.py app:app
 # 1.0.17: clear the deferred-restart marker whenever the service starts
 # clean (postinst-detected active sync => install left this file behind;
