@@ -1,0 +1,8 @@
+# Hourly scheduled sync — respects per-account intervals, auto-staggered
+# 1.1.7: via a wrapper that takes mail-archiver.service's environment, so the
+# cron run sees the same MAIL_ARCHIVER_SECRET_FILE / _DATA / _AUTH as the WebUI.
+0 * * * * root /usr/libexec/mail-archiver-scheduled-sync >> /var/log/mail-archiver-sync.log 2>&1
+# 1.3.0: mail import (per-account import folders), per-user schedule, checked every hour
+30 * * * * root /usr/libexec/mail-archiver-scheduled-sync import >> /var/log/mail-archiver-import.log 2>&1
+# 1.3.0: initial / rebase sync jobs; minute 20 so a run never races the :00 sync
+20 * * * * root /usr/libexec/mail-archiver-scheduled-sync bulk-sync >> /var/log/mail-archiver-bulk-sync.log 2>&1

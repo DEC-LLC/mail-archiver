@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: mail-archiver
+Upstream-Contact: DEC-LLC <https://github.com/DEC-LLC/mail-archiver>
+Source: https://github.com/DEC-LLC/mail-archiver
+
+Files: *
+Copyright: 2026 Diwan Enterprise Consulting LLC (DEC-LLC)
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ use these files except in compliance with the License. On Debian systems
+ the full text of the License is in /usr/share/common-licenses/Apache-2.0.

@@ -1,13 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — Settings — {{ account.email }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-<body>
-    <div class="container">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — Settings — {{ account.email }}{% endblock %}
+{% block content %}
         <header>
             <div class="logo-header">
                 <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
@@ -40,7 +33,7 @@
                 <label for="display_name">Display name</label>
                 <input type="text" id="display_name" name="display_name"
                        value="{{ account.display_name or '' }}"
-                       placeholder="e.g. Family Hotmail (Mrunalini)">
+                       placeholder="e.g. Home Hotmail (Alice)">
                 <p class="help-text">Optional friendly label shown on the dashboard. Leave blank to use the provider name.</p>
 
                 <label for="host">IMAP host</label>
@@ -258,6 +251,4 @@
         <p style="margin-top: 2em;">
             <a href="{{ url_for('dashboard') }}" class="btn">← Back to dashboard</a>
         </p>
-    </div>
-</body>
-</html>
+{% endblock %}

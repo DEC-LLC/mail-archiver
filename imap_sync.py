@@ -8,6 +8,7 @@ Supports Gmail, iCloud, Outlook (app password and OAuth2 XOAUTH2).
 """
 
 import imaplib
+import re
 import email
 import email.policy
 import os
@@ -18,7 +19,74 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import platform_compat as _pc
+
 log = logging.getLogger('mail_archiver.imap_sync')
+
+
+_LIST_RE = re.compile(
+    r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.*)$', re.S)
+
+
+def parse_list_line(item) -> Optional[str]:
+    """The folder name in one LIST response line, or None for a line that
+    names nothing to open (a \\Noselect container, or a line that cannot be
+    read).
+
+    A line is `(flags) "delimiter" name`. The name is quoted (Gmail:
+    `"[Gmail]/All Mail"`), a bare atom (Dovecot: `INBOX`, `Junk`) or sent
+    as a literal, which imaplib hands over as a (header, name) pair. Up to
+    1.3.0 the last quoted string on the line was taken, which for a bare
+    name is the delimiter: every folder of such a server was read as ".".
+    """
+    literal = None
+    if isinstance(item, tuple):
+        if len(item) < 2:
+            return None
+        item, literal = item[0], item[1]
+    if not isinstance(item, bytes):
+        return None
+    m = _LIST_RE.match(item.decode('utf-8', errors='replace').strip())
+    if not m:
+        return None
+    if '\\noselect' in m.group('flags').lower():
+        return None
+    name = m.group('name').strip()
+    if literal is not None:
+        name = literal.decode('utf-8', errors='replace') if isinstance(literal, bytes) else str(literal)
+    elif len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+        name = re.sub(r'\\(.)', r'\1', name[1:-1])
+    return name or None
+
+
+def _imap_text(data) -> str:
+    """Server response data as short text for a message."""
+    try:
+        return ' '.join(d.decode('utf-8', errors='replace') if isinstance(d, bytes) else str(d)
+                        for d in (data or []))[:200]
+    except Exception:
+        return str(data)[:200]
+
+
+PLAINTEXT_REFUSED = (
+    'This account is set to "Plaintext" (no TLS). The built-in IMAP client '
+    'does not send a password over an unencrypted connection. Edit the '
+    'account and choose SSL/TLS (port 993) or STARTTLS (port 143).')
+
+
+class PlaintextLoginRefused(RuntimeError):
+    """The account asks for a login without TLS."""
+
+
+def normalise_tls_mode(tls_mode, use_tls=True) -> str:
+    """'ssl', 'starttls' or 'none' from an account's setting.
+
+    An empty or unknown value follows the older true/false `use_tls`.
+    """
+    mode = (tls_mode or '').strip().lower()
+    if mode in ('ssl', 'starttls', 'none'):
+        return mode
+    return 'ssl' if use_tls else 'none'
 
 
 class ImapSyncer:
@@ -43,10 +111,14 @@ class ImapSyncer:
                  folders: Optional[list] = None,
                  max_messages: int = 0,
                  chown_uid: Optional[int] = None,
-                 chown_gid: Optional[int] = None):
+                 chown_gid: Optional[int] = None,
+                 tls_mode: Optional[str] = None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
+        # 1.3.2: 'ssl' (IMAPS), 'starttls' or 'none'. Left out, it follows
+        # use_tls as before. 'none' never logs in - see connect().
+        self.tls_mode = normalise_tls_mode(tls_mode, use_tls)
         self.username = username
         self.password = password
         self.local_dir = Path(local_dir)
@@ -67,16 +139,37 @@ class ImapSyncer:
         if self.chown_uid is None or self.chown_gid is None:
             return
         try:
-            os.chown(str(path), self.chown_uid, self.chown_gid)
+            _pc.chown(str(path), self.chown_uid, self.chown_gid)
         except (PermissionError, OSError):
             pass
 
-    def connect(self) -> imaplib.IMAP4_SSL:
-        """Connect and authenticate to the IMAP server."""
-        if self.use_tls:
-            conn = imaplib.IMAP4_SSL(self.host, self.port)
-        else:
+    def connect(self) -> imaplib.IMAP4:
+        """Connect and authenticate to the IMAP server.
+
+        The password or token is only ever sent inside TLS: either the
+        connection starts encrypted ('ssl') or it is upgraded with STARTTLS
+        before anything else is said ('starttls'). With 'none' there is no
+        login at all (1.3.2; up to 1.3.1 it logged in in the clear).
+        """
+        mode = normalise_tls_mode(getattr(self, 'tls_mode', None),
+                                  getattr(self, 'use_tls', True))
+        if mode == 'ssl':
+            conn = imaplib.IMAP4_SSL(self.host, self.port,
+                                     ssl_context=_pc.tls_client_context())
+        elif mode == 'starttls':
             conn = imaplib.IMAP4(self.host, self.port)
+            try:
+                conn.starttls(ssl_context=_pc.tls_client_context())
+            except Exception:
+                # No STARTTLS on offer, or the certificate did not verify:
+                # leave without logging in.
+                try:
+                    conn.shutdown()
+                except Exception:
+                    pass
+                raise
+        else:
+            raise PlaintextLoginRefused(PLAINTEXT_REFUSED)
 
         if self.auth_method == 'oauth2' and self.oauth2_token:
             # XOAUTH2 for Microsoft/Google
@@ -88,29 +181,26 @@ class ImapSyncer:
         return conn
 
     def list_folders(self, conn: imaplib.IMAP4_SSL) -> list:
-        """List all IMAP folders on the server."""
+        """List the IMAP folders on the server that can be opened."""
         status, data = conn.list()
         if status != 'OK':
             return []
-
         folders = []
         for item in data:
-            if isinstance(item, bytes):
-                # Parse: (\\HasNoChildren) "/" "INBOX"
-                decoded = item.decode('utf-8', errors='replace')
-                # Extract folder name (last quoted string or last token)
-                parts = decoded.rsplit('"', 2)
-                if len(parts) >= 2:
-                    folders.append(parts[-2])
-                else:
-                    # Unquoted folder name
-                    folders.append(decoded.rsplit(' ', 1)[-1])
+            name = parse_list_line(item)
+            if name:
+                folders.append(name)
         return folders
 
     def _safe_folder_name(self, folder: str) -> str:
-        """Convert IMAP folder name to safe filesystem path."""
-        return folder.replace('/', '_').replace('\\', '_').replace(
-            '[Gmail]', 'Gmail').replace(' ', '_').strip('.')
+        """Convert IMAP folder name to safe filesystem path.
+
+        The last step changes nothing on Linux; on Windows it replaces the
+        characters NTFS refuses in a name (a folder called `Lists: dev`).
+        """
+        return _pc.safe_path_component(
+            folder.replace('/', '_').replace('\\', '_').replace(
+                '[Gmail]', 'Gmail').replace(' ', '_').strip('.'))
 
     def _message_filename(self, uid: str, msg_bytes: bytes) -> str:
         """Generate a unique Maildir-compatible filename for a message."""
@@ -146,9 +236,13 @@ class ImapSyncer:
             status, data = conn.select(f'"{folder}"', readonly=True)
             if status != 'OK':
                 log.warning('Cannot select folder %s: %s', folder, data)
+                result['errors'] += 1
+                result['error'] = 'cannot open folder: %s' % _imap_text(data)
                 return result
         except imaplib.IMAP4.error as e:
             log.warning('Error selecting %s: %s', folder, e)
+            result['errors'] += 1
+            result['error'] = 'cannot open folder: %s' % e
             return result
 
         # Get message count
@@ -161,7 +255,7 @@ class ImapSyncer:
         synced_uids = set()
         if uid_file.exists():
             try:
-                synced_uids = set(json.loads(uid_file.read_text()))
+                synced_uids = set(json.loads(uid_file.read_text(encoding='utf-8')))
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -205,7 +299,7 @@ class ImapSyncer:
                 result['errors'] += 1
 
         # Save synced UIDs
-        uid_file.write_text(json.dumps(sorted(synced_uids)))
+        uid_file.write_text(json.dumps(sorted(synced_uids)), encoding='utf-8')
         self._chown(uid_file)  # T5
 
         return result
@@ -249,7 +343,14 @@ class ImapSyncer:
                     log.warning('Error syncing folder %s: %s', folder, e)
                     result['folders'][folder] = {'error': str(e)}
 
-            result['success'] = True
+            # A server whose every folder refused to open was not synced:
+            # report it, do not record a clean sync with nothing new.
+            failed = [f for f, r in result['folders'].items() if r.get('error')]
+            if folders and len(failed) == len(folders):
+                result['error'] = 'no folder could be opened (%s: %s)' % (
+                    failed[0], result['folders'][failed[0]]['error'])
+            else:
+                result['success'] = True
 
         finally:
             try:
@@ -279,6 +380,7 @@ def sync_account(account_config: dict, data_dir: Path) -> dict:
         host=account_config.get('host', 'imap.gmail.com'),
         port=account_config.get('port', 993),
         use_tls=account_config.get('tls', True),
+        tls_mode=account_config.get('tls_mode'),
         username=account_config['email'],
         password=account_config.get('password', ''),
         local_dir=local_dir,

@@ -1,19 +1,24 @@
 /* Mail Archiver — DEC-LLC branded CSS */
 :root {
-    --bg: #f5f7f9;
+    color-scheme: light;
+    /* Documents are black on white; colour only where it carries meaning. */
+    --bg: #ffffff;
     --card-bg: #fff;
-    --text: #333;
-    --text-muted: #666;
-    --border: #ddd;
+    --panel: #fafaf8;
+    --text: #16161a;
+    --text-muted: #5c5952;
+    --border: #dedbd4;
     --primary: #0f2b46;
     --primary-hover: #1a4d7d;
     --accent: #2196f3;
     --accent-dark: #1565c0;
     --teal: #00897b;
-    --danger: #dc2626;
-    --success: #16a34a;
-    --warning: #d97706;
+    --danger: #a8341f;   /* alert */
+    --success: #16794a;  /* good */
+    --warning: #a86a1f;  /* warning */
+    --info: #1f5fa8;     /* informational / current */
     --syncing: #7c3aed;
+    --sidebar-width: 220px;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -33,7 +38,7 @@ body {
 
 .login-container {
     max-width: 400px;
-    margin-top: 10vh;
+    margin: 10vh auto 0;
     text-align: center;
 }
 
@@ -366,4 +371,111 @@ code {
     .search-bar { flex-direction: column; }
     .search-account-filter { width: 100%; }
     .result-header { flex-direction: column; gap: 0.25rem; }
+}
+
+/* ------------------------------------------------------------------
+   Shared layout (1.3.0, templates/base.html): fixed left sidebar with
+   the navigation tree, main content beside it, footer with the version.
+   ------------------------------------------------------------------ */
+.sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: var(--sidebar-width);
+    overflow-y: auto;
+    padding: 1rem 0.75rem;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    font-size: 0.9rem;
+}
+.has-sidebar .main { margin-left: var(--sidebar-width); min-width: 0; }
+
+.sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0 0.5rem 0.75rem;
+    border-bottom: 2px solid var(--primary);
+}
+.sidebar-brand img { height: 32px; display: block; }
+.sidebar-title { font-weight: 700; color: var(--primary); }
+.sidebar-user {
+    padding: 0.6rem 0.5rem 0.4rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nav-tree, .nav-tree ul { list-style: none; }
+.nav-tree ul { margin-left: 0.75rem; border-left: 1px solid var(--border); }
+.nav-link {
+    display: block;
+    padding: 0.4rem 0.5rem;
+    border-left: 3px solid transparent;
+    border-radius: 0 5px 5px 0;
+    color: var(--text);
+    text-decoration: none;
+}
+a.nav-link:hover { background: #efede8; }
+a.nav-link:focus-visible { outline: 2px solid var(--info); outline-offset: -2px; }
+.nav-link[aria-current="page"] {
+    border-left-color: var(--info);
+    color: var(--info);
+    font-weight: 700;
+    background: #fff;
+}
+.nav-link.nav-section { border-left-color: var(--border); font-weight: 600; }
+.nav-group-label {
+    display: block;
+    padding: 0.7rem 0.5rem 0.2rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+/* Admin entries for a non-admin: listed, greyed, not a link. */
+.nav-disabled, .nav-group-disabled .nav-group-label {
+    color: #a3a09a;
+    cursor: not-allowed;
+}
+.nav-disabled { user-select: none; }
+
+/* The sidebar carries the logo; the per-page header keeps its title. */
+.has-sidebar .main header .logo-header > a[target="_blank"] { display: none; }
+header { flex-wrap: wrap; gap: 0.5rem; }
+
+.site-footer {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-align: center;
+}
+.site-footer a { color: inherit; }
+
+/* Narrow screens: the sidebar becomes a block above the content and the
+   tree wraps into rows; nothing is fixed, nothing scrolls sideways. */
+@media (max-width: 900px) {
+    .sidebar {
+        position: static;
+        width: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+        padding: 0.6rem 0.75rem;
+    }
+    .has-sidebar .main { margin-left: 0; }
+    .sidebar-brand { border-bottom: 0; padding-bottom: 0.25rem; }
+    .sidebar-user { display: none; }
+    .nav-tree, .nav-tree ul { display: flex; flex-wrap: wrap; align-items: center; gap: 0 0.25rem; }
+    .nav-tree ul { margin-left: 0; border-left: 0; }
+    .nav-group { display: flex; flex-wrap: wrap; align-items: center; }
+    .nav-group-label { padding: 0.4rem 0.5rem; }
+    .nav-link { border-left: 0; border-bottom: 3px solid transparent; border-radius: 5px 5px 0 0; }
+    .nav-link[aria-current="page"] { border-bottom-color: var(--info); }
+    .nav-link.nav-section { border-bottom-color: var(--border); }
+    .container { padding: 1rem; }
+    .user-info { flex-wrap: wrap; gap: 0.5rem; }
+    .actions-bar { flex-wrap: wrap; }
 }

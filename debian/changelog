@@ -1,0 +1,11 @@
+mail-archiver (1.3.3-1) unstable; urgency=medium
+
+  * First release with source packages: a source tarball, a Debian source
+    package and an SRPM are built for every release.
+  * search_index.py imports on Python 3.9 (it did not; EL 9 only).
+  * Server-wide OAuth apps are written by administrators only; with built-in
+    sign-in, administrators are the names in MAIL_ARCHIVER_ADMIN_USERS.
+  * The system CA bundle is found on EL as well as on Debian.
+  * See CHANGELOG.md for the release notes of this and earlier versions.
+
+ -- Madhav Diwan <madhav@decllc.biz>  Mon, 16 Nov 2026 22:30:00 -0500

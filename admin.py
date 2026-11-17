@@ -17,13 +17,13 @@ direct systemctl privileges.
 import os
 import time
 import json
-import fcntl
+import platform
 import subprocess
 import threading
-import pwd
-import grp
 from functools import wraps
 from pathlib import Path
+
+import platform_compat as _pc
 
 from flask import (
     Blueprint, render_template, redirect, url_for, session, jsonify,
@@ -38,9 +38,33 @@ admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 ADMIN_GROUP = os.environ.get('MAIL_ARCHIVER_ADMIN_GROUP',
                              'mail-archiver-admins')
 FALLBACK_GROUPS = ('sudo', 'wheel')
-RESTART_REQUEST_MARKER = '/run/mail-archiver/restart-requested'
-RESTART_PENDING_MARKER = '/run/mail-archiver/restart-pending'
-VERSION_FILE = '/opt/mail-archiver/VERSION'
+# /run/mail-archiver on Linux (platform_compat.runtime_dir).
+RESTART_REQUEST_MARKER = os.path.join(_pc.runtime_dir(), 'restart-requested')
+RESTART_PENDING_MARKER = os.path.join(_pc.runtime_dir(), 'restart-pending')
+# The packaged server is installed in /opt/mail-archiver; the Windows
+# application runs from wherever it was unpacked.
+APP_DIR = (os.path.dirname(os.path.abspath(__file__)) if _pc.IS_WINDOWS
+           else '/opt/mail-archiver')
+VERSION_FILE = os.path.join(APP_DIR, 'VERSION')
+# Written by the hourly cron on Linux; there is no such log on Windows.
+SYNC_LOG = None if _pc.IS_WINDOWS else '/var/log/mail-archiver-sync.log'
+
+# Windows (single-user desktop application): there are no unix groups, so
+# the administrators are the Mail Archiver users named here, separated by
+# commas. Unset = nobody is an administrator. Ignored on Linux.
+ADMIN_USERS_ENV = 'MAIL_ARCHIVER_ADMIN_USERS'
+
+# What a Windows administrator is told instead of a systemd-backed panel.
+WINDOWS_SERVICE_MESSAGE = (
+    'Service status, the journal and timers are not available on Windows: '
+    'Mail Archiver runs here as a desktop application, not as a systemd '
+    'service.')
+WINDOWS_RESTART_MESSAGE = (
+    'Restart is not available on Windows. Close Mail Archiver and start it '
+    'again to restart it.')
+WINDOWS_HOST_MESSAGE = (
+    'Load, memory, temperature, network and disk I/O figures are read from '
+    'Linux /proc and /sys and are not available on Windows.')
 
 STORAGE_CACHE_TTL = 300  # seconds
 _STORAGE_CACHE = {}       # {(user, email): {bytes, computed_at, computing}}
@@ -70,17 +94,24 @@ def _resolve_admin_group():
     the configured name anyway so `getgrnam` raises KeyError upstream
     (deny by default).
     """
-    try:
-        grp.getgrnam(ADMIN_GROUP)
+    if _pc.group_info(ADMIN_GROUP) is not None:
         return ADMIN_GROUP
-    except KeyError:
-        for fallback in FALLBACK_GROUPS:
-            try:
-                grp.getgrnam(fallback)
-                return fallback
-            except KeyError:
-                continue
-    return ADMIN_GROUP  # will raise later on check
+    for fallback in FALLBACK_GROUPS:
+        if _pc.group_info(fallback) is not None:
+            return fallback
+    return ADMIN_GROUP  # does not exist: the check denies
+
+
+def _builtin_auth():
+    """True when users sign in with Mail Archiver's own accounts."""
+    return os.environ.get('MAIL_ARCHIVER_AUTH', 'pam').strip().lower() == 'builtin'
+
+
+def _configured_admin_users():
+    """The usernames in MAIL_ARCHIVER_ADMIN_USERS (Windows, and built-in
+    sign-in on any platform)."""
+    raw = os.environ.get(ADMIN_USERS_ENV, '')
+    return {u.strip() for u in raw.replace(';', ',').split(',') if u.strip()}
 
 
 def _is_admin(username):
@@ -94,15 +125,23 @@ def _is_admin(username):
             return cached[0]
 
     result = False
-    try:
-        group_name = _resolve_admin_group()
-        gr = grp.getgrnam(group_name)
-        pw = pwd.getpwnam(username)
-        # Member either explicitly in gr_mem or via primary GID
-        if username in gr.gr_mem or pw.pw_gid == gr.gr_gid:
-            result = True
-    except (KeyError, OSError):
-        result = False
+    if not _pc.supports_system_accounts() or _builtin_auth():
+        # No unix groups to ask (Windows), or the users are Mail Archiver's
+        # own (built-in sign-in, 1.3.3): only the configured names. A
+        # built-in user is not a system account even when the names match,
+        # and anyone may register a name, so group membership of a system
+        # account of the same name must not make a built-in user an admin.
+        result = username in _configured_admin_users()
+    else:
+        try:
+            gr = _pc.group_info(_resolve_admin_group())
+            pw = _pc.user_info(username)
+            # Member either explicitly in gr_mem or via primary GID
+            if (gr is not None and pw is not None
+                    and (username in gr.members or pw.gid == gr.gid)):
+                result = True
+        except OSError:
+            result = False
 
     with _ADMIN_CHECK_CACHE_LOCK:
         _ADMIN_CHECK_CACHE[username] = (result, now)
@@ -116,6 +155,16 @@ def requires_admin(f):
         if not username:
             return redirect(url_for('login'))
         if not _is_admin(username):
+            if not _pc.supports_system_accounts() or _builtin_auth():
+                html = (
+                    '<h1>403 — Admin access required</h1>'
+                    '<p>The admin pages are for administrators only. With '
+                    'built-in sign-in an administrator is a Mail Archiver user named '
+                    f'in the <code>{ADMIN_USERS_ENV}</code> setting of the '
+                    'application.</p>'
+                    '<p><a href="/dashboard">Back to dashboard</a></p>'
+                )
+                return html, 403
             group_name = _resolve_admin_group()
             html = (
                 f'<h1>403 — Admin access required</h1>'
@@ -137,13 +186,15 @@ def requires_admin(f):
 
 def _read_version():
     try:
-        with open(VERSION_FILE) as f:
+        with open(VERSION_FILE, encoding='utf-8') as f:
             return f.read().strip()
     except OSError:
         return 'unknown'
 
 
 def _systemctl_show(unit, prop):
+    if not _pc.supports_system_accounts():
+        return ''            # no systemd on Windows; never shell out
     try:
         out = subprocess.check_output(
             ['systemctl', 'show', unit, '-p', prop, '--value'],
@@ -155,14 +206,17 @@ def _systemctl_show(unit, prop):
 
 
 def _service_info():
+    supported = _pc.supports_system_accounts()
     active = _systemctl_show('mail-archiver.service', 'ActiveState') or 'unknown'
+    if not supported:
+        active = 'running (desktop application)'
     since_us = _systemctl_show('mail-archiver.service', 'ActiveEnterTimestampMonotonic')
     uptime_s = None
     if since_us and since_us.isdigit():
         # ActiveEnterTimestampMonotonic is us since kernel boot; compare
         # against /proc/uptime
         try:
-            with open('/proc/uptime') as f:
+            with open('/proc/uptime', encoding='utf-8') as f:
                 boot_uptime = float(f.read().split()[0])
             uptime_s = boot_uptime - (int(since_us) / 1_000_000)
             if uptime_s < 0:
@@ -173,7 +227,7 @@ def _service_info():
     restart_pending = None
     if os.path.exists(RESTART_PENDING_MARKER):
         try:
-            with open(RESTART_PENDING_MARKER) as f:
+            with open(RESTART_PENDING_MARKER, encoding='utf-8') as f:
                 restart_pending = f.read().strip()
         except OSError:
             pass
@@ -187,6 +241,9 @@ def _service_info():
 
     return {
         'version': _read_version(),
+        'supported': supported,
+        'unsupported_message': '' if supported else WINDOWS_SERVICE_MESSAGE,
+        'restart_message': '' if supported else WINDOWS_RESTART_MESSAGE,
         'active_state': active,
         'uptime_s': uptime_s,
         'restart_pending': restart_pending,
@@ -203,9 +260,7 @@ def _service_info():
 
 def _statvfs_summary(path):
     try:
-        st = os.statvfs(path)
-        total = st.f_blocks * st.f_frsize
-        avail = st.f_bavail * st.f_frsize
+        total, avail = _pc.fs_usage(path)
         used = total - avail
         pct_free = (avail / total * 100.0) if total > 0 else 0.0
         band = 'green' if pct_free >= 20.0 else ('amber' if pct_free >= 5.0 else 'red')
@@ -219,7 +274,21 @@ def _slug(s):
     return s.replace('@', '_at_').replace('.', '_')
 
 
+def _tree_bytes(path):
+    """Sum of the file sizes under path, without an external tool."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
 def _compute_du_bytes(path):
+    if _pc.IS_WINDOWS:
+        return _tree_bytes(path)     # no `du` on Windows
     try:
         out = subprocess.check_output(
             ['du', '-sb', path], timeout=300, text=True,
@@ -267,7 +336,7 @@ def _storage_per_account(data_dir):
             if not acct_file.exists():
                 continue
             try:
-                data = json.loads(acct_file.read_text())
+                data = json.loads(acct_file.read_text(encoding='utf-8'))
                 emails = [
                     a.get('email') for a in (
                         data if isinstance(data, list)
@@ -316,8 +385,10 @@ def _storage_per_account(data_dir):
 # ---------------------------------------------------------------
 
 def _read_loadavg():
+    if _pc.IS_WINDOWS:
+        return {'load1': None, 'load5': None, 'load15': None}
     try:
-        with open('/proc/loadavg') as f:
+        with open('/proc/loadavg', encoding='utf-8') as f:
             parts = f.read().split()
         return {'load1': float(parts[0]), 'load5': float(parts[1]),
                 'load15': float(parts[2])}
@@ -327,8 +398,10 @@ def _read_loadavg():
 
 def _read_meminfo():
     out = {'total_kb': 0, 'available_kb': 0, 'pct_used': 0.0}
+    if _pc.IS_WINDOWS:
+        return out
     try:
-        with open('/proc/meminfo') as f:
+        with open('/proc/meminfo', encoding='utf-8') as f:
             for line in f:
                 if line.startswith('MemTotal:'):
                     out['total_kb'] = int(line.split()[1])
@@ -345,10 +418,12 @@ def _read_meminfo():
 
 def _read_thermal_max_c():
     max_c = None
+    if _pc.IS_WINDOWS:
+        return max_c
     try:
         for p in Path('/sys/class/thermal').glob('thermal_zone*'):
             try:
-                v = int((p / 'temp').read_text().strip())
+                v = int((p / 'temp').read_text(encoding='utf-8').strip())
                 c = v / 1000.0 if v > 1000 else float(v)
                 if max_c is None or c > max_c:
                     max_c = c
@@ -360,8 +435,10 @@ def _read_thermal_max_c():
 
 
 def _read_uptime_s():
+    if _pc.IS_WINDOWS:
+        return None
     try:
-        with open('/proc/uptime') as f:
+        with open('/proc/uptime', encoding='utf-8') as f:
             return float(f.read().split()[0])
     except (OSError, ValueError, IndexError):
         return None
@@ -369,8 +446,11 @@ def _read_uptime_s():
 
 def _read_os_release():
     d = {}
+    if _pc.IS_WINDOWS:
+        # e.g. "Windows-11-10.0.26100-SP0"
+        return {'PRETTY_NAME': platform.platform()}
     try:
-        with open('/etc/os-release') as f:
+        with open('/etc/os-release', encoding='utf-8') as f:
             for line in f:
                 if '=' in line:
                     k, v = line.strip().split('=', 1)
@@ -384,13 +464,15 @@ def _read_diskstats_for(path):
     """Return {read_sectors, write_sectors} for the block device backing path,
     or {} if unresolvable.
     """
+    if _pc.IS_WINDOWS:
+        return {}            # no /proc/diskstats, no os.major()
     try:
         st = os.stat(path)
         target_major, target_minor = os.major(st.st_dev), os.minor(st.st_dev)
     except OSError:
         return {}
     try:
-        with open('/proc/diskstats') as f:
+        with open('/proc/diskstats', encoding='utf-8') as f:
             for line in f:
                 parts = line.split()
                 if len(parts) < 14:
@@ -456,7 +538,7 @@ def _oauth_token_summary(data_dir):
                 continue
             for f in token_files:
                 try:
-                    d = json.loads(f.read_text())
+                    d = json.loads(f.read_text(encoding='utf-8'))
                 except (OSError, ValueError):
                     continue
                 # Reconstruct email from filename
@@ -510,11 +592,12 @@ def _active_syncs():
         return []
 
 
-def _recent_failure_rate(log_path='/var/log/mail-archiver-sync.log', n=100):
+def _recent_failure_rate(log_path=None, n=100):
     """Parse tail of the sync log, count 'Sync failed for' vs 'Sync completed' or
     'Sync error'. Returns {total, failures, rate}.
     """
-    if not os.path.exists(log_path):
+    log_path = log_path or SYNC_LOG
+    if not log_path or not os.path.exists(log_path):
         return {'total': 0, 'failures': 0, 'rate': None}
     try:
         # Read last ~64K then parse — cheap enough
@@ -554,6 +637,7 @@ def index():
     storage_root = _statvfs_summary(data_dir)
     storage_rows = _storage_per_account(data_dir)
     host = {
+        'unsupported_message': WINDOWS_HOST_MESSAGE if _pc.IS_WINDOWS else '',
         'load': _read_loadavg(),
         'mem': _read_meminfo(),
         'thermal_c': _read_thermal_max_c(),
@@ -587,13 +671,18 @@ def restart():
     runs `systemctl restart mail-archiver` as root. Returns 202 Accepted
     immediately; the actual restart happens ~1-2s later.
     """
+    if not _pc.supports_system_accounts():
+        # No systemd path unit to pick the marker up. 409, not a 5xx: the
+        # request was understood and nothing is broken.
+        return jsonify({'status': 'unsupported',
+                        'detail': WINDOWS_RESTART_MESSAGE}), 409
     try:
-        os.makedirs('/run/mail-archiver', mode=0o770, exist_ok=True)
+        os.makedirs(_pc.runtime_dir(), mode=0o770, exist_ok=True)
     except OSError:
         pass
     try:
         # Atomic-ish: open + write + close. Path unit fires on PathExists.
-        with open(RESTART_REQUEST_MARKER, 'w') as f:
+        with open(RESTART_REQUEST_MARKER, 'w', encoding='utf-8') as f:
             f.write(f'{time.time()} requested_by={session.get("username","?")}\n')
         try:
             # Match tmpfiles.d perm so the mail-archiver-restart executor
@@ -618,8 +707,16 @@ def storage_detail():
     data_dir = main_app.CONFIG['data_dir']
     # /proc/mounts parse — list filesystems > 1GB
     mounts = []
+    if _pc.IS_WINDOWS:
+        # No /proc/mounts: report the drive that holds the data.
+        drive = os.path.splitdrive(os.path.abspath(data_dir))[0] or data_dir
+        info = _statvfs_summary(data_dir)
+        if 'error' not in info:
+            info.update({'path': data_dir, 'device': drive, 'fstype': ''})
+            mounts.append(info)
     try:
-        with open('/proc/mounts') as f:
+        with open('/proc/mounts' if not _pc.IS_WINDOWS else os.devnull,
+                  encoding='utf-8') as f:
             for line in f:
                 parts = line.split()
                 if len(parts) < 3:
@@ -640,14 +737,14 @@ def storage_detail():
         pass
 
     logs_size = 0
-    for lp in ('/var/log/mail-archiver-sync.log',):
+    for lp in ((SYNC_LOG,) if SYNC_LOG else ()):
         try:
             logs_size += os.path.getsize(lp)
         except OSError:
             pass
 
     app_size = 0
-    for root, _, files in os.walk('/opt/mail-archiver'):
+    for root, _, files in os.walk(APP_DIR):
         for name in files:
             try:
                 app_size += os.path.getsize(os.path.join(root, name))
@@ -662,6 +759,8 @@ def storage_detail():
         rows=_storage_per_account(data_dir),
         logs_size=logs_size,
         app_size=app_size,
+        app_dir=APP_DIR,
+        sync_log=SYNC_LOG,
     )
 
 
@@ -673,7 +772,8 @@ def host_detail():
     data_dir = main_app.CONFIG['data_dir']
     interfaces = []
     try:
-        with open('/proc/net/dev') as f:
+        with open('/proc/net/dev' if not _pc.IS_WINDOWS else os.devnull,
+                  encoding='utf-8') as f:
             for line in f.readlines()[2:]:
                 parts = line.split()
                 if len(parts) < 10:
@@ -691,14 +791,15 @@ def host_detail():
 
     thermal = []
     try:
-        for p in sorted(Path('/sys/class/thermal').glob('thermal_zone*')):
+        for p in sorted(Path('/sys/class/thermal').glob('thermal_zone*')
+                        if not _pc.IS_WINDOWS else ()):
             try:
                 zone = p.name
-                temp_raw = int((p / 'temp').read_text().strip())
+                temp_raw = int((p / 'temp').read_text(encoding='utf-8').strip())
                 temp_c = temp_raw / 1000.0 if temp_raw > 1000 else float(temp_raw)
                 zone_type = ''
                 try:
-                    zone_type = (p / 'type').read_text().strip()
+                    zone_type = (p / 'type').read_text(encoding='utf-8').strip()
                 except OSError:
                     pass
                 thermal.append({'zone': zone, 'type': zone_type, 'temp_c': temp_c})
@@ -713,6 +814,7 @@ def host_detail():
     return render_template(
         'admin_host.html',
         username=session.get('username', ''),
+        unsupported_message=WINDOWS_HOST_MESSAGE if _pc.IS_WINDOWS else '',
         load=_read_loadavg(),
         mem=_read_meminfo(),
         uptime_s=_read_uptime_s(),
@@ -744,7 +846,7 @@ def app_detail():
             if not f.exists():
                 continue
             try:
-                d = json.loads(f.read_text())
+                d = json.loads(f.read_text(encoding='utf-8'))
             except (OSError, ValueError):
                 continue
             for email, st in d.items():
@@ -801,7 +903,6 @@ def sync_cancel(job_id):
     os.killpg on the recorded mbsync_pid. Safe because 1.0.17 chunking
     makes cancel-and-resume painless.
     """
-    import signal
     import sync_lifecycle as slc
     try:
         state = slc.read_state(job_id)
@@ -818,10 +919,7 @@ def sync_cancel(job_id):
         # under mail-archiver.service (not our scope), signal its pgid.
         pid = state.get('mbsync_pid')
         if pid:
-            try:
-                os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
-            except (OSError, ValueError):
-                pass
+            _pc.terminate_process_group(pid)
         return jsonify({
             'status': 'ok',
             'scope_stopped': stopped,

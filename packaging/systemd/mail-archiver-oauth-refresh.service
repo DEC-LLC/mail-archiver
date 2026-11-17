@@ -18,7 +18,9 @@ IOSchedulingPriority=6
 
 # Lock down: read-only /opt, no need to write anywhere outside data dir
 ProtectSystem=strict
-ReadWritePaths=/datapool/email-archive /srv /var/log
+# A leading '-' lets the unit start when that directory does not exist (1.3.3:
+# the unit failed with 226/NAMESPACE on every install without it).
+ReadWritePaths=-/var/lib/mail-archiver -/datapool/email-archive /srv /var/log
 NoNewPrivileges=true
 PrivateTmp=true
 

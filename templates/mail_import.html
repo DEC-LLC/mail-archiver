@@ -1,0 +1,329 @@
+{% extends "base.html" %}
+{% block title %}Mail Archiver — Import mail{% endblock %}
+{% block head_extra %}
+    <style>
+        .imp-section { border: 1px solid #dedbd4; border-radius: 8px; padding: 16px 20px; margin: 16px 0; background: #fff; color: #16161a; }
+        .imp-section h3 { margin: 0 0 12px; color: #0f2b46; font-size: 1.1rem; }
+        .imp-section h4 { margin: 16px 0 6px; font-size: 0.95rem; color: #16161a; }
+        .imp-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        .imp-table th, .imp-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+        .imp-table th { color: #5c5952; font-weight: 600; background: #fafaf8; }
+        .imp-table td.num { text-align: right; white-space: nowrap; }
+        .imp-wrap { overflow-x: auto; }
+        .imp-grid { display: grid; grid-template-columns: 180px 1fr; gap: 10px 16px; align-items: center; }
+        .imp-grid input[type=text], .imp-grid select, .map-row input, .map-row select, .imp-upload select { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.9rem; }
+        .map-row { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+        .map-row input { flex: 1; min-width: 220px; }
+        .imp-upload { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .tag { display: inline-block; padding: 3px 8px; border-radius: 5px; font-size: 0.72rem; font-weight: 600; color: #fff; text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; }
+        .tag-done { background: #16794a; } .tag-partial { background: #a86a1f; }
+        .tag-failed, .tag-refused { background: #a8341f; } .tag-running, .tag-queued, .tag-type { background: #1f5fa8; }
+        .tag-skipped, .tag-deleted { background: #6d4aa8; } .tag-unknown { background: #5c5952; }
+        .muted { color: #5c5952; font-size: 0.85rem; }
+        code.path { background: #f4f4f1; padding: 1px 5px; border-radius: 4px; font-size: 0.85rem; word-break: break-all; }
+        .warn { background: #fff4e5; border: 1px solid #f0c27b; padding: 8px 12px; border-radius: 6px; margin: 8px 0; color: #16161a; }
+        .imp-section details summary { cursor: pointer; color: #1f5fa8; }
+        .reason { white-space: pre-wrap; }
+        #upload-progress { margin-left: 8px; }
+        @media (max-width: 700px) { .imp-grid { grid-template-columns: 1fr; } }
+    </style>
+{% endblock %}
+{% block content %}
+    <h2>Import mail</h2>
+    <p class="muted">Mail files are imported into one of your accounts and become searchable like synced mail.
+    Supported: Outlook PST/OST, mbox (Thunderbird, Google Takeout, Apple Mail export), Maildir / Maildir++ folders,
+    single <code>.eml</code> files or a folder of them, Apple <code>.emlx</code>, Outlook <code>.msg</code>, and
+    zip / tar archives of any of these. The type is recognised from the content, not the file name.
+    Only messages that are not already in the account (by Message-ID) are added; imported mail is marked read
+    and lands under <code>PST/</code> or <code>Imported/&lt;type&gt;/</code>.</p>
+
+    {% with messages = get_flashed_messages() %}
+    {% if messages %}<div class="flash">{% for m in messages %}<p>{{ m }}</p>{% endfor %}</div>{% endif %}
+    {% endwith %}
+
+    {% if tree_error %}
+    <div class="warn"><strong>The import folders are not used.</strong> {{ tree_error }}.
+    Nothing in them is read, moved or imported until this is put right.</div>
+    {% endif %}
+    {% if ledger_error %}
+    <div class="warn"><strong>The import history cannot be read:</strong> the index database is damaged ({{ ledger_error }}).
+    Rebuilding the search index keeps the damaged file aside (it is not deleted), makes a new database from the mail, and imports work again.
+    <form method="post" action="{{ url_for('rebuild_search_index') }}" class="inline-form">
+        <button class="btn btn-small btn-primary">Rebuild the search index</button>
+    </form></div>
+    {% endif %}
+    {% if running %}
+    <div class="warn" id="running-note"><strong>An import is running.</strong> This page refreshes every 15 seconds.</div>
+    {% endif %}
+    {# tool_notes (mail_import.tool_notes()) carries the platform's own wording; without it the Linux text is shown. #}
+    {% if not readpst %}<div class="warn" id="imp-needs-readpst">{% if tool_notes and tool_notes.readpst %}{{ tool_notes.readpst }}. PST / OST files are refused until then; every other format is imported.{% else %}readpst is not installed (package <code>pst-utils</code>): PST files are refused until it is.{% endif %}</div>{% endif %}
+    {% if not msgconvert %}<div class="warn" id="imp-needs-msgconvert">{% if tool_notes and tool_notes.msgconvert %}{{ tool_notes.msgconvert }}. Outlook <code>.msg</code> files are refused until then; every other format is imported.{% else %}msgconvert is not installed (package <code>libemail-outlook-message-perl</code>): Outlook <code>.msg</code> files are refused until it is.{% endif %}</div>{% endif %}
+
+    <div class="imp-section">
+        <h3>Upload a file</h3>
+        <p class="muted">Up to {{ max_upload }}. The file goes into the chosen account's import folder and is imported straight away.
+        To import a folder (a Maildir, or a folder of .eml files) zip it first, or copy it into the account's import folder below.
+        Behind a reverse proxy the upload size is also limited by the proxy.</p>
+        <div class="imp-upload">
+            <label for="imp-account">Import into</label>
+            <select id="imp-account" {% if not accounts %}disabled{% endif %}>
+                {% for a in accounts %}<option value="{{ a.email }}">{{ a.email }}</option>{% endfor %}
+            </select>
+            <input type="file" id="imp-file">
+            <button type="button" class="btn btn-primary" id="imp-upload-btn" {% if not accounts %}disabled{% endif %}>Upload and import</button>
+            <span id="upload-progress" class="muted"></span>
+        </div>
+    </div>
+
+    <div class="imp-section">
+        <h3>Import folders</h3>
+        <p class="muted">Every account has its own import folder; whatever is put in its <code>inbox/</code> is imported into
+        that account. Programs that deliver files write into <code>inbox/.incoming/</code>, put
+        <code>&lt;name&gt;.sha256</code> in place, then rename the file into <code>inbox/</code>.</p>
+        <form method="post" action="{{ url_for('mail_import_run') }}" class="inline-form">
+            <button class="btn btn-small btn-primary" {% if running or not accounts %}disabled{% endif %}>Import everything waiting</button>
+        </form>
+        {% for a in acct_rows %}
+        <h4>{{ a.email }}</h4>
+        <p class="muted">Folder: <code class="path">{{ a.paths.inbox }}</code></p>
+        {% if a.error and not tree_error %}
+        <div class="warn"><strong>This import folder is refused.</strong> {{ a.error }}.
+        Nothing in it is read, moved or imported until this is put right.</div>
+        {% endif %}
+        {% if a.waiting %}
+        <div class="imp-wrap"><table class="imp-table">
+            <tr><th>Waiting</th><th>Size</th><th>Detected type</th><th>Checksum</th><th></th></tr>
+            {% for f in a.waiting %}
+            <tr>
+                <td>{{ f.name }}{% if f.is_dir %}/{% endif %}</td><td>{{ f.size }}</td>
+                <td>{% if f.type %}<span class="tag tag-type">{{ f.type }}</span> <span class="muted">{{ f.type_label }}</span>{% else %}<span class="tag tag-unknown">unknown</span> <span class="muted">{{ f.how }}</span>{% endif %}</td>
+                <td>{{ 'sidecar' if f.sidecar else 'none' }}</td>
+                <td><form method="post" action="{{ url_for('mail_import_run') }}" class="inline-form">
+                        <input type="hidden" name="account" value="{{ a.email }}">
+                        <input type="hidden" name="file" value="{{ f.name }}">
+                        <button class="btn btn-small btn-primary" {% if running %}disabled{% endif %}>Import now</button>
+                    </form></td>
+            </tr>
+            {% endfor %}
+        </table></div>
+        {% else %}
+        <p class="muted">Nothing waiting.</p>
+        {% endif %}
+        {% if a.ignored %}
+        <details><summary>{{ a.ignored|length }} other item(s) ignored</summary>
+            <ul class="muted">{% for n, why in a.ignored %}<li>{{ n }} — {{ why }}</li>{% endfor %}</ul>
+        </details>
+        {% endif %}
+        {% else %}
+        <p class="muted">Add an email account first.</p>
+        {% endfor %}
+
+        {% if watch_files or cfg.mappings or cfg.default_account %}
+        <h4>PST watch folder (older layout)</h4>
+        <p class="muted">Folder: <code class="path">{{ paths.watch }}</code> — only <code>.pst</code> files; the account
+        comes from the file name rules in the settings below.</p>
+        {% if watch_files %}
+        <div class="imp-wrap"><table class="imp-table">
+            <tr><th>Waiting</th><th>Size</th><th>Checksum</th><th>Imports into</th><th></th></tr>
+            {% for f in watch_files %}
+            <tr>
+                <td>{{ f.name }}</td><td>{{ f.size }}</td>
+                <td>{{ 'sidecar' if f.sidecar else 'none' }}</td>
+                <td>{% if f.account %}{{ f.account }} <span class="muted">({{ f.mapped_by }})</span>{% else %}<span class="tag tag-unknown">unmapped</span> <span class="muted">{{ f.mapped_by }}</span>{% endif %}</td>
+                <td>{% if f.account %}
+                    <form method="post" action="{{ url_for('mail_import_run') }}" class="inline-form">
+                        <input type="hidden" name="file" value="{{ f.name }}">
+                        <button class="btn btn-small btn-primary" {% if running %}disabled{% endif %}>Import now</button>
+                    </form>{% endif %}</td>
+            </tr>
+            {% endfor %}
+        </table></div>
+        {% else %}<p class="muted">Nothing waiting.</p>{% endif %}
+        {% if watch_ignored %}
+        <details><summary>{{ watch_ignored|length }} other item(s) ignored</summary>
+            <ul class="muted">{% for n, why in watch_ignored %}<li>{{ n }} — {{ why }}</li>{% endfor %}</ul>
+        </details>
+        {% endif %}
+        {% endif %}
+    </div>
+
+    <div class="imp-section">
+        <h3>History</h3>
+        {% if rows %}
+        <div class="imp-wrap"><table class="imp-table">
+            <tr><th>#</th><th>When</th><th>File</th><th>Type</th><th>Account / folder</th><th>Status</th><th>Imported</th><th>Duplicates</th><th>Failed</th><th>Details</th></tr>
+            {% for r in rows %}
+            <tr>
+                <td>{{ r.id }}</td>
+                <td>{{ r.started_at or r.finished_at or r.queued_at }}<div class="muted">{{ r.trigger }}</div></td>
+                <td>{{ r.original_name }}<div class="muted">{% if r.sha256 %}sha256 {{ r.sha256[:16] }}…{% endif %}</div></td>
+                <td>{% if r.detected_type %}<span class="tag tag-type">{{ r.detected_type }}</span>{% endif %}</td>
+                <td>{{ r.account }}<div class="muted">{{ r.target_prefix }}</div></td>
+                <td><span class="tag tag-{{ r.status }}">{{ r.status }}</span></td>
+                <td class="num">{{ r.imported if r.status in ('done', 'partial') else '' }}</td>
+                <td class="num">{{ r.duplicates if r.status in ('done', 'partial') else '' }}</td>
+                <td class="num">{{ r.failed if r.status in ('done', 'partial') else '' }}{% if r.too_large %} <span class="muted">(+{{ r.too_large }} too large)</span>{% endif %}</td>
+                <td class="muted">
+                    {% if r.error %}<div>{{ r.error }}</div>{% endif %}
+                    {% if r.detail.checksum %}<div>{{ r.detail.checksum }}</div>{% endif %}
+                    {% if r.detail.archived_as %}<div>archived as {{ r.detail.archived_as }}</div>{% endif %}
+                    {% if r.detail.archive_error %}<div>{{ r.detail.archive_error }}</div>{% endif %}
+                    {% if r.detail.moved_to %}<div>moved to {{ r.detail.moved_to }}</div>{% endif %}
+                    {% if r.detail.refused_members %}<div>{{ r.detail.refused_members }} archive member(s) refused</div>{% endif %}
+                    {% if r.detail.ignored %}<div>{{ r.detail.ignored }} file(s) that are not mail left out</div>{% endif %}
+                    {% if r.detail.errors %}<details><summary>{{ r.detail.errors|length }} note(s)</summary><ul>{% for e in r.detail.errors %}<li>{{ e }}</li>{% endfor %}</ul></details>{% endif %}
+                    {% if r.detail.folders %}<details><summary>folders</summary><ul>{% for fn, n in r.detail.folders.items() %}<li>{{ fn }}: {{ n }}</li>{% endfor %}</ul></details>{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </table></div>
+        {% else %}
+        <p class="muted">No imports yet.</p>
+        {% endif %}
+    </div>
+
+    <div class="imp-section">
+        <h3>Failed and skipped files</h3>
+        <p class="muted">A file that could not be imported, or that is identical to one already imported, is moved to the
+        account's <code>failed/</code> folder with the reason next to it. Nothing there is ever deleted by the importer.</p>
+        {% set ns = namespace(any=false) %}
+        {% for a in acct_rows %}{% if a.failed %}{% set ns.any = true %}
+        <h4>{{ a.email }}</h4>
+        <p class="muted">Folder: <code class="path">{{ a.paths.failed }}</code></p>
+        <div class="imp-wrap"><table class="imp-table">
+            <tr><th>File</th><th>Size</th><th>Reason</th><th></th></tr>
+            {% for f in a.failed %}
+            <tr><td>{{ f.name }}{% if f.is_dir %}/{% endif %}</td><td>{{ f.size }}</td>
+                <td class="muted reason">{{ f.reason or 'no reason recorded' }}</td>
+                <td><form method="post" action="{{ url_for('mail_import_retry') }}" class="inline-form">
+                    <input type="hidden" name="account" value="{{ a.email }}">
+                    <input type="hidden" name="file" value="{{ f.name }}">
+                    <button class="btn btn-small">Move back to the inbox</button></form></td></tr>
+            {% endfor %}
+        </table></div>
+        {% endif %}{% endfor %}
+        {% if not ns.any %}<p class="muted">None.</p>{% endif %}
+    </div>
+
+    <div class="imp-section">
+        <h3>Archive of imported files</h3>
+        <p class="muted">Imported files are kept in each account's <code>done/</code> folder. Only a dated series
+        (<code>&lt;name&gt;-YYYYMMDD.&lt;ext&gt;</code>, e.g. a nightly export) is ever thinned out, and only right after a
+        successful import of a new copy of that series: the newest {{ cfg.keep_recent }} copies and the newest copy of each of
+        {{ cfg.keep_monthly }} earlier months are kept, never fewer than {{ cfg.min_keep }} copies, never the newest one, at most
+        {{ cfg.max_delete_per_run }} deletions per run. A failed or partial import, or no import at all, deletes nothing.
+        One-off files are kept until you remove them.</p>
+        {% set ns2 = namespace(any=false) %}
+        {% for a in acct_rows %}{% if a.archive %}{% set ns2.any = true %}
+        <h4>{{ a.email }}</h4>
+        <p class="muted">Folder: <code class="path">{{ a.paths.done }}</code></p>
+        <div class="imp-wrap"><table class="imp-table">
+            <tr><th>File</th><th>Date</th><th>Size</th><th>Retention</th></tr>
+            {% for r in a.archive %}<tr><td>{{ r.name }}</td><td>{{ r.date }}</td><td>{{ r.size }}</td><td>{{ r.plan }}</td></tr>{% endfor %}
+        </table></div>
+        {% endif %}{% endfor %}
+        {% if not ns2.any %}<p class="muted">Empty.</p>{% endif %}
+
+        <h4>Retention log</h4>
+        {% if events %}
+        <div class="imp-wrap"><table class="imp-table">
+            <tr><th>When</th><th>Action</th><th>Rule</th><th>Copy</th><th>Account</th><th>Why</th></tr>
+            {% for e in events %}
+            <tr><td>{{ e.at }}</td><td><span class="tag tag-{{ e.action }}">{{ e.action }}</span></td><td>{{ e.rule }}</td>
+                <td>{{ e.name }}<div class="muted">{{ e.copy_date }}</div></td><td>{{ e.account }}</td><td class="muted">{{ e.reason }}</td></tr>
+            {% endfor %}
+        </table></div>
+        {% else %}<p class="muted">No copy has been deleted, and no deletion has been refused.</p>{% endif %}
+    </div>
+
+    <div class="imp-section">
+        <h3>Scheduled import</h3>
+        <form method="post" action="{{ url_for('mail_import_config') }}">
+            <div class="imp-grid">
+                <label for="enabled">Enabled</label>
+                <div><input type="checkbox" id="enabled" name="enabled" value="1" {% if cfg.enabled %}checked{% endif %}>
+                    <span class="muted">import whatever is waiting in the import folders on the schedule below</span></div>
+
+                <label for="schedule_kind">Schedule</label>
+                <div>
+                    <select name="schedule_kind" id="schedule_kind">
+                        {% for k, label in [('hourly','Every hour'),('daily','Daily'),('weekly','Weekly'),('manual','Manual only')] %}
+                        <option value="{{ k }}" {% if cfg.schedule.kind == k %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                    on
+                    <select name="weekday">
+                        {% for d in weekdays %}<option value="{{ loop.index0 }}" {% if cfg.schedule.weekday == loop.index0 %}selected{% endif %}>{{ d }}</option>{% endfor %}
+                    </select>
+                    at
+                    <select name="hour">
+                        {% for h in range(24) %}<option value="{{ h }}" {% if cfg.schedule.hour == h %}selected{% endif %}>{{ '%02d' % h }}:00</option>{% endfor %}
+                    </select>
+                    <div class="muted">The weekday applies to weekly, the hour to daily and weekly. Checked by the hourly cron; a missed time runs at the next hour.
+                    {% if last_scheduled_run %}Last scheduled run: {{ last_scheduled_run }}.{% endif %}</div>
+                </div>
+
+                <label>Keep imported files</label>
+                <div>newest <input type="text" name="keep_recent" value="{{ cfg.keep_recent }}" size="2"> copies of a dated series, plus one per month for
+                    <input type="text" name="keep_monthly" value="{{ cfg.keep_monthly }}" size="2"> months;
+                    never fewer than <input type="text" name="min_keep" value="{{ cfg.min_keep }}" size="2"> copies;
+                    at most <input type="text" name="max_delete_per_run" value="{{ cfg.max_delete_per_run }}" size="2"> deletions per run</div>
+
+                <label for="watch_dir">PST watch folder</label>
+                <div><input type="text" id="watch_dir" name="watch_dir" value="{{ cfg.watch_dir }}" placeholder="_import/watch (default)" size="40">
+                    <div class="muted">Older layout, PST files only. Must be inside your own archive folder. Leave empty for the default.</div></div>
+
+                <label>Watch folder: file name → account</label>
+                <div>
+                    <div class="muted">Glob patterns, first match wins, e.g. <code>ab1234c@example.edu-*.pst</code>. A file named
+                    <code>&lt;account email&gt;-YYYYMMDD.pst</code> maps to that account without a rule. Not needed for the per-account import folders.</div>
+                    {% for m in cfg.mappings + [{'pattern': '', 'account': ''}, {'pattern': '', 'account': ''}] %}
+                    <div class="map-row">
+                        <input type="text" name="map_pattern" value="{{ m.pattern }}" placeholder="pattern, e.g. name@old-domain-*.pst">
+                        <select name="map_account">
+                            {% for a in accounts %}<option value="{{ a.email }}" {% if m.account == a.email %}selected{% endif %}>{{ a.email }}</option>{% endfor %}
+                        </select>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                <label for="default_account">Watch folder: otherwise</label>
+                <div><select name="default_account" id="default_account">
+                    <option value="">leave the file waiting (unmapped)</option>
+                    {% for a in accounts %}<option value="{{ a.email }}" {% if cfg.default_account == a.email %}selected{% endif %}>import into {{ a.email }}</option>{% endfor %}
+                </select></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-primary">Save settings</button></div>
+        </form>
+    </div>
+{% endblock %}
+{% block scripts %}
+<script>
+(function () {
+    var btn = document.getElementById('imp-upload-btn');
+    var input = document.getElementById('imp-file');
+    var acct = document.getElementById('imp-account');
+    var out = document.getElementById('upload-progress');
+    if (btn) btn.addEventListener('click', function () {
+        var f = input.files && input.files[0];
+        if (!f) { out.textContent = 'Choose a file first.'; return; }
+        btn.disabled = true;
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '{{ url_for('mail_import_upload') }}?import=1&account=' + encodeURIComponent(acct.value) + '&name=' + encodeURIComponent(f.name));
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.upload.onprogress = function (e) {
+            if (e.lengthComputable) out.textContent = 'Uploading ' + Math.floor(100 * e.loaded / e.total) + '%';
+        };
+        xhr.onload = function () {
+            var msg;
+            try { msg = JSON.parse(xhr.responseText); } catch (e) { msg = {error: 'HTTP ' + xhr.status}; }
+            if (xhr.status === 200) { out.textContent = msg.import_started ? 'Uploaded. Import started.' : 'Uploaded. Another import is running; this file is picked up by the next run.'; setTimeout(function () { location.reload(); }, 1500); }
+            else { out.textContent = 'Upload failed: ' + (msg.error || ('HTTP ' + xhr.status)); btn.disabled = false; }
+        };
+        xhr.onerror = function () { out.textContent = 'Upload failed (connection).'; btn.disabled = false; };
+        xhr.send(f);
+    });
+    {% if running %}setTimeout(function () { location.reload(); }, 15000);{% endif %}
+})();
+</script>
+{% endblock %}

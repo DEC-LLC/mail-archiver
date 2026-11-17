@@ -1,0 +1,7 @@
+build/
+dist/
+__pycache__/
+pystray-PKGBUILD/src/
+pystray-PKGBUILD/pkg/
+pystray-PKGBUILD/*.tar.gz
+pystray-PKGBUILD/*.pkg.tar.*

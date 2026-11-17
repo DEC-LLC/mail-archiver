@@ -1,0 +1,85 @@
+# Maintainer: Madhav Diwan <madhav@decllc.biz>
+#
+# pystray is not in the MSYS2 repositories. This recipe builds it as an
+# ordinary pacman package for the Mail-Archiver Windows build, so that the
+# toolchain stays pacman-only (no pip). Build and install, from an
+# "MSYS2 UCRT64" shell, in this directory:
+#
+#   makepkg-mingw --syncdeps --cleanbuild --noconfirm
+#   pacman -U --noconfirm mingw-w64-ucrt-x86_64-python-pystray-0.19.5-1-any.pkg.tar.zst
+#
+# (MINGW_ARCH=ucrt64 makepkg-mingw ... from a plain MSYS shell does the same.)
+
+_realname=pystray
+pkgbase=mingw-w64-python-${_realname}
+pkgname=("${MINGW_PACKAGE_PREFIX}-python-${_realname}")
+pkgver=0.19.5
+pkgrel=1
+pkgdesc="System tray icon for Python applications (mingw-w64)"
+arch=('any')
+mingw_arch=('mingw64' 'ucrt64' 'clang64' 'clangarm64')
+url='https://github.com/moses-palmer/pystray'
+msys2_repository_url='https://github.com/moses-palmer/pystray'
+msys2_references=(
+  'purl: pkg:pypi/pystray'
+)
+license=('spdx:LGPL-3.0-or-later')
+depends=("${MINGW_PACKAGE_PREFIX}-python"
+         "${MINGW_PACKAGE_PREFIX}-python-pillow"
+         "${MINGW_PACKAGE_PREFIX}-python-six")
+makedepends=("${MINGW_PACKAGE_PREFIX}-python-build"
+             "${MINGW_PACKAGE_PREFIX}-python-installer"
+             "${MINGW_PACKAGE_PREFIX}-python-setuptools"
+             "${MINGW_PACKAGE_PREFIX}-python-wheel")
+source=("${_realname}-${pkgver}.tar.gz::https://github.com/moses-palmer/pystray/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('2ab6bd15c14b400c9e8271a82c9de8adc0f1a0cacfc14080bdd4fb42bb88ec92')
+
+prepare() {
+  cd "${srcdir}/${_realname}-${pkgver}"
+
+  # setup.py lists Pillow, six and sphinx in setup_requires. setuptools
+  # would try to download whatever of those is missing; the build must
+  # never fetch anything, so the line goes. (Pillow and six are real
+  # dependencies and come from pacman; sphinx only builds the HTML docs.)
+  sed -i '/^    setup_requires=/d' setup.py
+  # test_suite is a keyword of the removed "setup.py test" command.
+  sed -i "/^    test_suite=/d" setup.py
+  if grep -nE 'setup_requires=|test_suite=' setup.py; then
+    echo "prepare: setup.py still has setup_requires/test_suite" >&2
+    return 1
+  fi
+
+  # "[bdist_wheel] universal = 1" is deprecated in current setuptools; the
+  # package is Python 3 only here.
+  sed -i '/^\[bdist_wheel\]/,/^$/d' setup.cfg
+}
+
+build() {
+  cd "${srcdir}"
+  rm -rf "python-build-${MSYSTEM}"
+  cp -r "${_realname}-${pkgver}" "python-build-${MSYSTEM}"
+  cd "python-build-${MSYSTEM}"
+
+  ${MINGW_PREFIX}/bin/python -m build --wheel --no-isolation --skip-dependency-check
+}
+
+check() {
+  cd "${srcdir}/python-build-${MSYSTEM}"
+
+  # The upstream tests are interactive (they ask a person to click the
+  # icon), so only prove that the Windows backend imports from the wheel
+  # sources.
+  PYTHONPATH="${PWD}/lib" PYSTRAY_BACKEND=win32 \
+    ${MINGW_PREFIX}/bin/python -c "import pystray, pystray._info, pystray._win32; print('pystray', '.'.join(str(v) for v in pystray._info.__version__))"
+}
+
+package() {
+  cd "${srcdir}/python-build-${MSYSTEM}"
+
+  MSYS2_ARG_CONV_EXCL="--prefix=" \
+    ${MINGW_PREFIX}/bin/python -m installer --prefix=${MINGW_PREFIX} \
+    --destdir="${pkgdir}" dist/*.whl
+
+  install -Dm644 COPYING "${pkgdir}${MINGW_PREFIX}/share/licenses/python-${_realname}/COPYING"
+  install -Dm644 COPYING.LGPL "${pkgdir}${MINGW_PREFIX}/share/licenses/python-${_realname}/COPYING.LGPL"
+}

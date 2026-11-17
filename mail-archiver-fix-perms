@@ -1,0 +1,102 @@
+#!/bin/bash
+# mail-archiver-fix-perms: make the installed application tree root's.
+#
+# Run by the package scripts on every install and upgrade (deb postinst,
+# rpm %post). Everything the service executes must be owned by root and
+# writable by nobody else; otherwise an ordinary account can replace
+# application code that then runs with the service's privileges or, from
+# the hourly cron, as root.
+#
+# Background: on one host /opt/mail-archiver, templates/ and static/ were
+# owned by an ordinary account, mode 775, left by an old copy-the-files deploy.
+# dpkg does not reset the owner or mode of a directory that already exists,
+# so no package upgrade ever repaired it. Stale __pycache__ entries written
+# by mailbox owners were found as well.
+#
+# What it does (and prints, one line per repair):
+#   - /opt/mail-archiver and everything in it except certs/ and .secret_key
+#     (those belong to the service account, set by the package script):
+#     owner and group -> root, group/other write bits removed
+#   - the helpers in /usr/libexec, the cron file and the unit files: same
+#   - /opt/mail-archiver/__pycache__ is rebuilt by root, so the bytecode the
+#     service loads was compiled from the packaged sources by root
+# Links are never followed and never changed.
+#
+# usage: mail-archiver-fix-perms [--check] [--root DIR] [--owner UID:GID]
+#   --check   report only; exit 1 if anything would be repaired
+#   --root    prefix for all paths (tests)
+#   --owner   owner to enforce instead of 0:0 (tests)
+set -u
+CHECK=0; ROOT=""; OWNER="0:0"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) CHECK=1 ;;
+        --root)  ROOT="${2%/}"; shift ;;
+        --owner) OWNER="$2"; shift ;;
+        *) echo "usage: $0 [--check] [--root DIR] [--owner UID:GID]" >&2; exit 2 ;;
+    esac
+    shift
+done
+WANT_UID="${OWNER%%:*}"; WANT_GID="${OWNER##*:}"
+APP="$ROOT/opt/mail-archiver"
+found=0
+
+fix_one() {
+    # $1 = a regular file or a directory (never a link)
+    local p="$1" uid gid mode
+    uid=$(stat -c %u -- "$p") || return 0
+    gid=$(stat -c %g -- "$p"); mode=$(stat -c %a -- "$p")
+    if [ "$uid" != "$WANT_UID" ] || [ "$gid" != "$WANT_GID" ]; then
+        found=$((found + 1))
+        if [ "$CHECK" = 1 ]; then echo "mail-archiver-fix-perms: WRONG OWNER $uid:$gid $p"
+        else chown -h "$WANT_UID:$WANT_GID" -- "$p" && echo "mail-archiver-fix-perms: owner $uid:$gid -> $WANT_UID:$WANT_GID $p"; fi
+    fi
+    if [ -n "$(find "$p" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
+        found=$((found + 1))
+        if [ "$CHECK" = 1 ]; then echo "mail-archiver-fix-perms: WRITABLE BY OTHERS (mode $mode) $p"
+        else chmod go-w -- "$p" && echo "mail-archiver-fix-perms: mode $mode -> $(stat -c %a -- "$p") $p"; fi
+    fi
+}
+
+if [ -d "$APP" ] && [ ! -L "$APP" ]; then
+    while IFS= read -r -d '' p; do
+        fix_one "$p"
+    done < <(find "$APP" -xdev \
+                 \( -path "$APP/certs" -o -path "$APP/.secret_key" -o -path "$APP/__pycache__" \) -prune \
+                 -o \( -type f -o -type d \) -print0)
+
+    # Bytecode: drop whatever is there and let root compile the packaged sources.
+    if [ -e "$APP/__pycache__" ] || [ -L "$APP/__pycache__" ]; then
+        stale=$(find "$APP/__pycache__" -maxdepth 1 \( ! -uid "$WANT_UID" -o -perm /022 \) 2>/dev/null | wc -l)
+        if [ "$stale" -gt 0 ] || [ -L "$APP/__pycache__" ]; then
+            found=$((found + 1))
+            [ "$CHECK" = 1 ] && echo "mail-archiver-fix-perms: STALE BYTECODE ($stale entries not root's) $APP/__pycache__"
+        fi
+    fi
+    if [ "$CHECK" = 0 ]; then
+        rm -rf -- "$APP/__pycache__"
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -m compileall -q -l "$APP" >/dev/null 2>&1 || true
+            if [ -d "$APP/__pycache__" ] && [ ! -L "$APP/__pycache__" ]; then
+                chown -R -h "$WANT_UID:$WANT_GID" -- "$APP/__pycache__"
+                chmod -R go-w -- "$APP/__pycache__"
+            fi
+        fi
+    fi
+fi
+
+for p in "$ROOT/usr/libexec/mail-archiver-cred" "$ROOT/usr/libexec/mail-archiver-scheduled-sync" \
+         "$ROOT/usr/libexec/mail-archiver-fix-perms" "$ROOT/etc/cron.d/mail-archiver" \
+         "$ROOT/etc/systemd/system/mail-archiver.service" \
+         "$ROOT"/lib/systemd/system/mail-archiver-* "$ROOT"/usr/lib/systemd/system/mail-archiver-* \
+         "$ROOT/usr/lib/tmpfiles.d/mail-archiver.conf"; do
+    [ -L "$p" ] && continue
+    [ -f "$p" ] && fix_one "$p"
+done
+
+if [ "$CHECK" = 1 ]; then
+    [ "$found" -eq 0 ] && echo "mail-archiver-fix-perms: ownership and permissions are correct"
+    [ "$found" -eq 0 ]; exit $?
+fi
+[ "$found" -eq 0 ] || echo "mail-archiver-fix-perms: $found repair(s) made"
+exit 0

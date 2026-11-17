@@ -1,0 +1,31 @@
+#!/bin/bash
+# Hourly scheduled sync, run by /etc/cron.d/mail-archiver as root.
+#
+# 1.1.7: cron gives a bare environment, but the app needs the same
+# MAIL_ARCHIVER_* settings as mail-archiver.service (the secret file since
+# 1.1.3, the data path set by a host drop-in). Take them from the unit
+# instead of hard-coding them in the cron line, so a drop-in override is
+# honoured and a package upgrade cannot lose it.
+set -euo pipefail
+while IFS= read -r kv; do
+    case "$kv" in
+        MAIL_ARCHIVER_*=*) export "$kv" ;;
+    esac
+done < <(systemctl show mail-archiver -p Environment --value | tr ' ' '\n')
+# 1.3.0: an optional argument picks the job. `import` is the hourly mail
+# import check (same cron mechanism, same environment); `pst-import` is its
+# old name and still works. `bulk-sync` is the hourly check of the initial /
+# rebase sync jobs. Arguments after the job go to app.py, e.g.
+#   mail-archiver-scheduled-sync bulk-sync --list
+#   mail-archiver-scheduled-sync bulk-sync --reconcile --user U --account E
+#   mail-archiver-scheduled-sync import --user NAME --manual
+#   mail-archiver-scheduled-sync import --user NAME --ledger
+case "${1:-scheduled-sync}" in
+    scheduled-sync)     job=scheduled-sync ;;
+    import|pst-import)  job=import ;;
+    bulk-sync)          job=bulk-sync ;;
+    *) echo "usage: $0 [scheduled-sync|import [options]|bulk-sync [options]]" >&2; exit 2 ;;
+esac
+[ "$#" -gt 0 ] && shift
+cd /opt/mail-archiver
+exec python3 app.py "$job" "$@"

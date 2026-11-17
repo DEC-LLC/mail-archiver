@@ -1,13 +1,7 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — Login</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-<body>
-    <div class="container login-container">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — Login{% endblock %}
+{% block content %}
+    <div class="login-container">
         <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC" style="height:64px;margin-bottom:12px;"></a>
         <h1 style="color:#0f2b46;">Mail Archiver</h1>
         <p class="subtitle">Email backup &amp; archive by DEC-LLC</p>
@@ -20,6 +14,10 @@
         {% endif %}
         {% endwith %}
 
+        {% if auth_unavailable %}
+        <p id="auth-unavailable" style="margin:0 0 1rem;color:#a8341f">{{ auth_unavailable }}</p>
+        {% endif %}
+
         <form method="post" action="{{ url_for('login') }}">
             <label for="username">Username</label>
             <input type="text" id="username" name="username" autofocus required
@@ -31,11 +29,10 @@
 
             <button type="submit" class="btn btn-primary" style="width:100%;margin-top:1.5rem">Log In</button>
         </form>
-        {% if auth_mode == 'builtin' %}
+        {% if auth_mode == 'builtin' and registration_open() %}
         <p style="margin-top:1rem;font-size:0.9rem;color:#666">
             No account? <a href="{{ url_for('register') }}">Create one</a>
         </p>
         {% endif %}
     </div>
-</body>
-</html>
+{% endblock %}

@@ -1,9 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <title>Mail Archiver — App Detail</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — App Detail{% endblock %}
+{% block head_extra %}
     <style>
     table.dtl { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
     table.dtl th, table.dtl td { border-bottom: 1px solid #eee; padding: 0.35rem 0.5rem; text-align: left; }
@@ -14,9 +11,8 @@
     .status-error { color: #c62828; }
     .status-ok { color: #2e7d32; }
     </style>
-</head>
-<body>
-<div class="container">
+{% endblock %}
+{% block content %}
     <header>
         <h1>App Detail</h1>
         <div class="user-info">
@@ -122,8 +118,8 @@
         No completed syncs in log window.
     {% endif %}
     </p>
-</div>
-
+{% endblock %}
+{% block scripts %}
 <script>
 function refreshToken(user, email) {
     var el = document.getElementById('refresh-' + user + '-' + email);
@@ -142,5 +138,4 @@ function cancelJob(jobId) {
       .then(function () { setTimeout(function () { window.location.reload(); }, 500); });
 }
 </script>
-</body>
-</html>
+{% endblock %}

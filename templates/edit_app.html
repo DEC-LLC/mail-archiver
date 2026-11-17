@@ -1,13 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — {{ 'Edit' if app else 'New' }} OAuth App</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-<body>
-    <div class="container">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — {{ 'Edit' if app else 'New' }} OAuth App{% endblock %}
+{% block content %}
         <header>
             <div class="logo-header">
                 <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
@@ -54,7 +47,7 @@
                 <label for="name">Friendly name</label>
                 <input type="text" id="name" name="name" required
                        value="{{ form.name }}"
-                       placeholder="e.g. Family Microsoft App, or Work Tenant">
+                       placeholder="e.g. Home Microsoft App, or Work Tenant">
 
                 <label for="tenant">Microsoft Tenant</label>
                 <input type="text" id="tenant" name="tenant"
@@ -109,6 +102,4 @@
             <span class="help-text" style="margin-left:1em;">Delete is refused if any account still uses this app. Reassign accounts first.</span>
         </form>
         {% endif %}
-    </div>
-</body>
-</html>
+{% endblock %}

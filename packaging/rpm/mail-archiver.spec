@@ -1,25 +1,48 @@
 Name:           mail-archiver
-Version:        1.1.0
+Version:        1.3.3
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
-URL:            https://dec-llc.biz
+URL:            https://github.com/DEC-LLC/mail-archiver
+# `git archive` of the release commit plus BUILD_INFO: packaging/make-source.sh
+Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
+
+# The package is files copied into place. Leave them byte for byte as the
+# source has them (the deb ships the same files): no shebang rewriting.
+%undefine __brp_mangle_shebangs
 
 Requires:       python3-flask
 Requires:       python3-gunicorn
 Requires:       isync
 Requires:       python3-pam
+# The three scheduled jobs are a file in /etc/cron.d (1.3.3: was not required,
+# so a minimal EL install had no scheduled sync).
+Requires:       cronie
+# 1.3.0: PST import (readpst; EPEL libpst)
+Requires:       /usr/bin/readpst
+Recommends:     zstd
+# .msg import (msgconvert, perl-Email-Outlook-Message). Required since 1.3.1:
+# as a weak dependency it was never pulled in by an upgrade.
+Requires:       /usr/bin/msgconvert
 # XOAUTH2 SASL plugin — Microsoft Exchange IMAP requires it. Rocky/RHEL
 # gets it via EPEL as cyrus-sasl-xoauth2. Weak dep so install still
 # proceeds on hosts without EPEL (personal accounts still work).
 Recommends:     cyrus-sasl-xoauth2
 
 %description
-Mail Archiver is a self-hosted email archive with full-text search.
-Supports Gmail, iCloud, and Outlook/Hotmail via IMAP. Features SQLite
-FTS5 search index, Microsoft OAuth2, export as MBOX/EML, and scheduled
-sync with per-account intervals.
+Mail Archiver is a self-hosted email archive supporting Gmail, iCloud,
+and Outlook/Hotmail via IMAP. Features SQLite FTS5 search index,
+Microsoft OAuth2, MBOX/EML export, scheduled sync, mail import (PST,
+mbox, Maildir, eml/emlx, msg, zip/tar) from per-account import folders
+with an import ledger, and a budgeted initial / rebase sync for very
+large folders.
+
+%prep
+%setup -q
+
+%build
+# nothing to build
 
 %install
 mkdir -p %{buildroot}/opt/mail-archiver/templates
@@ -31,51 +54,63 @@ mkdir -p %{buildroot}/usr/lib/systemd/system
 mkdir -p %{buildroot}/usr/lib/tmpfiles.d
 
 # Application files
-install -m 644 %{_sourcedir}/app.py %{buildroot}/opt/mail-archiver/app.py
-install -m 644 %{_sourcedir}/search_index.py %{buildroot}/opt/mail-archiver/search_index.py
-install -m 644 %{_sourcedir}/oauth2_microsoft.py %{buildroot}/opt/mail-archiver/oauth2_microsoft.py
-[ -f %{_sourcedir}/imap_sync.py ] && install -m 644 %{_sourcedir}/imap_sync.py %{buildroot}/opt/mail-archiver/imap_sync.py || true
-install -m 644 %{_sourcedir}/mail_batcher.py %{buildroot}/opt/mail-archiver/mail_batcher.py
-install -m 644 %{_sourcedir}/admin.py %{buildroot}/opt/mail-archiver/admin.py
-install -m 644 %{_sourcedir}/sync_lifecycle.py %{buildroot}/opt/mail-archiver/sync_lifecycle.py
-install -m 644 %{_sourcedir}/gunicorn.conf.py %{buildroot}/opt/mail-archiver/gunicorn.conf.py
-install -m 644 %{_sourcedir}/VERSION %{buildroot}/opt/mail-archiver/VERSION
-install -m 755 %{_sourcedir}/generate-cert.sh %{buildroot}/opt/mail-archiver/generate-cert.sh
-install -m 755 %{_sourcedir}/install-tls-cert.sh %{buildroot}/opt/mail-archiver/install-tls-cert.sh
-install -m 644 %{_sourcedir}/tls-sources.conf.example %{buildroot}/opt/mail-archiver/tls-sources.conf.example
-install -m 755 %{_sourcedir}/mail-archiver-cred %{buildroot}/usr/libexec/mail-archiver-cred
+install -m 644 app.py %{buildroot}/opt/mail-archiver/app.py
+install -m 644 search_index.py %{buildroot}/opt/mail-archiver/search_index.py
+install -m 644 oauth2_microsoft.py %{buildroot}/opt/mail-archiver/oauth2_microsoft.py
+install -m 644 imap_sync.py %{buildroot}/opt/mail-archiver/imap_sync.py
+install -m 644 mail_batcher.py %{buildroot}/opt/mail-archiver/mail_batcher.py
+install -m 644 admin.py %{buildroot}/opt/mail-archiver/admin.py
+install -m 644 sync_lifecycle.py %{buildroot}/opt/mail-archiver/sync_lifecycle.py
+install -m 644 pst_import.py %{buildroot}/opt/mail-archiver/pst_import.py
+install -m 644 mail_import.py %{buildroot}/opt/mail-archiver/mail_import.py
+install -m 644 bulk_sync.py %{buildroot}/opt/mail-archiver/bulk_sync.py
+install -m 644 bulk_sync_routes.py %{buildroot}/opt/mail-archiver/bulk_sync_routes.py
+install -m 644 layout.py %{buildroot}/opt/mail-archiver/layout.py
+install -m 644 platform_compat.py %{buildroot}/opt/mail-archiver/platform_compat.py
+# BUILD_INFO comes with the source (commit, date); the builder line is added here.
+{ cat BUILD_INFO; echo "builder=$(. /etc/os-release 2>/dev/null; echo "${ID:-unknown}:${VERSION_ID%%%%.*}")"; } > %{buildroot}/opt/mail-archiver/BUILD_INFO
+chmod 644 %{buildroot}/opt/mail-archiver/BUILD_INFO
+install -m 644 gunicorn.conf.py %{buildroot}/opt/mail-archiver/gunicorn.conf.py
+install -m 644 VERSION %{buildroot}/opt/mail-archiver/VERSION
+install -m 755 generate-cert.sh %{buildroot}/opt/mail-archiver/generate-cert.sh
+install -m 755 install-tls-cert.sh %{buildroot}/opt/mail-archiver/install-tls-cert.sh
+install -m 644 tls-sources.conf.example %{buildroot}/opt/mail-archiver/tls-sources.conf.example
+install -m 755 mail-archiver-cred %{buildroot}/usr/libexec/mail-archiver-cred
+install -m 755 mail-archiver-scheduled-sync %{buildroot}/usr/libexec/mail-archiver-scheduled-sync
+install -m 755 mail-archiver-fix-perms %{buildroot}/usr/libexec/mail-archiver-fix-perms
 
 # 1.0.18: restart trigger — path+service pair. WebUI (as mail-archiver)
 # touches /run/mail-archiver/restart-requested; path unit fires the
 # service which runs `systemctl restart mail-archiver` as root.
-install -m 644 %{_sourcedir}/systemd/mail-archiver-restart.path %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.path
-install -m 644 %{_sourcedir}/systemd/mail-archiver-restart.service %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.service
+install -m 644 packaging/systemd/mail-archiver-restart.path %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.path
+install -m 644 packaging/systemd/mail-archiver-restart.service %{buildroot}/usr/lib/systemd/system/mail-archiver-restart.service
 # 1.1.0: parent slice for sync scopes + oauth-refresh timer/service
-install -m 644 %{_sourcedir}/systemd/mail-archiver-syncs.slice %{buildroot}/usr/lib/systemd/system/mail-archiver-syncs.slice
-install -m 644 %{_sourcedir}/systemd/mail-archiver-oauth-refresh.service %{buildroot}/usr/lib/systemd/system/mail-archiver-oauth-refresh.service
-install -m 644 %{_sourcedir}/systemd/mail-archiver-oauth-refresh.timer %{buildroot}/usr/lib/systemd/system/mail-archiver-oauth-refresh.timer
-install -m 644 %{_sourcedir}/tmpfiles.d/mail-archiver.conf %{buildroot}/usr/lib/tmpfiles.d/mail-archiver.conf
+install -m 644 packaging/systemd/mail-archiver-syncs.slice %{buildroot}/usr/lib/systemd/system/mail-archiver-syncs.slice
+install -m 644 packaging/systemd/mail-archiver-oauth-refresh.service %{buildroot}/usr/lib/systemd/system/mail-archiver-oauth-refresh.service
+install -m 644 packaging/systemd/mail-archiver-oauth-refresh.timer %{buildroot}/usr/lib/systemd/system/mail-archiver-oauth-refresh.timer
+install -m 644 packaging/tmpfiles.d/mail-archiver.conf %{buildroot}/usr/lib/tmpfiles.d/mail-archiver.conf
 
 # Templates
-for t in %{_sourcedir}/templates/*.html; do
+for t in templates/*.html; do
     install -m 644 "$t" %{buildroot}/opt/mail-archiver/templates/
 done
 
 # Static files
-for s in %{_sourcedir}/static/*.css; do
+for s in static/*.css static/*.svg; do
     install -m 644 "$s" %{buildroot}/opt/mail-archiver/static/
 done
 
 # systemd service
-install -m 644 %{_sourcedir}/mail-archiver.service %{buildroot}/etc/systemd/system/mail-archiver.service
+install -m 644 mail-archiver.service %{buildroot}/etc/systemd/system/mail-archiver.service
+# EL has no group `shadow` (the unit asks for it so pam_unix can check
+# passwords on Debian); with the line present the unit fails with 216/GROUP.
+sed -i '/^SupplementaryGroups=shadow$/d' %{buildroot}/etc/systemd/system/mail-archiver.service
 
-# cron job for scheduled sync
-cat > %{buildroot}/etc/cron.d/mail-archiver << 'CRON'
-# Hourly scheduled sync — respects per-account intervals, auto-staggered
-0 * * * * root cd /opt/mail-archiver && python3 app.py scheduled-sync >> /var/log/mail-archiver-sync.log 2>&1
-CRON
+# cron job for scheduled sync (the same file the deb installs)
+install -m 644 packaging/cron.d/mail-archiver %{buildroot}/etc/cron.d/mail-archiver
 
 %files
+%license LICENSE NOTICE
 %dir /opt/mail-archiver
 %dir /opt/mail-archiver/templates
 %dir /opt/mail-archiver/static
@@ -86,14 +121,24 @@ CRON
 /opt/mail-archiver/mail_batcher.py
 /opt/mail-archiver/admin.py
 /opt/mail-archiver/sync_lifecycle.py
+/opt/mail-archiver/pst_import.py
+/opt/mail-archiver/mail_import.py
+/opt/mail-archiver/bulk_sync.py
+/opt/mail-archiver/bulk_sync_routes.py
+/opt/mail-archiver/layout.py
+/opt/mail-archiver/platform_compat.py
+/opt/mail-archiver/BUILD_INFO
 /opt/mail-archiver/gunicorn.conf.py
 /opt/mail-archiver/generate-cert.sh
 /opt/mail-archiver/install-tls-cert.sh
 /opt/mail-archiver/tls-sources.conf.example
 /opt/mail-archiver/VERSION
 /usr/libexec/mail-archiver-cred
+/usr/libexec/mail-archiver-scheduled-sync
+/usr/libexec/mail-archiver-fix-perms
 /opt/mail-archiver/templates/*.html
 /opt/mail-archiver/static/*.css
+/opt/mail-archiver/static/*.svg
 /etc/systemd/system/mail-archiver.service
 /usr/lib/systemd/system/mail-archiver-restart.path
 /usr/lib/systemd/system/mail-archiver-restart.service
@@ -125,14 +170,26 @@ mkdir -p /opt/mail-archiver/certs
 chown mail-archiver:mail-archiver /opt/mail-archiver/certs
 chmod 0750 /opt/mail-archiver/certs
 
+# 1.3.1: the application tree is root's, on every install and upgrade.
+# dpkg/rpm do not reset the owner or mode of a directory that already
+# exists, so a tree left by an old copy-the-files deploy stayed writable by
+# an ordinary account (seen in 2026-11: /opt/mail-archiver owned by uid 1001,
+# mode 775). The helper repairs owner and mode, prints each repair, and
+# rebuilds __pycache__ as root.
+if [ -x /usr/libexec/mail-archiver-fix-perms ]; then
+    /usr/libexec/mail-archiver-fix-perms || true
+fi
+
 # Cron log preseed — cron runs as root, WebUI service runs as mail-archiver;
 # 0640 root:mail-archiver keeps both able to append.
-touch /var/log/mail-archiver-sync.log
-chown root:mail-archiver /var/log/mail-archiver-sync.log
-chmod 0640 /var/log/mail-archiver-sync.log
+touch /var/log/mail-archiver-sync.log /var/log/mail-archiver-import.log /var/log/mail-archiver-bulk-sync.log
+chown root:mail-archiver /var/log/mail-archiver-sync.log /var/log/mail-archiver-import.log /var/log/mail-archiver-bulk-sync.log
+chmod 0640 /var/log/mail-archiver-sync.log /var/log/mail-archiver-import.log /var/log/mail-archiver-bulk-sync.log
 
-# Default data root
-mkdir -p /datapool/email-archive 2>/dev/null || mkdir -p /var/lib/mail-archiver
+# Default data root: the directory the service unit names (MAIL_ARCHIVER_DATA,
+# ReadWritePaths). Until 1.3.2 another directory was created here and the
+# service could not start on a fresh EL install.
+mkdir -p /var/lib/mail-archiver
 
 # Add all local human users to mail-archiver group so mbsync PassCmd can
 # read the shared secret key. Additive — never removes memberships. Safe
@@ -264,12 +321,12 @@ systemctl start mail-archiver-syncs.slice 2>/dev/null || true
 systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
 systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
 
-echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
+echo "Mail Archiver installed. Data directory: /var/lib/mail-archiver (to change it, use a drop-in: systemctl edit mail-archiver)."
 echo "Then: systemctl enable --now mail-archiver"
 echo ""
 echo "Admin access: grant users membership in 'mail-archiver-admins':"
 echo "  sudo usermod -aG mail-archiver-admins <username>"
-echo "  (log out and back in for group membership to apply)"
+echo "  (takes effect within a minute; no restart needed)"
 
 %preun
 if [ "$1" = "0" ]; then
@@ -278,6 +335,53 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Mon Nov 16 2026 Madhav Diwan <madhav@decllc.biz> - 1.3.3-1
+- Built from a source tarball (Source0); an SRPM is produced with every
+  build. The cron file is the one the deb installs (comment wording only).
+- Fix: search_index.py did not import on Python 3.9 (this platform), so
+  search and mail import failed in the rpm from 1.3.0 to 1.3.2.
+- The service starts on a fresh EL 9 install: /var/lib/mail-archiver is
+  created, the unit no longer names the group shadow, cronie is required,
+  and the CA bundle of the platform is found.
+- Server-wide OAuth apps are written by administrators only; with built-in
+  sign-in, administrators are the names in MAIL_ARCHIVER_ADMIN_USERS.
+
+* Mon Nov 16 2026 Madhav Diwan <madhav@decllc.biz> - 1.3.2-1
+- Security: the built-in IMAP client (hosts without isync) does STARTTLS for
+  accounts set to it and never logs in over an unencrypted connection.
+- Search export reads only files in the signed-in user's own folder.
+- A "syncing" status with no sync running reads "interrupted"; corrected on
+  read, on the hourly schedule and at service start (gunicorn post_worker_init).
+
+* Sat Nov 14 2026 Madhav Diwan <madhav@decllc.biz> - 1.3.1-1
+- Shared code base for the Windows application: POSIX-only calls go through
+  platform_compat.py (new module, installed with the others). No change in
+  behaviour on Linux.
+- Security: /email/view and /email/attachment accept only paths inside the
+  signed-in user's own folder (was: anywhere in the data directory).
+- Security: the built-in IMAP client (imaplib) verifies the server
+  certificate and host name; it checked neither before.
+- imaplib sync: custom IMAP server host honoured; a refused sign-in is an
+  error, not a clean sync.
+- Every install and upgrade runs /usr/libexec/mail-archiver-fix-perms: the
+  application tree, the helpers, the cron file and the units are set to
+  root:root without group/other write, and __pycache__ is rebuilt by root.
+- msgconvert (.msg import) is a hard requirement instead of a weak one.
+* Sun Nov 08 2026 Madhav Diwan <madhav@decllc.biz> - 1.3.0-1
+- PST import. Outlook .pst exports import into a chosen account of a user
+  with readpst (pst-utils), keeping the PST folder tree as Maildir folders.
+  Messages already in the account (Message-ID, else a content hash) are
+  skipped, so a weekly full export adds only new mail. Imported mail is
+  indexed and searchable. Conversion runs as the mailbox owner.
+- Scheduled import from <data_dir>/<user>/_import/watch/ (producer contract:
+  .incoming/ staging, <file>.pst.sha256 sidecar renamed in first, atomic
+  rename of <name>-YYYYMMDD.pst). Sidecar verified, two-check stability,
+  filename -> account mapping, per-user hourly/daily/weekly schedule run by
+  a second line in /etc/cron.d/mail-archiver through the same wrapper.
+- Imported PSTs move to _import/archive/ (zstd when installed). Retention:
+  last 4 copies + newest of each of the 3 previous months; rotation stops
+  while the latest import is not ok. Failed files go to _import/failed/.
+- WebUI: Import PST page (status, history, settings, upload, retry).
 * Fri Aug 21 2026 Madhav Diwan <madhav@decllc.biz> - 1.1.0-1
 - Sync lifecycle is now a first-class citizen. Runtime-model change,
   not new user-facing features — dashboard/settings/OAuth flows are
@@ -534,7 +638,7 @@ fi
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.10-1
 - Add-page OAuth picker (Item 1): /account/add now shows the same
   OAuth-app dropdown that was previously only on /account/<email>/edit,
-  so onboarding a family Hotmail is one form (pick app + email + save)
+  so onboarding a Hotmail account is one form (pick app + email + save)
   instead of add → dashboard → Settings → pick → back → Sign in. JS
   toggles the picker's visibility to match the provider's auth type.
 - imap_sync.py chown-on-write (T5 deferred from 1.0.5): ImapSyncer now
@@ -573,13 +677,13 @@ fi
   The .office.com variant is the unified endpoint accepted by both
   personal + work/school flows. Blocks OAuth token exchange until fixed
   — no accounts have ever successfully completed the flow with the old
-  scope (both pnas hosts had zero .oauth2.json / .token files despite
+  scope (no installation had any .oauth2.json / .token file despite
   multiple sign-in attempts since the OAuth flow was wired 4+ months ago).
 
 * Thu Aug 20 2026 Madhav Diwan <madhav@decllc.biz> - 1.0.8-1
 - OAuth Apps management: registered Azure apps are now named + reusable
   at two scopes (server-wide + per-user), with per-provider defaults and
-  per-account pinning. Solves the "different Azure app per family member
+  per-account pinning. Solves the "different Azure app per user
   / per tenant / per email account" case.
 - Data model v2: server config at ${DATA}/.oauth2_config.json becomes
   {apps: {srv-*: {...}}, defaults: {microsoft: srv-...}, _schema_version: 2}
@@ -587,7 +691,7 @@ fi
   usr-* prefix). Auto-migrates v1 legacy {microsoft: {client_id, secret}}
   to a named app srv-microsoft-default on first read, save-back to disk.
   Existing accounts (no oauth_app_id) resolve via the server default —
-  seamless upgrade for the current mvdiwan@hotmail.com flow.
+  seamless upgrade for accounts added before this release.
 - Server Settings page rewritten: two-table view (Server-wide + Your
   Private) with redacted secret hints, Make-default / Edit / Delete
   buttons per row. Delete refuses if any account still pins that app.
@@ -672,7 +776,7 @@ fi
   worker timeout 120s → 3600s to match mbsync subprocess timeout (T2).
 - Fix Microsoft OAuth2 token files unreadable by mbsync PassCmd:
   chown token + config dir to the target PAM user in save_oauth2_tokens
-  (T4). Unblocks family Hotmail account sync.
+  (T4). Unblocks Hotmail account sync.
 - UX: /account/add auto-redirects to Microsoft OAuth consent for
   oauth2 providers (was: silent redirect to dashboard leaving user
   with no way to complete auth).

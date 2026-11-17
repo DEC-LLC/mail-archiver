@@ -1,10 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — {{ username }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — {{ username }}{% endblock %}
+{% block head_extra %}
     <style>
     .sync-progress {
         margin: 0.5rem 0;
@@ -18,6 +14,11 @@
     .sync-progress.hidden { display: none; }
     .sync-progress.error { background: #fbe9e7; border-color: #d84315; }
     .sync-progress.done  { background: #e8f5e9; border-color: #388e3c; }
+    /* 1.1.7: "a sync is already running, your click was ignored" */
+    .sync-progress .refused { color: #a86a1f; font-weight: 600; margin-bottom: 0.35rem; }
+    #sync-guard-note { background: #fff8e1; border: 1px solid #a86a1f; border-radius: 5px;
+                       padding: 0.5rem 0.75rem; margin: 0.5rem 0; color: #16161a; }
+    #sync-guard-note.hidden { display: none; }
     .sync-progress-bar {
         height: 6px;
         background: #d6d9de;
@@ -60,9 +61,8 @@
         font-size: 0.85rem;
     }
     </style>
-</head>
-<body>
-    <div class="container">
+{% endblock %}
+{% block content %}
         <header>
             <div class="logo-header">
                 <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
@@ -103,8 +103,15 @@
             <a href="{{ url_for('add_account') }}" class="btn btn-primary">Add Email Account</a>
             {% if accounts %}
             <a href="{{ url_for('search') }}" class="btn">Search Archive</a>
-            <button type="button" class="btn sync-all-btn">Sync All</button>
+            <a href="{{ url_for('mail_import_page') }}" class="btn" title="Import mail files (PST, mbox, Maildir, eml, emlx, msg, zip, tar) into an account, by upload or from its import folder">Import mail</a>
+            <button type="button" class="btn sync-all-btn" {% if active_jobs %}disabled{% endif %}>{{ 'Syncing…' if active_jobs else 'Sync All' }}</button>
             {% endif %}
+        </div>
+
+        <div id="sync-guard-note" class="{{ '' if active_jobs else 'hidden' }}">
+            <strong>A sync is running.</strong> Please don't click Sync again &mdash; the
+            buttons stay off until it finishes, extra clicks are ignored, and nothing is
+            queued. A first sync of a large mailbox can take hours.
         </div>
 
         <div id="sync-all-status" class="sync-progress hidden" data-target="__all__"
@@ -129,6 +136,7 @@
                         {% if acct.status.get('state') == 'ok' %}Synced
                         {% elif acct.status.get('state') == 'error' %}Error
                         {% elif acct.status.get('state') == 'syncing' %}Syncing...
+                        {% elif acct.status.get('state') == 'interrupted' %}Interrupted
                         {% else %}Not synced{% endif %}
                     </div>
                 </div>
@@ -157,7 +165,8 @@
                      {% if active_jobs and active_jobs.get(acct.email) %}data-active-job="{{ active_jobs[acct.email] }}"{% endif %}></div>
 
                 <div class="account-actions">
-                    <button type="button" class="btn btn-small sync-now-btn" data-email="{{ acct.email }}" {% if not acct.enabled %}disabled{% endif %}>Sync Now</button>
+                    {% set acct_busy = active_jobs and (active_jobs.get('__all__') or active_jobs.get(acct.email)) %}
+                    <button type="button" class="btn btn-small sync-now-btn" data-email="{{ acct.email }}" data-acct-enabled="{{ '1' if acct.enabled else '0' }}" {% if not acct.enabled or acct_busy %}disabled{% endif %}>{{ 'Syncing…' if acct_busy else 'Sync Now' }}</button>
                     <form method="post" action="{{ url_for('toggle_account', email=acct.email) }}" style="display:inline">
                         <button type="submit" class="btn btn-small">{{ 'Enable' if not acct.enabled else 'Disable' }}</button>
                     </form>
@@ -174,6 +183,7 @@
                     <a href="{{ url_for('oauth2_authorize', email=acct.email) }}" class="btn btn-small" title="Grant this app access to your Microsoft mailbox via browser sign-in">Sign in with Microsoft</a>
                     {% endif %}
                     <a href="{{ url_for('edit_account', email=acct.email) }}" class="btn btn-small" title="Account settings — host, port, TLS, folders, client cert, password">Settings</a>
+                    <a href="{{ url_for('bulk_sync_account', email=acct.email) }}" class="btn btn-small" title="Download a very large folder over several days, or re-download a folder, outside the regular sync">Initial / rebase sync…</a>
 
                     <form method="post" action="{{ url_for('remove_account', email=acct.email) }}" style="display:inline"
                           onsubmit="return confirm('Remove {{ acct.email }}? Archived mail will NOT be deleted.')">
@@ -191,8 +201,8 @@
                 <span>Sync times are automatically staggered across accounts to avoid overloading mail servers.</span>
             </div>
         </footer>
-    </div>
-
+{% endblock %}
+{% block scripts %}
     <script>
     // ------------------------------------------------------------------
     // Live sync progress via Server-Sent Events (1.0.14)
@@ -271,46 +281,149 @@
             (msg.last_line ? '<div class="last-line">' + msg.last_line + '</div>' : '');
     }
 
-    // 1.1.0: split "start a new sync" from "attach to an existing job".
-    // Both share the SSE wiring below.
-    function _wireSSE(streamUrl, panel, target, isAll) {
-        var es = new EventSource(streamUrl);
+    // 1.1.7: one sync at a time per account (and "all" covers every account).
+    // The server enforces it (HTTP 409, nothing queued); the page also turns
+    // the buttons off so nobody is tempted to keep clicking.
+    var running = {};   // target -> true
+
+    function _covers(t, email) { return t === '__all__' || t === email; }
+
+    function refreshSyncButtons() {
+        var busy = Object.keys(running);
+        document.querySelectorAll('.sync-now-btn').forEach(function (b) {
+            var email = b.dataset.email;
+            var on = busy.some(function (t) { return _covers(t, email); });
+            b.disabled = on || b.dataset.acctEnabled === '0';
+            b.textContent = on ? 'Syncing…' : 'Sync Now';
+        });
+        var all = document.querySelector('.sync-all-btn');
+        if (all) {
+            all.disabled = busy.length > 0;
+            all.textContent = busy.length ? 'Syncing…' : 'Sync All';
+        }
+        var note = document.getElementById('sync-guard-note');
+        if (note) note.classList.toggle('hidden', busy.length === 0);
+    }
+    function markRunning(t) { running[t] = true; refreshSyncButtons(); }
+    function markIdle(t)    { delete running[t]; refreshSyncButtons(); }
+
+    function panelFor(target) {
+        if (target === '__all__') return document.getElementById('sync-all-status');
+        return document.querySelector(
+            '.sync-progress[data-target="' + target.replace(/"/g,'\\"') + '"]');
+    }
+
+    // 1.1.11: follow a job by BOTH the SSE stream and a 10s status poll,
+    // so the panel never sits on a message forever: a dropped stream, a
+    // scheduled sync that writes no progress, or a job whose worker died
+    // all still reach a final state. When the last sync ends the page
+    // reloads, so the account cards show the new status.
+    var following = {};   // job_id -> true
+
+    function _hhmm(s) {
+        var m = /(\d\d:\d\d)(:\d\d)?/.exec(s || '');
+        return m ? m[1] : 'earlier';
+    }
+
+    function renderState(panel, st) {
+        var since = _hhmm(st.started);
+        var line;
+        if (st.heartbeat === false) {
+            line = 'Scheduled sync running since ' + since + '. Live progress is ' +
+                   'not shown for scheduled syncs; this panel updates when it finishes.';
+        } else {
+            line = 'Sync running since ' + since + ' — waiting for the first progress update…';
+        }
+        panel.innerHTML = '<div class="sync-progress-line"></div>';
+        panel.firstChild.textContent = line;
+    }
+
+    function _reloadWhenIdle(panel) {
+        if (Object.keys(running).length) return;
+        var n = document.createElement('div');
+        n.style.marginTop = '0.35rem';
+        n.textContent = 'Refreshing the page in a few seconds to show the new status…';
+        panel.appendChild(n);
+        setTimeout(function () { window.location.reload(); }, 4000);
+    }
+
+    function followJob(jobId, panel, target) {
+        if (following[jobId]) return;
+        following[jobId] = true;
+        var isAll = target === '__all__';
+        var finished = false, sawProgress = false, poll = null;
+        var es = new EventSource('/api/sync/' + encodeURIComponent(jobId) + '/stream');
+
+        function finish(ok, msg) {
+            if (finished) return;
+            finished = true;
+            try { es.close(); } catch (e) {}
+            if (poll) clearInterval(poll);
+            delete following[jobId];
+            if (ok) renderDone(panel, msg || {}, isAll, target);
+            else renderError(panel, msg || {}, isAll, target);
+            markIdle(target);
+            _reloadWhenIdle(panel);
+        }
+
+        es.addEventListener('state', function (ev) {
+            if (sawProgress || finished) return;
+            try { renderState(panel, JSON.parse(ev.data)); } catch (e) {}
+        });
         es.addEventListener('progress', function (ev) {
+            if (finished) return;
+            sawProgress = true;
             try { renderProgress(panel, JSON.parse(ev.data)); } catch (e) {}
         });
         es.addEventListener('done', function (ev) {
-            try { renderDone(panel, JSON.parse(ev.data), isAll, target); }
-            catch (e) { renderDone(panel, {}, isAll, target); }
-            es.close();
+            var m = {}; try { m = JSON.parse(ev.data); } catch (e) {}
+            finish(true, m);
         });
         es.addEventListener('error', function (ev) {
             if (ev.data) {
-                try { renderError(panel, JSON.parse(ev.data), isAll, target); }
-                catch (e) { renderError(panel, {error: 'stream ended'}, isAll, target); }
-            } else if (es.readyState === EventSource.CLOSED) {
-                renderError(panel, {error: 'connection lost'}, isAll, target);
+                var m = {error: 'stream ended'};
+                try { m = JSON.parse(ev.data); } catch (e) {}
+                if (m.error === 'job_gone') finish(true, {});
+                else finish(false, m);
             }
-            es.close();
+            // No data = the connection dropped; the browser retries by
+            // itself and the status poll below is the backstop.
         });
         es.addEventListener('ping', function () { /* keepalive */ });
         es.addEventListener('timeout', function () {
-            renderError(panel, {error: 'stream timed out (>1h)'}, isAll, target);
-            es.close();
+            // The stream is capped at ~1h; keep following by polling.
+            try { es.close(); } catch (e) {}
         });
+
+        poll = setInterval(function () {
+            fetch('/api/sync/' + encodeURIComponent(jobId),
+                  {headers: {'Accept': 'application/json'}})
+            .then(function (r) {
+                if (r.status === 404) return {state: 'gone'};
+                return r.json();
+            }).then(function (j) {
+                if (finished || !j) return;
+                if (j.state === 'done') finish(true, j);
+                else if (j.state === 'gone') finish(true, {});
+                else if (j.state === 'error' || j.state === 'cancelled')
+                    finish(false, {error: j.error || j.state, last_line: j.last_line});
+            }).catch(function () {});
+        }, 10000);
     }
 
     function attachToJob(jobId, panel, target) {
-        // Reattach to an already-running job (page-load / logout-login /
-        // second-tab). Sync state lives on disk in 1.1.0, any worker
-        // serves the same job_id.
+        // Follow an already-running job (page load, logout/login, second
+        // tab, or a sync started by cron while this page is open).
         panel.classList.remove('hidden', 'error', 'done');
-        panel.innerHTML = '<div>Reconnecting to in-flight sync…</div>';
-        var isAll = target === '__all__';
-        _wireSSE('/api/sync/' + encodeURIComponent(jobId) + '/stream',
-                 panel, target, isAll);
+        panel.innerHTML = '<div>Checking the running sync…</div>';
+        markRunning(target);
+        followJob(jobId, panel, target);
     }
 
     function startSync(url, panel, target) {
+        // Turn the buttons off BEFORE the request, so a double-click never
+        // gets a second request out.
+        markRunning(target);
         panel.classList.remove('hidden', 'error', 'done');
         panel.innerHTML = '<div>Starting sync…</div>';
         var isAll = target === '__all__';
@@ -319,27 +432,63 @@
             headers: {'Accept': 'application/json',
                       'X-Requested-With': 'XMLHttpRequest'},
         }).then(function (r) {
+            if (r.status === 409) {
+                return r.json().then(function (busy) { throw {busy: busy}; });
+            }
             if (r.status !== 202) throw new Error('HTTP ' + r.status);
             return r.json();
         }).then(function (job) {
-            _wireSSE(job.stream_url, panel, target, isAll);
+            followJob(job.job_id, panel, target);
         }).catch(function (e) {
+            if (e && e.busy) {
+                // A sync covering this target is already in flight. Say so,
+                // and follow THAT sync instead of starting another.
+                var busy = e.busy;
+                markIdle(target);
+                var busyPanel = panelFor(busy.target || '__all__') || panel;
+                if (busyPanel !== panel) {
+                    panel.classList.remove('hidden', 'error', 'done');
+                    panel.innerHTML = '<div class="refused"></div>';
+                    panel.firstChild.textContent = busy.message;
+                }
+                attachToJob(busy.job_id, busyPanel, busy.target || '__all__');
+                var note = document.createElement('div');
+                note.className = 'refused';
+                note.textContent = busy.message;
+                busyPanel.insertBefore(note, busyPanel.firstChild);
+                return;
+            }
+            markIdle(target);
             renderError(panel, {error: 'Could not start sync: ' + e.message},
                         isAll, target);
         });
     }
 
-    // On page load, auto-reattach to any sync jobs the server flagged
-    // as still running for this user's accounts. Belt+braces: also poll
-    // /api/sync/active as fallback if the server-side render missed
-    // something (e.g. sync started after page render but before this JS
-    // executes).
+    // On page load, follow any sync jobs the server flagged as running.
+    // 1.1.11: then keep checking /api/sync/active every 30s, so a sync
+    // started elsewhere (cron, another tab, another device) shows up here
+    // and the page refreshes when it ends. (Earlier versions said they did
+    // this; they did not.)
+    function watchForSyncs() {
+        fetch('/api/sync/active', {headers: {'Accept': 'application/json'}})
+        .then(function (r) { return r.ok ? r.json() : {jobs: []}; })
+        .then(function (d) {
+            (d.jobs || []).forEach(function (job) {
+                if (following[job.job_id]) return;
+                var target = job.target || '__all__';
+                var panel = panelFor(target);
+                if (panel) attachToJob(job.job_id, panel, target);
+            });
+        }).catch(function () {});
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         document.querySelectorAll('.sync-progress[data-active-job]').forEach(function (panel) {
             var jobId = panel.getAttribute('data-active-job');
             var target = panel.getAttribute('data-target');
             if (jobId && target) attachToJob(jobId, panel, target);
         });
+        setInterval(watchForSyncs, 30000);
     });
 
     document.addEventListener('click', function (e) {
@@ -376,5 +525,4 @@
         sel.form.submit();
     }
     </script>
-</body>
-</html>
+{% endblock %}

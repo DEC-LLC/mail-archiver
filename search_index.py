@@ -11,6 +11,10 @@ All functions are safe to call from multiple threads (one connection per call).
 No external dependencies beyond Python stdlib.
 """
 
+# Annotations stay unevaluated: `dict | None` below is Python 3.10 syntax and
+# EL 9 runs Python 3.9, where it stopped this module from importing (1.3.3).
+from __future__ import annotations
+
 import email as email_mod
 import email.policy
 import email.utils
@@ -53,6 +57,78 @@ CREATE TABLE IF NOT EXISTS seen_ids (
 );
 """
 
+# 1.3.0 import ledger. It lives in the same per-user database as the index
+# (the index DB is the only per-user database; it sits with the mail on the
+# data disk). One row per imported file or directory; one row per retention
+# deletion or refused deletion (ADR retention-never-rotates-to-empty, R6).
+# mail_import.Ledger is the only reader/writer.
+_IMPORT_LEDGER_SCHEMA = (
+    """\
+CREATE TABLE IF NOT EXISTS import_ledger (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256         TEXT    NOT NULL DEFAULT '',
+    size_bytes     INTEGER NOT NULL DEFAULT 0,
+    original_name  TEXT    NOT NULL DEFAULT '',
+    detected_type  TEXT    NOT NULL DEFAULT '',
+    account        TEXT    NOT NULL DEFAULT '',
+    target_prefix  TEXT    NOT NULL DEFAULT '',
+    source         TEXT    NOT NULL DEFAULT '',
+    trigger        TEXT    NOT NULL DEFAULT '',
+    status         TEXT    NOT NULL DEFAULT 'queued',
+    imported       INTEGER NOT NULL DEFAULT 0,
+    duplicates     INTEGER NOT NULL DEFAULT 0,
+    failed         INTEGER NOT NULL DEFAULT 0,
+    too_large      INTEGER NOT NULL DEFAULT 0,
+    queued_at      TEXT    NOT NULL DEFAULT '',
+    started_at     TEXT    NOT NULL DEFAULT '',
+    finished_at    TEXT    NOT NULL DEFAULT '',
+    finished_epoch REAL    NOT NULL DEFAULT 0,
+    error          TEXT    NOT NULL DEFAULT '',
+    detail         TEXT    NOT NULL DEFAULT '{}'
+)""",
+    'CREATE INDEX IF NOT EXISTS import_ledger_sha ON import_ledger(sha256, account, status)',
+    'CREATE INDEX IF NOT EXISTS import_ledger_acct ON import_ledger(account, id)',
+    """\
+CREATE TABLE IF NOT EXISTS import_retention_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    at          TEXT    NOT NULL DEFAULT '',
+    at_epoch    REAL    NOT NULL DEFAULT 0,
+    account     TEXT    NOT NULL DEFAULT '',
+    series      TEXT    NOT NULL DEFAULT '',
+    action      TEXT    NOT NULL DEFAULT '',
+    rule        TEXT    NOT NULL DEFAULT '',
+    name        TEXT    NOT NULL DEFAULT '',
+    size_bytes  INTEGER NOT NULL DEFAULT 0,
+    copy_date   TEXT    NOT NULL DEFAULT '',
+    reason      TEXT    NOT NULL DEFAULT '',
+    ledger_id   INTEGER
+)""",
+)
+
+# Columns added after a table first shipped: (table, column, declaration).
+# ensure_import_ledger() adds whatever an existing database lacks, so a
+# newer package opens an older database (and the reverse) without a step
+# anyone has to run.
+_IMPORT_LEDGER_COLUMNS = (
+    ('import_ledger', 'source', "TEXT NOT NULL DEFAULT ''"),
+    ('import_ledger', 'queued_at', "TEXT NOT NULL DEFAULT ''"),
+    ('import_ledger', 'finished_epoch', 'REAL NOT NULL DEFAULT 0'),
+    ('import_retention_events', 'copy_date', "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def ensure_import_ledger(conn: sqlite3.Connection) -> None:
+    """Create the import ledger tables in an index database, new or
+    existing. Idempotent; never touches the index tables or existing rows."""
+    for stmt in _IMPORT_LEDGER_SCHEMA:
+        conn.execute(stmt)
+    for table, column, decl in _IMPORT_LEDGER_COLUMNS:
+        have = {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
+        if column not in have:
+            conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {decl}')
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Database setup
 # ---------------------------------------------------------------------------
@@ -73,6 +149,7 @@ def get_index_db(username: str, data_dir: str) -> sqlite3.Connection:
     conn.execute(_FTS5_SCHEMA)
     conn.execute(_SEEN_SCHEMA)
     conn.commit()
+    ensure_import_ledger(conn)
     return conn
 
 
@@ -282,7 +359,9 @@ def index_maildir(username: str, data_dir: str,
                 acct_dirs.append(candidate)
         else:
             for child in sorted(archive_dir.iterdir()):
-                if child.is_dir() and not child.name.startswith('.'):
+                # 1.3.0: _import/ holds PST files + work dirs, not mail
+                if (child.is_dir() and not child.name.startswith('.')
+                        and child.name != '_import'):
                     acct_dirs.append(child)
 
         for acct_dir in acct_dirs:
@@ -667,6 +746,28 @@ def get_index_stats(username: str, data_dir: str) -> dict:
     return stats
 
 
+def set_aside_corrupt_db(db_path) -> str:
+    """Rename a damaged index database (and its -wal / -shm files) to
+    `.search_index.db.corrupt-<timestamp>` next to it. Nothing is deleted.
+    Returns the new path."""
+    db_path = Path(db_path)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    dest = db_path.with_name(f'{db_path.name}.corrupt-{stamp}')
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = db_path.with_name(f'{db_path.name}.corrupt-{stamp}-{n}')
+    # os.replace, not os.rename: the same call on Linux, and on Windows it
+    # does not fail if the name is taken. Callers close their connection
+    # first (an open database cannot be moved on Windows).
+    os.replace(str(db_path), str(dest))
+    for suffix in ('-wal', '-shm'):
+        side = db_path.with_name(db_path.name + suffix)
+        if side.exists():
+            os.replace(str(side), str(dest) + suffix)
+    return str(dest)
+
+
 def rebuild_index(username: str, data_dir: str) -> dict:
     """Drop and rebuild the entire search index from Maildir.
 
@@ -675,10 +776,35 @@ def rebuild_index(username: str, data_dir: str) -> dict:
     user_dir = Path(data_dir) / username
     db_path = user_dir / '.search_index.db'
 
-    # Remove existing database files (WAL and SHM too)
-    for suffix in ('', '-wal', '-shm'):
-        p = Path(str(db_path) + suffix)
-        if p.exists():
-            p.unlink()
+    # 1.3.0: the database also holds the import ledger and the retention
+    # audit trail, so it is no longer deleted. Only the index tables are
+    # dropped; get_index_db() recreates them.
+    #
+    # A damaged database cannot be repaired that way (and before 1.3.0
+    # "rebuild" was the cure for one, because it deleted the file). It is
+    # moved aside - never deleted: it may still hold readable ledger rows -
+    # and a new database is created.
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=30)
+            try:
+                check = conn.execute('PRAGMA quick_check').fetchone()
+                if not check or check[0] != 'ok':
+                    raise sqlite3.DatabaseError(
+                        f'integrity check: {check[0] if check else "no result"}')
+                conn.execute('DROP TABLE IF EXISTS emails')
+                conn.execute('DROP TABLE IF EXISTS seen_ids')
+                conn.commit()
+                conn.execute('VACUUM')
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as e:
+            # Locked or busy is not damage; only these messages are.
+            text = str(e).lower()
+            if not any(w in text for w in ('malformed', 'corrupt', 'not a database')):
+                raise
+            set_aside_corrupt_db(db_path)
+        except sqlite3.DatabaseError:
+            set_aside_corrupt_db(db_path)
 
     return index_maildir(username, data_dir)

@@ -21,10 +21,20 @@ mkdir -p /opt/mail-archiver/certs
 chown mail-archiver:mail-archiver /opt/mail-archiver/certs
 chmod 0750 /opt/mail-archiver/certs
 
+# 1.3.1: the application tree is root's, on every install and upgrade.
+# dpkg/rpm do not reset the owner or mode of a directory that already
+# exists, so a tree left by an old copy-the-files deploy stayed writable by
+# an ordinary account (seen in 2026-11: /opt/mail-archiver owned by uid 1001,
+# mode 775). The helper repairs owner and mode, prints each repair, and
+# rebuilds __pycache__ as root.
+if [ -x /usr/libexec/mail-archiver-fix-perms ]; then
+    /usr/libexec/mail-archiver-fix-perms || true
+fi
+
 # Cron log preseed
-touch /var/log/mail-archiver-sync.log
-chown root:mail-archiver /var/log/mail-archiver-sync.log
-chmod 0640 /var/log/mail-archiver-sync.log
+touch /var/log/mail-archiver-sync.log /var/log/mail-archiver-import.log /var/log/mail-archiver-bulk-sync.log
+chown root:mail-archiver /var/log/mail-archiver-sync.log /var/log/mail-archiver-import.log /var/log/mail-archiver-bulk-sync.log
+chmod 0640 /var/log/mail-archiver-sync.log /var/log/mail-archiver-import.log /var/log/mail-archiver-bulk-sync.log
 
 # Default data root (do not overwrite operator-chosen MAIL_ARCHIVER_DATA)
 mkdir -p /var/lib/mail-archiver 2>/dev/null || true
@@ -183,9 +193,9 @@ systemctl start mail-archiver-syncs.slice 2>/dev/null || true
 systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
 systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
 
-echo "Mail Archiver installed. Edit /etc/systemd/system/mail-archiver.service to set MAIL_ARCHIVER_DATA."
+echo "Mail Archiver installed. Data directory: /var/lib/mail-archiver (to change it, use a drop-in: systemctl edit mail-archiver)."
 echo "Then: systemctl enable --now mail-archiver"
 echo ""
 echo "Admin access: grant users membership in 'mail-archiver-admins':"
 echo "  sudo usermod -aG mail-archiver-admins <username>"
-echo "  (log out and back in for group membership to apply)"
+echo "  (takes effect within a minute; no restart needed)"

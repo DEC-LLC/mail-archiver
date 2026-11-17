@@ -38,8 +38,12 @@ import uuid
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+import platform_compat as _pc
 
-JOB_STATE_DIR = '/run/mail-archiver/sync-jobs'
+
+# /run/mail-archiver/sync-jobs on Linux; on Windows `.run\sync-jobs` under
+# the data directory (platform_compat.runtime_dir, MAIL_ARCHIVER_RUN_DIR).
+JOB_STATE_DIR = os.path.join(_pc.runtime_dir(), 'sync-jobs')
 SCOPE_UNIT_PREFIX = 'mail-archiver-sync-'
 SLICE_NAME = 'mail-archiver-syncs.slice'
 
@@ -92,6 +96,19 @@ def new_job_id(user: str, email: Optional[str] = None) -> str:
 # Atomic state read/write
 # ---------------------------------------------------------------
 
+def _chown_like_dir(path: str, d: str) -> None:
+    """1.1.7: the cron path runs as root. A root:root 0640 state file is
+    unreadable to the mail-archiver service, so the WebUI would not see a
+    cron sync at all. Hand root-created files to the directory's owner."""
+    if not _pc.is_root():
+        return
+    try:
+        st = os.stat(d)
+        _pc.chown(path, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+
+
 def _atomic_write(path: str, payload: dict) -> bool:
     ensure_state_dir()
     d = os.path.dirname(path)
@@ -101,13 +118,16 @@ def _atomic_write(path: str, payload: dict) -> bool:
     except OSError:
         return False
     try:
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(payload, f, separators=(',', ':'))
         try:
             os.chmod(tmp, 0o640)
         except OSError:
             pass
-        os.rename(tmp, path)
+        _chown_like_dir(tmp, d)
+        # Atomic on both platforms; on Windows a reader that has the old
+        # file open makes the replace wait (os.rename would fail there).
+        _pc.replace_file(tmp, path)
         return True
     except OSError:
         try:
@@ -129,11 +149,19 @@ def write_state(job_id: str, state: dict) -> bool:
 
 
 def read_state(job_id: str) -> Optional[dict]:
-    try:
-        with open(state_file_for(job_id)) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
+    # Windows only: the file cannot be opened for the instant in which the
+    # writer replaces it; that is not "no such job", so look again.
+    for _attempt in range(5 if _pc.IS_WINDOWS else 1):
+        try:
+            with open(state_file_for(job_id), encoding='utf-8') as f:
+                return json.load(f)
+        except PermissionError:
+            if _pc.IS_WINDOWS:
+                time.sleep(0.02)
+            continue
+        except (OSError, ValueError):
+            return None
+    return None
 
 
 def update_state(job_id: str, **updates) -> Optional[dict]:
@@ -185,7 +213,14 @@ def list_states_for_user(user: str) -> List[dict]:
     return [s for s in list_all_states() if s.get('user') == user]
 
 
-ACTIVE_STATES = ('starting', 'running')
+ACTIVE_STATES = ('starting', 'running', 'syncing')
+
+# 1.1.7: an in-flight job whose state file has not been touched for this
+# long is reported as stalled. mbsync -V emits progress continuously and
+# the worker flushes it at ~2Hz, so half an hour of silence is not normal.
+# A stalled job still BLOCKS a new sync: its mbsync may still hold the
+# box locks, and the service cannot signal it (no CAP_KILL).
+STALL_SECONDS = 1800
 
 # A job may legitimately sit in 'starting' with no pid recorded yet while
 # the worker is still forking mbsync. Only treat a pid-less job as dead
@@ -211,26 +246,16 @@ def _pid_alive(pid) -> bool:
     Treating that as "dead" made the orphan reaper kill off healthy,
     actively-downloading syncs. Check /proc first (ownership-independent).
     """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    if os.path.isdir('/proc'):
-        return os.path.exists(f'/proc/{pid}')
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True          # exists, just not ours to signal
-    except (ProcessLookupError, OSError):
-        return False
+    # The check itself lives in platform_compat: on Windows os.kill(pid, 0)
+    # would terminate the process instead of probing it.
+    return _pc.pid_alive(pid)
 
 
 def current_boot_id() -> str:
+    if _pc.IS_WINDOWS:
+        return ''            # no boot id; owner_pid liveness governs
     try:
-        with open('/proc/sys/kernel/random/boot_id') as f:
+        with open('/proc/sys/kernel/random/boot_id', encoding='utf-8') as f:
             return f.read().strip()
     except OSError:
         return ''
@@ -306,6 +331,63 @@ def list_active_states_for_user(user: str) -> List[dict]:
     reap_orphaned_states()
     return [s for s in list_states_for_user(user)
             if s.get('state') in ACTIVE_STATES]
+
+
+def is_state_stalled(st: dict, now: Optional[float] = None) -> bool:
+    """True when an in-flight job has written nothing for STALL_SECONDS."""
+    if st.get('state') not in ACTIVE_STATES:
+        return False
+    # The cron path runs mbsync synchronously and writes no progress, so
+    # its silence means nothing; liveness alone (owner_pid) governs it.
+    if st.get('heartbeat') is False:
+        return False
+    ts = _state_epoch(st)
+    if ts is None:
+        return False
+    return ((now or time.time()) - ts) > STALL_SECONDS
+
+
+def targets_overlap(a: Optional[str], b: Optional[str]) -> bool:
+    """Two sync targets touch the same maildirs: same account, or either
+    one is '__all__' (mbsync -a covers every account)."""
+    a = a or '__all__'
+    b = b or '__all__'
+    return a == '__all__' or b == '__all__' or a == b
+
+
+def claim_sync(user: str, target: str, initial: dict):
+    """1.1.7: start a sync only if none is in flight for an overlapping
+    target. Never queues.
+
+    Returns (job_id, None) when the claim succeeded and the state file is
+    written, or (None, blocking_state) when a live job already covers the
+    target. The check and the create happen under one per-user flock, so
+    two clicks that land on two gunicorn workers in the same millisecond
+    cannot both win. Dead jobs are reaped first, so a crashed sync never
+    blocks the next one.
+    """
+    ensure_state_dir()
+    lock_path = os.path.join(JOB_STATE_DIR, f'.claim-{_safe(user)}.lock')
+    # Read-only is enough for flock. The cron path (root, umask 022) and
+    # the service (mail-archiver) both create this file; a root-created
+    # 0640 lock is unwritable to the service, so never ask for write.
+    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o660)
+    try:
+        _chown_like_dir(lock_path, JOB_STATE_DIR)
+        _pc.lock_fd(fd, exclusive=True, blocking=True)
+        for st in list_active_states_for_user(user):
+            if targets_overlap(st.get('target'), target):
+                return None, st
+        email = None if target == '__all__' else target
+        job_id = new_job_id(user, email)
+        state = dict(initial)
+        state.update({'job_id': job_id, 'user': user, 'email': email,
+                      'target': target})
+        if not write_state(job_id, state):
+            raise OSError(f'cannot write sync state for {job_id}')
+        return job_id, None
+    finally:
+        os.close(fd)   # releases the lock
 
 
 def is_authorized(state: Optional[dict], user: str) -> bool:
@@ -429,8 +511,8 @@ def spawn_scoped_mbsync(
         'stderr': subprocess.STDOUT,
         'bufsize': 1,
         'text': True,
-        'start_new_session': True,
     }
+    kw.update(_pc.detached_popen_kwargs())   # start_new_session on Linux
     if uid is not None:
         kw['user'] = uid
     if gid is not None:
@@ -458,19 +540,13 @@ def stop_scope(job_id: str, timeout: int = 10) -> bool:
     admin.sync_cancel's pgid fallback (present since 1.0.15 for the
     batched path) is now the ONE cancel mechanism.
     """
-    import signal
-
     st = read_state(job_id)
     if not st:
         return False
     pid = st.get('mbsync_pid')
     if not pid:
         return False
-    try:
-        os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
-        return True
-    except (OSError, ValueError, ProcessLookupError):
-        return False
+    return _pc.terminate_process_group(pid)
 
 
 def scope_is_active(job_id: str) -> bool:
@@ -506,3 +582,92 @@ def list_active_scopes() -> List[str]:
 
 def iso_utc_now() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+# ---------------------------------------------------------------
+# 1.2.0: daily schedule, one lane per IMAP server
+# ---------------------------------------------------------------
+#
+# The rule: accounts on the same server (all Gmail, all iCloud,
+# all Microsoft, or all on one custom IMAP host) never sync at the same
+# time, while one Gmail, one iCloud and one Microsoft account may run
+# together. Each account gets a fixed hour of the day; the accounts on one
+# server are spread evenly over the 24 hours, so every download has at
+# least an hour (run_sync's 1-hour mbsync timeout) before the next one on
+# that server starts.
+#
+# Before 1.2.0 an account was due 24 h after its last sync FINISHED, but
+# the cron only looks once an hour, so every daily account started an hour
+# later each day (a 25-hour "day") and the accounts drifted round the clock.
+# Slots are fixed hours, so they do not drift.
+
+import hashlib  # noqa: E402
+
+HOURS_PER_DAY = 24
+
+
+def server_key(host: Optional[str], provider: Optional[str] = None) -> str:
+    """The lane an account belongs to: its IMAP host, lower-cased. An
+    account with no host (an unknown custom provider) gets a lane of its
+    own provider name."""
+    h = (host or '').strip().lower()
+    return h or f'provider:{(provider or "unknown").strip().lower()}'
+
+
+def _slot_order(user: str, email: str) -> str:
+    # Stable across runs and hosts, independent of account-list order.
+    return hashlib.md5(f'{user}/{email}'.encode('utf-8')).hexdigest()
+
+
+def assign_slots(entries: Iterable[tuple], start_hour: int = 0) -> dict:
+    """Give each account a fixed hour of the day (0-23).
+
+    `entries` is (user, email, server) per scheduled account. Returns
+    {(user, email): hour}. The n accounts on one server get hours
+    start, start + 24/n, start + 2*24/n, ... More than 24 accounts on one
+    server share hours (lane_capacity() lets that lane run more than one
+    per hour).
+    """
+    lanes: dict = {}
+    for user, email, server in entries:
+        lanes.setdefault(server, []).append((user, email))
+    slots = {}
+    for members in lanes.values():
+        members.sort(key=lambda m: _slot_order(*m))
+        n = len(members)
+        for i, m in enumerate(members):
+            slots[m] = (start_hour + (i * HOURS_PER_DAY) // n) % HOURS_PER_DAY
+    return slots
+
+
+def lane_capacity(n_accounts: int) -> int:
+    """Accounts one server lane may start per hourly run: 1 up to 24
+    accounts on that server, so that every account still syncs daily."""
+    return max(1, -(-n_accounts // HOURS_PER_DAY))
+
+
+def period_hours(interval_secs: int) -> int:
+    return max(1, min(HOURS_PER_DAY, int(interval_secs) // 3600))
+
+
+def last_slot_epoch(now: float, slot_hour: int, interval_secs: int) -> float:
+    """The most recent top of an hour at or before `now` (local time) whose
+    hour is the account's slot, repeated every interval: a daily account
+    with slot 6 runs at 06:00, a 6-hourly one at 00, 06, 12 and 18."""
+    period = period_hours(interval_secs)
+    lt = time.localtime(now)
+    top = now - lt.tm_min * 60 - lt.tm_sec
+    back = (lt.tm_hour - slot_hour) % period
+    return top - back * 3600
+
+
+def is_due(now: float, slot_hour: int, interval_secs: int,
+           last_started: Optional[float]) -> bool:
+    """Due once per slot: not yet started since the slot's most recent
+    occurrence. A slot that moves (accounts added to or removed from the
+    server) never runs an account twice within half its interval."""
+    if last_started is None:
+        return True
+    if last_started >= last_slot_epoch(now, slot_hour, interval_secs):
+        return False
+    return now - last_started >= interval_secs / 2

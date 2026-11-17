@@ -1,10 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — Admin</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — Admin{% endblock %}
+{% block head_extra %}
     <style>
     .admin-grid { display: grid; grid-template-columns: 1fr 1fr;
                   gap: 1rem; margin: 1rem 0; }
@@ -42,9 +38,8 @@
     .btn-restart:hover { background: #bf360c; }
     #restart-status { font-size: 0.85rem; margin-left: 0.5rem; }
     </style>
-</head>
-<body>
-<div class="container">
+{% endblock %}
+{% block content %}
     <header>
         <div class="logo-header">
             <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
@@ -68,8 +63,10 @@
                 {% if service.uptime_s %}
                 <span class="k">Uptime:</span>        <span>{{ '%.0f'|format(service.uptime_s / 60) }} min</span>
                 {% endif %}
+                {% if service.supported %}
                 <span class="k">Workers:</span>       <span>{{ service.workers }}</span>
                 <span class="k">Thread cap:</span>    <span>{{ service.threads_base }}–{{ service.threads_max }}</span>
+                {% endif %}
             </div>
             {% if service.restart_pending %}
             <div class="banner-warn">
@@ -77,10 +74,15 @@
                 <br><small>Marker: {{ service.restart_pending }}</small>
             </div>
             {% endif %}
+            {% if service.supported %}
             <p style="margin-top: 1rem;">
                 <button class="btn-restart" id="restart-btn" onclick="doRestart()">Restart Now</button>
                 <span id="restart-status"></span>
             </p>
+            {% else %}
+            <p id="service-unsupported" style="margin-top: 1rem; font-size: 0.9rem;">{{ service.unsupported_message }}</p>
+            <p id="restart-unsupported" style="font-size: 0.9rem;">{{ service.restart_message }}</p>
+            {% endif %}
         </div>
 
         <!-- ===== Storage card ===== -->
@@ -179,10 +181,15 @@
             <h2>Host
                 <a class="detail-link" href="{{ url_for('admin.host_detail') }}">Details →</a>
             </h2>
+            {% if host.unsupported_message %}
+            <p id="host-unsupported" style="font-size: 0.9rem;">{{ host.unsupported_message }}</p>
+            {% endif %}
             <div class="kv">
+                {% if not host.unsupported_message %}
                 <span class="k">Load:</span>       <span>{{ host.load.load1 }} / {{ host.load.load5 }} / {{ host.load.load15 }}</span>
                 <span class="k">RAM used:</span>   <span>{{ host.mem.pct_used|round(1) }}%</span>
                 <span class="k">RAM total:</span>  <span>{{ (host.mem.total_kb / 1024)|round(0) }} MB</span>
+                {% endif %}
                 {% if host.thermal_c %}
                 <span class="k">Temp (max):</span> <span>{{ host.thermal_c|round(1) }}°C</span>
                 {% endif %}
@@ -233,13 +240,17 @@
 
     <footer>
         <p style="font-size: 0.8rem; color: #999;">
+            {% if service.supported %}
             Admin group: <code>{{ admin_group }}</code> —
             grant with <code>sudo usermod -aG {{ admin_group }} &lt;user&gt;</code>.
+            {% else %}
+            Administrators: the users named in the application's <code>MAIL_ARCHIVER_ADMIN_USERS</code> setting.
+            {% endif %}
             Mail Archiver {{ service.version }}.
         </p>
     </footer>
-</div>
-
+{% endblock %}
+{% block scripts %}
 <script>
 function doRestart() {
     var btn = document.getElementById('restart-btn');
@@ -269,5 +280,4 @@ function doRestart() {
     });
 }
 </script>
-</body>
-</html>
+{% endblock %}

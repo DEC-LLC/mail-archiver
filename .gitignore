@@ -11,3 +11,8 @@ packaging/deb/usr/
 # Python
 __pycache__/
 *.py[cod]
+
+# Release artifacts made by packaging/build.sh and make-source.sh
+packaging/dist/
+# Live harness: the local configuration names a real server and mailbox.
+tools/live-harness/harness.local.conf

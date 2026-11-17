@@ -1,13 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — OAuth Apps</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-<body>
-    <div class="container">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — OAuth Apps{% endblock %}
+{% block content %}
         <header>
             <div class="logo-header">
                 <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
@@ -30,7 +23,7 @@
 
         <h2>OAuth Apps</h2>
         <p class="help-text">
-            Register one Azure app and share it across all Hotmail accounts, or add a separate app per family member for tenant isolation.
+            Register one Azure app and share it across all Hotmail accounts, or add a separate app per user for tenant isolation.
             Each account can pin itself to a specific app on its Settings page (dropdown). Apps left blank fall back to the per-user default for the provider, then the server default.
         </p>
 
@@ -149,7 +142,7 @@
                 <ol style="margin:12px 0 0 20px;line-height:1.8;">
                     <li>Go to <a href="https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank">Microsoft Entra ID → App Registrations</a></li>
                     <li>Click <strong>New Registration</strong></li>
-                    <li>Name: <code>Mail Archiver</code> (or "Family Mail Archiver", etc.)</li>
+                    <li>Name: <code>Mail Archiver</code> (or "Home Mail Archiver", etc.)</li>
                     <li>Supported account types: <strong>Accounts in any organizational directory and personal Microsoft accounts</strong> (required for personal @hotmail.com / @outlook.com)</li>
                     <li>Redirect URI: <strong>Web</strong> → <code>{{ request.url_root }}oauth2/callback</code></li>
                     <li>Click <strong>Register</strong></li>
@@ -167,6 +160,4 @@
         <p style="margin-top:20px;">
             <a href="{{ url_for('dashboard') }}" class="btn">← Back to Dashboard</a>
         </p>
-    </div>
-</body>
-</html>
+{% endblock %}

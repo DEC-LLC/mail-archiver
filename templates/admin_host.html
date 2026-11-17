@@ -1,9 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <title>Mail Archiver — Host Detail</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — Host Detail{% endblock %}
+{% block head_extra %}
     <style>
     table.dtl { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
     table.dtl th, table.dtl td { border-bottom: 1px solid #eee; padding: 0.35rem 0.5rem; text-align: left; }
@@ -14,9 +11,8 @@
     .sparkline { display: inline-flex; height: 40px; align-items: flex-end; gap: 2px; }
     .sparkline .bar { width: 6px; background: #388e3c; }
     </style>
-</head>
-<body>
-<div class="container">
+{% endblock %}
+{% block content %}
     <header>
         <h1>Host Detail</h1>
         <div class="user-info">
@@ -25,11 +21,16 @@
     </header>
 
     <h2>Load + Memory + OS</h2>
+    {% if unsupported_message %}
+    <p id="host-unsupported">{{ unsupported_message }}</p>
+    {% endif %}
     <div class="kv">
+        {% if not unsupported_message %}
         <span class="k">Load (1/5/15):</span> <span>{{ load.load1 }} / {{ load.load5 }} / {{ load.load15 }}</span>
         <span class="k">RAM total:</span>     <span>{{ (mem.total_kb / 1024)|round(0) }} MB</span>
         <span class="k">RAM available:</span> <span>{{ (mem.available_kb / 1024)|round(0) }} MB</span>
         <span class="k">RAM used:</span>      <span>{{ mem.pct_used|round(1) }}%</span>
+        {% endif %}
         {% if uptime_s %}
         <span class="k">Host uptime:</span>   <span>{{ '%.1f'|format(uptime_s / 86400) }} days ({{ '%.0f'|format(uptime_s / 3600) }} h)</span>
         {% endif %}
@@ -96,6 +97,4 @@
         </tbody>
     </table>
     {% endif %}
-</div>
-</body>
-</html>
+{% endblock %}

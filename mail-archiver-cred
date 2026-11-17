@@ -13,7 +13,7 @@ Ships as a fixed system binary rather than an inlined `python3 -c "..."`
 PassCmd because:
   * fixed sys.path (`/opt/mail-archiver` only) — the previous inlined form
     used `sys.path.insert(0, '{archive_dir}/../..')` which resolves to
-    `/var/lib` or `/datapool`; any file the target PAM user drops under
+    `/var/lib` or the data volume; any file the target PAM user drops under
     the data dir named `app.py`, `PAM.py`, `email.py`, etc. would get
     imported as mbsync ran, giving the user arbitrary Python execution.
   * no shell interpolation of user-supplied values — username and email

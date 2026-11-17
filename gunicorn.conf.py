@@ -5,7 +5,7 @@ If no certs found, falls back to HTTP-only on port 8400.
 
 Threads scale with the number of email accounts under MAIL_ARCHIVER_DATA:
 each active SSE progress stream (1.0.14+) holds one thread for the whole
-sync duration, so a busy family NAS with 10 accounts + 4 users watching
+sync duration, so a busy host with 10 accounts + 4 users watching
 needs ~14 thread-slots. The formula is base + total_accounts, capped.
 Env overrides: MAIL_ARCHIVER_WORKERS, MAIL_ARCHIVER_THREADS_BASE,
 MAIL_ARCHIVER_THREADS_MAX.
@@ -66,3 +66,18 @@ timeout = 3600  # match mbsync 1h ceiling
 print(f'gunicorn: workers={workers} threads={threads} '
       f'(accounts={_accts}, base={_base}, cap={_cap})',
       flush=True)
+
+
+def post_worker_init(worker):
+    """1.3.2: when the service starts, a "syncing" status entry whose sync
+    died with the previous service instance is marked "interrupted".
+    Runs in every worker; a second run finds nothing left to do."""
+    try:
+        import app as _app
+        n = _app.heal_stale_sync_status_all()
+        if n:
+            print(f'mail-archiver: {n} abandoned "syncing" status '
+                  f'entr{"y" if n == 1 else "ies"} marked interrupted',
+                  flush=True)
+    except Exception as e:      # never block a worker over a status file
+        print(f'mail-archiver: stale-status check skipped: {e}', flush=True)

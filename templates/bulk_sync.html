@@ -1,0 +1,340 @@
+{% extends "base.html" %}
+{% block title %}Mail Archiver — Initial / rebase sync{% endblock %}
+
+{% block head_extra %}
+<style>
+    .bs { color: #16161a; background: #ffffff; }
+    .bs h2 { font-size: 1.35rem; margin: 0 0 4px; color: #16161a; }
+    .bs h3 { font-size: 1.05rem; margin: 0 0 10px; color: #16161a; }
+    .bs p { margin: 6px 0; }
+    .bs .lead { color: #5c5952; max-width: 62rem; }
+    .bs .mut { color: #5c5952; font-size: 0.86rem; }
+    .bs .card { border: 1px solid #dedbd4; border-radius: 8px; background: #fafaf8; padding: 16px 20px; margin: 16px 0; }
+    .bs .chip { display: inline-block; padding: 3px 8px; border-radius: 5px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; color: #fff; background: #5c5952; white-space: nowrap; }
+    .bs .chip.good { background: #16794a; } .bs .chip.warn { background: #a86a1f; }
+    .bs .chip.info { background: #1f5fa8; } .bs .chip.alert { background: #a8341f; }
+    .bs .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 14px 0; }
+    .bs .stat { border: 1px solid #dedbd4; border-radius: 6px; background: #fff; padding: 10px 12px; }
+    .bs .stat .k { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; color: #5c5952; }
+    .bs .stat .v { font-size: 1.25rem; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+    .bs .stat .s { font-size: 0.82rem; color: #5c5952; margin-top: 2px; }
+    .bs .bar { height: 8px; border-radius: 4px; background: #dedbd4; overflow: hidden; margin-top: 6px; }
+    .bs .bar span { display: block; height: 100%; background: #1f5fa8; }
+    .bs .bar.full span { background: #a86a1f; }
+    .bs table { width: 100%; border-collapse: collapse; font-size: 0.9rem; background: #fff; }
+    .bs th, .bs td { text-align: left; padding: 7px 9px; border-bottom: 1px solid #dedbd4; vertical-align: top; }
+    .bs th { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.04em; color: #5c5952; font-weight: 600; background: #fafaf8; }
+    .bs td.num, .bs th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .bs .scroll { overflow-x: auto; }
+    .bs .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+    .bs .actions form { display: inline; margin: 0; }
+    .bs .grid { display: grid; grid-template-columns: 190px 1fr; gap: 10px 16px; align-items: start; max-width: 52rem; }
+    .bs .grid label.k { font-weight: 600; padding-top: 5px; }
+    .bs input[type=text], .bs input[type=number], .bs input[type=time], .bs textarea { padding: 6px 10px; border: 1px solid #c9c5bc; border-radius: 6px; font-size: 0.9rem; background: #fff; color: #16161a; }
+    .bs textarea { width: 100%; max-width: 30rem; }
+    .bs .folders label { display: block; margin: 2px 0; font-weight: 400; }
+    .bs code { background: #f1efea; padding: 1px 5px; border-radius: 4px; font-size: 0.85rem; word-break: break-all; }
+    .bs details summary { cursor: pointer; color: #1f5fa8; }
+    .bs pre { background: #f1efea; padding: 8px 10px; border-radius: 6px; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; }
+    .bs .flash { border: 1px solid #1f5fa8; background: #fff; border-radius: 6px; padding: 8px 12px; margin: 12px 0; }
+    .bs a.plain { color: #1f5fa8; }
+    .bs .needs { border: 1px solid #a86a1f; background: #fff; border-radius: 6px; padding: 10px 14px; margin: 12px 0; }
+    @media (max-width: 760px) { .bs .grid { grid-template-columns: 1fr; } }
+</style>
+{% endblock %}
+
+{% macro state_chip(job) -%}
+    {%- if not job -%}<span class="chip">No job</span>
+    {%- elif job.state == 'running' -%}<span class="chip info">Running</span>
+    {%- elif job.state == 'waiting' -%}<span class="chip info">Waiting</span>
+    {%- elif job.state == 'paused' -%}<span class="chip warn">Paused</span>
+    {%- elif job.state == 'complete' -%}<span class="chip good">Complete</span>
+    {%- elif job.state == 'cancelled' -%}<span class="chip">Cancelled</span>
+    {%- else -%}<span class="chip">{{ job.state }}</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro reason_chip(reason, label) -%}
+    {%- set tone = {'complete': 'good', 'budget': 'info', 'window': 'info', 'provider-cap': 'warn',
+                    'timeout': 'warn', 'incomplete': 'warn', 'interrupted': 'warn', 'paused': 'warn',
+                    'error': 'alert'}.get(reason, '') -%}
+    <span class="chip {{ tone }}">{{ label or reason or 'none' }}</span>
+{%- endmacro %}
+
+{% macro num(n) -%}{{ '{:,}'.format(n) if n is not none else '–' }}{%- endmacro %}
+
+{% block content %}
+<div class="bs">
+    {% with messages = get_flashed_messages() %}
+    {% if messages %}<div class="flash">{% for m in messages %}<p>{{ m }}</p>{% endfor %}</div>{% endif %}
+    {% endwith %}
+    {% if needs_isync %}
+    <div class="needs" id="bs-needs-isync"><span class="chip warn">Needs isync</span> {{ needs_isync }}</div>
+    {% endif %}
+
+{% if not account %}
+    <h2>Initial / rebase sync</h2>
+    <p class="lead">Downloads a very large folder over several days, a bounded amount per day, outside the
+        regular sync. Use it for the first sync of a big mailbox (Gmail "All Mail") or to re-download a folder.
+        While a job is open the regular sync skips its folders; when the job is complete they go back in.</p>
+    <div class="card">
+        <div class="scroll">
+        <table>
+            <thead><tr><th>Account</th><th>Status</th><th>Folders</th><th class="num">Messages</th>
+                <th class="num">Today / budget</th><th>Last stop</th><th></th></tr></thead>
+            <tbody>
+            {% for a in accounts %}
+            <tr>
+                <td>{{ a.email }}</td>
+                <td>{{ state_chip(a.job) }}</td>
+                <td>{% if a.job %}{{ a.job.folders | join(', ') }}{% else %}<span class="mut">–</span>{% endif %}</td>
+                <td class="num">{% if a.job %}{{ num(a.job.messages_local) }}{% if a.job.messages_server is not none %} of {{ num(a.job.messages_server) }}{% endif %}{% endif %}</td>
+                <td class="num">{% if a.open %}{{ a.job.today_text }} / {{ a.job.budget_text }}{% endif %}</td>
+                <td>{% if a.job and a.job.last_stop_reason %}{{ reason_chip(a.job.last_stop_reason, a.job.last_stop_label) }}{% endif %}</td>
+                <td><a class="btn btn-small" href="{{ url_for('bulk_sync_account', email=a.email) }}">{{ 'Open' if a.job else 'Set up…' }}</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="mut">No mail accounts yet. Add one on the <a class="plain" href="{{ url_for('dashboard') }}">dashboard</a>.</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+{% else %}
+    {% set job = account.job %}
+    <p class="mut"><a class="plain" href="{{ url_for('bulk_sync_page') }}">Initial / rebase sync</a> › {{ account.email }}</p>
+    <h2>Initial / rebase sync: {{ account.email }}</h2>
+    <p class="lead">Downloads chosen folders over several days, a bounded amount per day, with download-only isync.
+        The regular sync skips these folders while the job is open. Nothing on the mail server is changed and
+        no mail in the archive is ever deleted.</p>
+
+    {% if job %}
+    <div class="card" id="bs-job" data-email="{{ account.email }}" data-open="{{ '1' if account.open else '0' }}">
+        <h3>{{ 'Fetch missing' if job.kind == 'fetch-missing' else 'Job' }}
+            <span id="bs-state">{{ state_chip(job) }}</span>
+            <span class="mut">started {{ job.created }}{% if job.closed %}, closed {{ job.closed }}{% endif %}</span></h3>
+        <p>Folders: {% for f in job.folders %}<code>{{ f }}</code> {% endfor %}</p>
+        {% if account.open %}
+        <p class="mut">Regular sync pattern while this job is open: <code>{{ job.excluded_pattern }}</code>.
+            When it closes: <code>{{ job.original_pattern or '*' }}</code>{% if not job.original_pattern %} (all folders){% endif %}.</p>
+        {% endif %}
+
+        <div class="stats">
+            <div class="stat"><div class="k">Messages in the archive</div>
+                <div class="v" id="bs-local">{{ num(job.messages_local) }}</div>
+                <div class="s" id="bs-server">{% if job.messages_server is not none %}of {{ num(job.messages_server) }} on the server{% if job.percent is not none %} ({{ job.percent }}%){% endif %}{% else %}server count not read yet{% endif %}</div>
+                {% if job.percent is not none %}<div class="bar"><span id="bs-pct" style="width: {{ job.percent }}%"></span></div>{% endif %}</div>
+            <div class="stat"><div class="k">Size in the archive</div>
+                <div class="v" id="bs-bytes">{{ job.bytes_local_text or '–' }}</div>
+                <div class="s">measured {{ job.measured_at or 'never' }}</div></div>
+            <div class="stat"><div class="k">Today against the budget</div>
+                <div class="v"><span id="bs-today">{{ job.today_text }}</span> <span class="mut">of {{ job.budget_text }}</span></div>
+                {% if job.budget_percent is not none %}<div class="bar{{ ' full' if job.budget_percent >= 100 }}"><span id="bs-budget-pct" style="width: {{ job.budget_percent }}%"></span></div>{% endif %}
+                <div class="s">window {{ job.window_text }}</div></div>
+            <div class="stat"><div class="k">Days run</div>
+                <div class="v">{{ job.days_run }}</div>
+                <div class="s">{{ job.runs }} run{{ '' if job.runs == 1 else 's' }}</div></div>
+            <div class="stat"><div class="k">Time left</div>
+                <div class="v" id="bs-eta">{{ job.eta_text or '–' }}</div>
+                <div class="s">{% if job.messages_remaining is not none %}{{ num(job.messages_remaining) }} messages to go{% else %}needs a server count and one day of download{% endif %}</div></div>
+            <div class="stat"><div class="k">Last stop</div>
+                <div class="v">{% if job.last_stop_reason %}{{ reason_chip(job.last_stop_reason, job.last_stop_label) }}{% else %}–{% endif %}</div>
+                <div class="s">{{ job.last_stop_at or '' }}</div></div>
+        </div>
+        {% if job.last_stop_detail %}<p>{{ job.last_stop_detail }}</p>{% endif %}
+        {% if job.next_run %}<p class="mut" id="bs-next">Next run: {{ job.next_run }}</p>{% endif %}
+
+        {% if account.open %}
+        <div class="actions">
+            <form method="post" action="{{ url_for('bulk_sync_run', email=account.email) }}">
+                <button type="submit" class="btn btn-small btn-primary" {{ 'disabled' if job.running or job.status != 'active' or needs_isync }}>Run now</button></form>
+            {% if job.status == 'active' %}
+            <form method="post" action="{{ url_for('bulk_sync_action', email=account.email, action='pause') }}">
+                <button type="submit" class="btn btn-small">Pause</button></form>
+            {% else %}
+            <form method="post" action="{{ url_for('bulk_sync_action', email=account.email, action='resume') }}">
+                <button type="submit" class="btn btn-small">Resume</button></form>
+            {% endif %}
+            <form method="post" action="{{ url_for('bulk_sync_action', email=account.email, action='cancel') }}"
+                  onsubmit="return confirm('Cancel this job? The regular sync takes the folders back. Downloaded mail is kept.')">
+                <button type="submit" class="btn btn-small btn-danger">Cancel job</button></form>
+            <span class="mut">"Run now" ignores the time window, not the budget. Cancel keeps all downloaded mail.</span>
+        </div>
+
+        <details style="margin-top: 14px">
+            <summary>Change the daily budget or the time window</summary>
+            <form method="post" action="{{ url_for('bulk_sync_settings', email=account.email) }}" style="margin-top: 10px">
+                <div class="grid">
+                    <label class="k" for="s-budget">Daily budget (MB)</label>
+                    <div><input type="number" id="s-budget" name="budget_mb" min="0" step="1" value="{{ job.budget_mb }}">
+                        <div class="mut">0 means no budget. {{ account.defaults.note }}</div></div>
+                    <label class="k" for="s-ws">Time window</label>
+                    <div><input type="time" id="s-ws" name="window_start" value="{{ job.window_start }}"> to
+                        <input type="time" name="window_end" value="{{ job.window_end }}">
+                        <div class="mut">Scheduled runs start only inside the window and stop when it closes. The same time twice means all day.</div></div>
+                    <span></span><div><button type="submit" class="btn btn-small">Save</button></div>
+                </div>
+            </form>
+        </details>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {% if not account.open %}
+    <div class="card">
+        <h3>{{ 'Start another job' if job else 'Set up' }}</h3>
+        {% if not account.enabled %}<p><span class="chip warn">Account disabled</span> Enable the account on the dashboard first.</p>{% endif %}
+        <form method="post" action="{{ url_for('bulk_sync_start', email=account.email) }}">
+            <div class="grid">
+                <label class="k">Folders</label>
+                <div class="folders">
+                    {% for f in suggested_folders %}
+                    <label><input type="checkbox" name="folders" value="{{ f }}" {{ 'checked' if account.profile == 'gmail' and f == account.defaults.folders[0] }}> <code>{{ f }}</code></label>
+                    {% endfor %}
+                    <div class="mut" style="margin: 6px 0 2px">Other folders, one per line, exactly as the server names them:</div>
+                    <textarea name="folders_other" rows="2" placeholder="[Gmail]/All Mail"></textarea>
+                    <div class="mut">The list shows this provider's usual large folder, the folders already in the archive, and the server's folders after "Check the server now" below.</div>
+                </div>
+                <label class="k" for="n-budget">Daily budget (MB)</label>
+                <div><input type="number" id="n-budget" name="budget_mb" min="0" step="1" value="{{ account.defaults.budget_mb }}">
+                    <div class="mut">{{ account.defaults.label }}: {{ account.defaults.note }} 0 means no budget.</div></div>
+                <label class="k" for="n-ws">Time window</label>
+                <div><input type="time" id="n-ws" name="window_start" value="{{ account.defaults.window_start }}"> to
+                    <input type="time" name="window_end" value="{{ account.defaults.window_end }}">
+                    <div class="mut">Scheduled runs start only inside the window, once a day, and stop when it closes. The same time twice means all day.</div></div>
+                <span></span>
+                <div><button type="submit" class="btn btn-primary" {{ 'disabled' if not account.enabled or needs_isync }}>Start initial / rebase sync</button>
+                    <div class="mut">The regular sync keeps running for every other folder{% if account.folder_pattern %} (your folder pattern <code>{{ account.folder_pattern }}</code> is kept and comes back unchanged){% endif %}.</div></div>
+            </div>
+        </form>
+    </div>
+    {% endif %}
+
+    {% if account.runs %}
+    <div class="card">
+        <h3>Run log</h3>
+        <div class="scroll">
+        <table>
+            <thead><tr><th>Day</th><th>Start</th><th>End</th><th>Started by</th><th class="num">Messages before</th>
+                <th class="num">After</th><th class="num">Downloaded</th><th>Stop reason</th></tr></thead>
+            <tbody>
+            {% for r in account.runs[:60] %}
+            <tr>
+                <td>{{ r.day }}</td>
+                <td>{{ (r.start or '')[11:] }}</td>
+                <td>{{ (r.end or '')[11:] }}</td>
+                <td>{{ 'schedule' if r.trigger == 'cron' else 'run now' }}</td>
+                <td class="num">{{ num(r.messages_before) }}</td>
+                <td class="num">{{ num(r.messages_after) }}</td>
+                <td class="num">+{{ num(r.messages) }}<br><span class="mut">{{ r.bytes_text }}</span></td>
+                <td>{{ reason_chip(r.reason, r.reason_label) }}
+                    {% if r.detail %}<div class="mut">{{ r.detail }}</div>{% endif %}
+                    {% if r.output_tail %}<details><summary>isync output</summary><pre>{{ r.output_tail }}</pre></details>{% endif %}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        {% if account.runs | length > 60 %}<p class="mut">Showing the latest 60 of {{ account.runs | length }} runs.</p>{% endif %}
+    </div>
+    {% endif %}
+
+    <div class="card">
+        <h3>Reconcile: server against archive</h3>
+        <p class="mut">Counts every folder on the mail server and compares it with the archive. The check only
+            reads (IMAP LIST, STATUS and a read-only EXAMINE); it changes nothing on the server.</p>
+        {% set rec = account.reconcile %}
+        {% if rec and rec.ok %}
+        <div class="scroll">
+        <table>
+            <thead><tr><th>Folder</th><th class="num">Server</th><th class="num">Archive</th><th class="num">Difference</th>
+                <th class="num">New since last sync</th><th class="num">Missing</th><th>Result</th><th></th></tr></thead>
+            <tbody>
+            {% for r in rec.folders %}
+            <tr>
+                <td><code>{{ r.folder }}</code>{% if r.last_sync %}<div class="mut">last sync {{ r.last_sync }}</div>{% endif %}</td>
+                <td class="num">{{ num(r.server_messages) }}</td>
+                <td class="num">{{ num(r.local_messages) }}</td>
+                <td class="num">{% if r.delta is not none %}{{ '{:+,}'.format(r.delta) if r.delta else '0' }}{% else %}–{% endif %}</td>
+                <td class="num">{{ num(r.new_since_last_sync) }}</td>
+                <td class="num">{{ num(r.missing) }}</td>
+                <td><span class="chip {{ r.verdict_tone }}">{{ r.verdict_label }}</span><div class="mut">{{ r.explanation }}</div></td>
+                <td>{% if r.can_fetch %}
+                    <form method="post" action="{{ url_for('bulk_sync_fetch_missing', email=account.email) }}">
+                        <input type="hidden" name="folder" value="{{ r.folder }}">
+                        <button type="submit" class="btn btn-small" {{ 'disabled' if needs_isync }}>Fetch missing</button></form>
+                    {% endif %}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        <p class="mut">Checked {{ rec.checked }}.</p>
+        {% elif rec %}
+        <p><span class="chip alert">Could not check</span> {{ rec.error }} <span class="mut">({{ rec.checked }})</span></p>
+        {% else %}
+        <p class="mut">Not checked yet.</p>
+        {% endif %}
+        <div class="actions">
+            <form method="post" action="{{ url_for('bulk_sync_reconcile', email=account.email) }}"
+                  onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent = 'Checking the server…';">
+                <button type="submit" class="btn btn-small">Check the server now</button></form>
+            <span class="mut">Takes a few seconds per folder on a large mailbox.</span>
+        </div>
+    </div>
+
+    {% if account.history %}
+    <div class="card">
+        <h3>Earlier jobs</h3>
+        <div class="scroll">
+        <table>
+            <thead><tr><th>Started</th><th>Closed</th><th>Folders</th><th>Result</th><th class="num">Days</th><th class="num">Downloaded</th></tr></thead>
+            <tbody>
+            {% for h in account.history %}
+            <tr><td>{{ h.created }}</td><td>{{ h.closed or '–' }}</td><td>{{ h.folders | join(', ') }}</td>
+                <td><span class="chip {{ 'good' if h.status == 'complete' }}">{{ h.status }}</span></td>
+                <td class="num">{{ h.days }}</td><td class="num">+{{ num(h.messages) }}</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+    {% endif %}
+{% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if account and account.open %}
+<script>
+(function () {
+    var box = document.getElementById('bs-job');
+    if (!box) { return; }
+    var url = {{ url_for('bulk_sync_status', email=account.email) | tojson }};
+    var wasRunning = {{ 'true' if account.job.running else 'false' }};
+    function fmt(n) { return n === null || n === undefined ? '–' : n.toLocaleString('en-US'); }
+    function set(id, text) { var el = document.getElementById(id); if (el) { el.textContent = text; } }
+    function width(id, pct) { var el = document.getElementById(id); if (el && pct !== null) { el.style.width = pct + '%'; } }
+    function tick() {
+        fetch(url, {headers: {'Accept': 'application/json'}, credentials: 'same-origin'})
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+                var a = data && data.accounts && data.accounts[0];
+                if (!a || !a.job) { return; }
+                var j = a.job;
+                // A run that started or ended changes the buttons and the run log: reload once.
+                if (j.running !== wasRunning || !j.excluding) { window.location.reload(); return; }
+                set('bs-local', fmt(j.messages_local));
+                set('bs-bytes', j.bytes_local_text || '–');
+                set('bs-today', j.today_text);
+                set('bs-eta', j.eta_text || '–');
+                width('bs-pct', j.percent);
+                width('bs-budget-pct', j.budget_percent);
+            })
+            .catch(function () {});
+    }
+    setInterval(tick, 10000);
+})();
+</script>
+{% endif %}
+{% endblock %}

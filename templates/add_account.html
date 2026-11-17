@@ -1,13 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mail Archiver — Add Account</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-<body>
-    <div class="container">
+{% extends "base.html" %}
+{% block title %}Mail Archiver — Add Account{% endblock %}
+{% block content %}
         <header>
             <div class="logo-header">
                 <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
@@ -90,8 +83,8 @@
                 <a href="{{ url_for('dashboard') }}" class="btn">Cancel</a>
             </div>
         </form>
-    </div>
-
+{% endblock %}
+{% block scripts %}
     <script>
     function updateHelp() {
         var sel = document.getElementById('provider');
@@ -118,5 +111,4 @@
         }
     }
     </script>
-</body>
-</html>
+{% endblock %}

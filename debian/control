@@ -1,0 +1,20 @@
+Source: mail-archiver
+Section: mail
+Priority: optional
+Maintainer: Madhav Diwan <madhav@decllc.biz>
+Build-Depends: dpkg-dev (>= 1.19)
+Standards-Version: 4.6.2
+Homepage: https://github.com/DEC-LLC/mail-archiver
+Rules-Requires-Root: binary-targets
+
+Package: mail-archiver
+Architecture: all
+Depends: python3-flask, gunicorn, isync, python3-pam, libsasl2-modules-kdexoauth2, pst-utils, libemail-outlook-message-perl
+Recommends: zstd
+Description: Self-hosted email archive with full-text search
+ Mail Archiver is a self-hosted email archive supporting Gmail, iCloud,
+ and Outlook/Hotmail via IMAP. Features SQLite FTS5 search index,
+ Microsoft OAuth2, MBOX/EML export, scheduled sync, mail import (PST,
+ mbox, Maildir, eml/emlx, msg, zip/tar) from per-account import folders
+ with an import ledger, and a budgeted initial / rebase sync for very
+ large folders.

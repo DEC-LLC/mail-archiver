@@ -50,6 +50,7 @@ import os
 import re
 import shlex
 import subprocess
+import platform_compat as _pc
 import sync_lifecycle as _sl
 import tempfile
 import time
@@ -68,10 +69,24 @@ def _connect_imap(host: str, port: int, tls_mode: str) -> imaplib.IMAP4:
     """Open an IMAP connection using the same TLS mode mbsync would use."""
     tls_mode = (tls_mode or 'ssl').lower()
     if tls_mode == 'ssl':
-        return imaplib.IMAP4_SSL(host, port, timeout=30)
+        return imaplib.IMAP4_SSL(host, port, timeout=30,
+                                 ssl_context=_pc.tls_client_context())
+    if tls_mode != 'starttls':
+        # 1.3.2: no login without TLS on any imaplib connection (folder
+        # measurement, Reconcile). imap_sync.py refuses the same way.
+        raise BatcherError(
+            'This account is set to "Plaintext" (no TLS); the built-in IMAP '
+            'client does not send a password over an unencrypted connection. '
+            'Choose SSL/TLS (port 993) or STARTTLS (port 143).')
     conn = imaplib.IMAP4(host, port, timeout=30)
-    if tls_mode == 'starttls':
-        conn.starttls()
+    try:
+        conn.starttls(ssl_context=_pc.tls_client_context())
+    except Exception:
+        try:
+            conn.shutdown()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -404,7 +419,7 @@ def _write_batch_rc(source_rc_text: str, channel: str,
         out_lines.append(f'Patterns {quoted}')
     fd, path = tempfile.mkstemp(prefix='mail-archiver-batch-',
                                 suffix='.mbsyncrc', text=True)
-    with os.fdopen(fd, 'w') as f:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write('\n'.join(out_lines) + '\n')
     os.chmod(path, 0o600)
     return path
@@ -455,7 +470,7 @@ def run_batched_sync(
             'MAIL_ARCHIVER_CHUNK_WALL_SECONDS',
             str(CHUNK_WALL_SECONDS_DEFAULT)))
 
-    with open(mbsyncrc_path) as f:
+    with open(mbsyncrc_path, encoding='utf-8') as f:
         source_rc_text = f.read()
     ownership = None
     if 'user' in subprocess_kwargs and 'group' in subprocess_kwargs:
@@ -479,7 +494,7 @@ def run_batched_sync(
         try:
             if ownership is not None:
                 try:
-                    os.chown(rc_path, ownership[0], ownership[1])
+                    _pc.chown(rc_path, ownership[0], ownership[1])
                 except OSError:
                     pass
             if progress_cb:

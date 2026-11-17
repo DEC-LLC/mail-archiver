@@ -17,7 +17,6 @@ Legacy schema (v1) — `{"microsoft": {"client_id": "...", "client_secret": "...
 and set as the server default for provider=microsoft.
 """
 
-import fcntl
 import json
 import os
 import sys
@@ -28,6 +27,8 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+
+import platform_compat as _pc
 
 
 class TokenNeedsReauth(Exception):
@@ -193,10 +194,12 @@ def _atomic_write(path: Path, content: bytes, mode: int, uid, gid) -> None:
         os.chmod(tmp, mode)
         if uid is not None:
             try:
-                os.chown(tmp, uid, gid)
+                _pc.chown(tmp, uid, gid)
             except (PermissionError, OSError):
                 pass
-        os.rename(tmp, str(path))
+        # Atomic on both platforms (os.rename fails on Windows when the
+        # destination exists).
+        _pc.replace_file(tmp, str(path))
     except Exception:
         try:
             os.unlink(tmp)
@@ -218,30 +221,29 @@ def save_oauth2_tokens(data_dir: str, username: str, email: str, tokens: dict):
     the mail-archiver gunicorn worker (who writes fresh tokens post-refresh
     in the Flask process) can read+write.
     """
-    import grp
-    import pwd
     config_dir = Path(data_dir) / username / '.config'
     config_dir.mkdir(parents=True, exist_ok=True)
 
+    # No OS accounts to hand the files to on Windows (single-user mode):
+    # target_uid stays None and nothing is chowned.
     target_uid = None
+    target_gid = None
     ma_gid = None
-    try:
-        pw = pwd.getpwnam(username)
-        target_uid = pw.pw_uid
-    except KeyError:
-        pass
-    try:
-        ma_gid = grp.getgrnam('mail-archiver').gr_gid
-    except KeyError:
-        pass
+    if _pc.supports_system_accounts():
+        pw = _pc.user_info(username)
+        if pw is not None:
+            target_uid, target_gid = pw.uid, pw.gid
+        gr = _pc.group_info('mail-archiver')
+        if gr is not None:
+            ma_gid = gr.gid
     # Fall back to the target user's primary group if mail-archiver group
     # doesn't exist yet (postinst hasn't run in dev tree).
     write_gid = ma_gid if ma_gid is not None else (
-        pwd.getpwnam(username).pw_gid if target_uid is not None else -1)
+        target_gid if target_uid is not None else -1)
 
     if target_uid is not None:
         try:
-            os.chown(str(config_dir), target_uid, write_gid if write_gid != -1 else target_uid)
+            _pc.chown(str(config_dir), target_uid, write_gid if write_gid != -1 else target_uid)
         except (PermissionError, OSError):
             pass
 
@@ -280,18 +282,17 @@ def mark_token_needs_reauth(data_dir: str, username: str, email: str,
     tokens['needs_reauth'] = True
     tokens['reauth_reason'] = reason
     tokens['reauth_flagged_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    import grp
-    import pwd
     target_uid = None
-    write_gid = None
-    try:
-        target_uid = pwd.getpwnam(username).pw_uid
-    except KeyError:
-        pass
-    try:
-        write_gid = grp.getgrnam('mail-archiver').gr_gid
-    except KeyError:
-        write_gid = pwd.getpwnam(username).pw_gid if target_uid else -1
+    write_gid = -1
+    if _pc.supports_system_accounts():
+        pw = _pc.user_info(username)
+        if pw is not None:
+            target_uid = pw.uid
+        gr = _pc.group_info('mail-archiver')
+        if gr is not None:
+            write_gid = gr.gid
+        else:
+            write_gid = pw.gid if target_uid else -1
     safe_name = email.replace('@', '_at_').replace('.', '_')
     token_file = Path(data_dir) / username / '.config' / f'{safe_name}.oauth2.json'
     _atomic_write(token_file, json.dumps(tokens, indent=2).encode(),
@@ -305,7 +306,7 @@ def load_oauth2_tokens(data_dir: str, username: str, email: str) -> dict:
     if not token_file.exists():
         return {}
     try:
-        with open(token_file) as f:
+        with open(token_file, encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
@@ -337,14 +338,14 @@ def ensure_fresh_token(oauth2: MicrosoftOAuth2, data_dir: str,
     lockp = _lock_path(data_dir, username, email)
     lockp.parent.mkdir(parents=True, exist_ok=True)
     # Touch the lock file first (own it so we can chmod after flock).
-    lf = open(str(lockp), 'a+')
+    lf = open(str(lockp), 'a+', encoding='utf-8')
     try:
         try:
             os.chmod(str(lockp), 0o660)
         except OSError:
             pass
         try:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            _pc.lock_file(lf, exclusive=True, blocking=True)
         except OSError:
             # Filesystem doesn't support flock — proceed unlocked.
             # (Same degradation policy as _write_sync_status_locked in app.)
@@ -396,7 +397,7 @@ def ensure_fresh_token(oauth2: MicrosoftOAuth2, data_dir: str,
         return new_tokens['access_token']
     finally:
         try:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            _pc.unlock_file(lf)
         except OSError:
             pass
         try:
@@ -542,7 +543,7 @@ def load_oauth2_config(data_dir: str) -> dict:
     if not path.exists():
         return _empty_config()
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             cfg = json.load(f)
     except (json.JSONDecodeError, OSError):
         return _empty_config()
@@ -562,7 +563,7 @@ def save_oauth2_config(data_dir: str, config: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     # Always stamp schema version
     config.setdefault('_schema_version', SCHEMA_VERSION)
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
     path.chmod(0o600)
 
@@ -580,7 +581,7 @@ def load_user_oauth2_config(data_dir: str, username: str) -> dict:
     if not path.exists():
         return _empty_config()
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             cfg = json.load(f)
     except (json.JSONDecodeError, OSError):
         return _empty_config()
@@ -592,23 +593,20 @@ def load_user_oauth2_config(data_dir: str, username: str) -> dict:
 
 def save_user_oauth2_config(data_dir: str, username: str, config: dict):
     """Save a user's private OAuth apps."""
-    import pwd
     path = _user_config_path(data_dir, username)
     path.parent.mkdir(parents=True, exist_ok=True)
     config.setdefault('_schema_version', SCHEMA_VERSION)
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
     path.chmod(0o600)
     # Chown to the PAM user so mbsync-as-user could read it if we ever moved
     # PassCmd lookups to per-user context. Best-effort.
-    try:
-        pw = pwd.getpwnam(username)
+    pw = _pc.user_info(username) if _pc.supports_system_accounts() else None
+    if pw is not None:
         try:
-            os.chown(path, pw.pw_uid, pw.pw_gid)
+            _pc.chown(path, pw.uid, pw.gid)
         except (PermissionError, OSError):
             pass
-    except KeyError:
-        pass
 
 
 # ---- Unified list + resolve --------------------------------------------------
@@ -781,7 +779,7 @@ def _cli_refresh_expiring() -> int:
     summary. Returns 0 unless catastrophically broken (missing data dir).
     """
     data_dir = os.environ.get('MAIL_ARCHIVER_DATA',
-                              '/datapool/email-archive')
+                              _pc.default_data_dir())
     if not Path(data_dir).is_dir():
         print(f'oauth-refresh: MAIL_ARCHIVER_DATA={data_dir} does not exist')
         return 1
@@ -804,7 +802,7 @@ def _cli_refresh_expiring() -> int:
             continue
         for tf in token_files:
             try:
-                data = json.loads(tf.read_text())
+                data = json.loads(tf.read_text(encoding='utf-8'))
             except (OSError, ValueError):
                 continue
             total += 1
@@ -824,7 +822,7 @@ def _cli_refresh_expiring() -> int:
             accounts_file = cfg_dir / 'accounts.json'
             found_email = None
             try:
-                accts = json.loads(accounts_file.read_text())
+                accts = json.loads(accounts_file.read_text(encoding='utf-8'))
                 iterable = (
                     accts.values() if isinstance(accts, dict) else accts
                 )

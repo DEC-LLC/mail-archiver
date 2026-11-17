@@ -1,0 +1,63 @@
+{# Shared page layout (1.3.0): fixed left sidebar (navigation tree from layout.py), main content, footer
+   with the running version. Page templates extend this file and fill only these blocks:
+   title, head_extra, content, scripts. Logged-out pages (login, register) get no sidebar. #}
+{#- One navigation entry. A disabled entry is a <span> with no href at all (not a dead link):
+    it cannot be followed, focused as a link, or opened in a new tab. -#}
+{% macro nav_item(item) -%}
+{% if item.disabled -%}
+<span class="nav-link nav-disabled" aria-disabled="true" title="{{ item.title }}" data-endpoint="{{ item.endpoint }}">{{ item.label }}</span>
+{%- else -%}
+<a class="nav-link{{ ' nav-section' if item.section }}" href="{{ item.href }}" data-endpoint="{{ item.endpoint }}"{% if item.current %} aria-current="page"{% endif %}>{{ item.label }}</a>
+{%- endif %}
+{%- endmacro -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>{% block title %}Mail Archiver{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% block head_extra %}{% endblock %}
+</head>
+<body class="{{ 'has-sidebar' if layout.logged_in else 'no-sidebar' }}">
+    {% if layout.logged_in %}
+    <nav class="sidebar" id="sidebar" aria-label="Main navigation">
+        <div class="sidebar-brand">
+            <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
+            <span class="sidebar-title">Mail Archiver</span>
+        </div>
+        <div class="sidebar-user" title="Logged in as {{ layout.username }}">{{ layout.username }}</div>
+        <ul class="nav-tree">
+            {% for item in layout.nav %}
+            {% if item.group %}
+            <li class="nav-group{{ ' nav-group-disabled' if item.disabled }}">
+                <span class="nav-group-label"{% if item.title %} title="{{ item.title }}"{% endif %}>{{ item.label }}</span>
+                <ul>
+                    {% for child in item.children %}
+                    <li>{{ nav_item(child) }}</li>
+                    {% endfor %}
+                </ul>
+            </li>
+            {% else %}
+            <li>{{ nav_item(item) }}</li>
+            {% endif %}
+            {% endfor %}
+        </ul>
+    </nav>
+    {% endif %}
+    <div class="main">
+        <div class="container">
+            {% block content %}{% endblock %}
+            <footer class="site-footer">
+                {% if layout.logged_in %}
+                <a href="{{ url_for('about') }}" class="footer-version">DEC-LLC Mail-Archiver {{ layout.version }}</a>
+                {% else %}
+                <span class="footer-version">DEC-LLC Mail-Archiver {{ layout.version }}</span>
+                {% endif %}
+            </footer>
+        </div>
+    </div>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -12,13 +12,14 @@ import json
 import subprocess
 import time
 import hashlib
+import hmac
 import secrets
 import email
 import email.policy
 import re
 import shlex
 import shutil
-import fcntl
+import sqlite3
 import threading
 import uuid
 from pathlib import Path
@@ -29,11 +30,41 @@ from flask import (Flask, render_template, request, redirect, url_for,
                    Response)
 from werkzeug.utils import secure_filename
 
+import platform_compat as _pc
+import pst_import as _pst
+import mail_import as _imp
+import bulk_sync as _bulk
+import bulk_sync_routes as _bulk_routes
+from flask import Request as _FlaskRequest
+
+
+class _MailArchiverRequest(_FlaskRequest):
+    """1.3.0: the mail import upload route streams a multi-GB body straight
+    to the user's data dir; every other route keeps the 256 KiB cap."""
+
+    @property
+    def max_content_length(self):
+        if self.path == '/import/upload':
+            return _imp.MAX_IMPORT_BYTES
+        return super().max_content_length
+
+    @max_content_length.setter
+    def max_content_length(self, value):  # Flask >= 3.1 has a setter
+        fset = getattr(_FlaskRequest.max_content_length, 'fset', None)
+        if fset is not None:
+            fset(self, value)
+
+
 app = Flask(__name__)
+app.request_class = _MailArchiverRequest
 # Cap request bodies at 256 KiB. Only routes we accept uploads on are the
 # per-account client-cert PEM uploads — a PEM cert + PEM key together are
 # well under 20 KiB. This guards the whole app from oversize form bodies.
+# (1.3.0: except the mail import upload, see _MailArchiverRequest.)
 app.config['MAX_CONTENT_LENGTH'] = 256 * 1024
+# 1.3.3: the session cookie is not sent with cross-site form posts or
+# scripted requests (SameSite=Lax) and is not readable from page scripts.
+app.config.update(SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_HTTPONLY=True)
 
 # HTTPS redirect: when serving on 8443, redirect HTTP requests
 @app.before_request
@@ -60,7 +91,7 @@ _secret_file = os.environ.get('MAIL_ARCHIVER_SECRET_FILE')
 _secret_key_source = 'random'
 if _secret_file and os.path.exists(_secret_file):
     try:
-        with open(_secret_file) as _f:
+        with open(_secret_file, encoding='utf-8') as _f:
             app.secret_key = _f.read().strip()
         _secret_key_source = 'file'
     except OSError as _e:
@@ -77,11 +108,16 @@ else:
 
 # Configuration — override via environment or config file
 CONFIG = {
-    'data_dir': os.environ.get('MAIL_ARCHIVER_DATA', '/datapool/email-archive'),
+    # Default: platform_compat.LINUX_DATA_DIR on Linux, %APPDATA%\MailArchiver
+    # on Windows (platform_compat.default_data_dir).
+    'data_dir': os.environ.get('MAIL_ARCHIVER_DATA', _pc.default_data_dir()),
     'listen_port': int(os.environ.get('MAIL_ARCHIVER_PORT', '8400')),
     'session_timeout': 3600,  # 1 hour
     'allowed_users': None,  # None = any PAM user, or list of usernames
-    'auth_mode': os.environ.get('MAIL_ARCHIVER_AUTH', 'pam'),  # 'pam' or 'builtin'
+    # 'pam' or 'builtin'. Windows has no PAM, so it defaults to builtin.
+    'auth_mode': os.environ.get(
+        'MAIL_ARCHIVER_AUTH',
+        'pam' if _pc.supports_system_accounts() else 'builtin'),
     # 1.0.15: batched sync — when an account's total message count exceeds
     # this, split into per-folder batches sized <= threshold. Fresh mbsync
     # process per batch = fresh IMAP/TLS/timeout window. 0 disables batching.
@@ -166,7 +202,7 @@ def _users_file():
 def _load_users():
     uf = _users_file()
     if uf.exists():
-        with open(uf) as f:
+        with open(uf, encoding='utf-8') as f:
             return json.load(f)
     return {}
 
@@ -174,7 +210,7 @@ def _load_users():
 def _save_users(users):
     uf = _users_file()
     uf.parent.mkdir(parents=True, exist_ok=True)
-    with open(uf, 'w') as f:
+    with open(uf, 'w', encoding='utf-8') as f:
         json.dump(users, f, indent=2)
     os.chmod(str(uf), 0o600)
 
@@ -190,7 +226,7 @@ def _verify_password(password, stored):
     if '$' not in stored:
         return False
     salt = stored.split('$')[0]
-    return _hash_password(password, salt) == stored
+    return hmac.compare_digest(_hash_password(password, salt), stored)
 
 
 def builtin_authenticate(username, password):
@@ -210,6 +246,8 @@ def builtin_create_user(username, password):
 
 def pam_authenticate(username, password):
     """Authenticate user via PAM. Returns True/False."""
+    if not _pc.supports_system_accounts():
+        return False         # no PAM on Windows; login() says so
     try:
         # Debian ships uppercase PAM module in python3-pam; Rocky/RHEL/Fedora
         # python3-pam ships lowercase pam. Try both so the same wheel works.
@@ -236,6 +274,21 @@ def pam_authenticate(username, password):
         return True
     except Exception:
         return False
+
+
+# Shown on the login page when the app is told to use PAM where there is
+# none (MAIL_ARCHIVER_AUTH=pam on Windows).
+PAM_UNAVAILABLE_MESSAGE = (
+    'PAM (system account) sign-in is not available on Windows. Start Mail '
+    'Archiver with MAIL_ARCHIVER_AUTH=builtin and create a Mail Archiver '
+    'account instead.')
+
+
+def auth_unavailable_message():
+    """Why nobody can log in with the configured method, or ''."""
+    if CONFIG['auth_mode'] != 'builtin' and not _pc.supports_system_accounts():
+        return PAM_UNAVAILABLE_MESSAGE
+    return ''
 
 
 def authenticate(username, password):
@@ -272,10 +325,10 @@ def _chown_user(path, username):
     if CONFIG['auth_mode'] != 'pam':
         return
     try:
-        import pwd
-        pw = pwd.getpwnam(username)
-        os.chown(str(path), pw.pw_uid, pw.pw_gid)
-    except (KeyError, ImportError, OSError):
+        pw = _pc.user_info(username)
+        if pw is not None:
+            _pc.chown(str(path), pw.uid, pw.gid)
+    except OSError:
         pass
 
 
@@ -293,7 +346,7 @@ def load_accounts(username):
     config_dir = get_user_config_dir(username)
     accounts_file = config_dir / 'accounts.json'
     if accounts_file.exists():
-        with open(accounts_file) as f:
+        with open(accounts_file, encoding='utf-8') as f:
             return json.load(f)
     return []
 
@@ -307,33 +360,56 @@ def save_accounts(username, accounts):
     Prior mode 0600 blocked that read with PermissionError, and the
     autoscaler silently fell back to threads=4.
     """
-    import grp
     config_dir = get_user_config_dir(username)
     accounts_file = config_dir / 'accounts.json'
-    with open(accounts_file, 'w') as f:
+    with open(accounts_file, 'w', encoding='utf-8') as f:
         json.dump(accounts, f, indent=2)
     os.chmod(str(accounts_file), 0o640)
     _chown_user(accounts_file, username)
     # Best-effort group swap to mail-archiver — silently keep user group
-    # if it doesn't exist (dev checkout / no service install).
+    # if it doesn't exist (dev checkout / no service install / Windows).
+    service_group = _pc.group_info('mail-archiver')
+    if service_group is None:
+        return
+    gid = service_group.gid
     try:
-        gid = grp.getgrnam('mail-archiver').gr_gid
         stat = os.stat(str(accounts_file))
-        os.chown(str(accounts_file), stat.st_uid, gid)
-    except (KeyError, OSError):
+        _pc.chown(str(accounts_file), stat.st_uid, gid)
+    except OSError:
         pass
     # Parent .config dir + per-user data-root dir need group-execute so
     # gunicorn can descend to accounts.json. Both normally 0700 owned by
     # the user — flip to 0710 with mail-archiver group so the service
     # traverses but can't list unrelated files inside.
     try:
-        gid = grp.getgrnam('mail-archiver').gr_gid
         for d in (config_dir, config_dir.parent):
             st = os.stat(str(d))
-            os.chown(str(d), st.st_uid, gid)
+            _pc.chown(str(d), st.st_uid, gid)
             os.chmod(str(d), 0o710)
-    except (KeyError, OSError):
+    except OSError:
         pass
+
+
+# What the generated .mbsyncrc points mbsync at. The file is only ever read
+# by mbsync, which Windows does not use (_has_mbsync); the two paths can be
+# set for a host that keeps them elsewhere.
+MBSYNC_CRED_HELPER = os.environ.get('MAIL_ARCHIVER_CRED_HELPER',
+                                    '/usr/libexec/mail-archiver-cred')
+# The system CA bundle: Debian/Ubuntu keep it in the first place, EL in the
+# second (1.3.3: only the first was known, so every isync connection failed
+# its certificate check on EL until MAIL_ARCHIVER_CA_FILE was set).
+SYSTEM_CA_BUNDLES = ('/etc/ssl/certs/ca-certificates.crt',
+                     '/etc/pki/tls/certs/ca-bundle.crt')
+
+
+def _default_ca_file():
+    for candidate in SYSTEM_CA_BUNDLES:
+        if os.path.isfile(candidate):
+            return candidate
+    return SYSTEM_CA_BUNDLES[0]
+
+
+MBSYNC_CA_FILE = os.environ.get('MAIL_ARCHIVER_CA_FILE') or _default_ca_file()
 
 
 def generate_mbsyncrc(username):
@@ -341,12 +417,8 @@ def generate_mbsyncrc(username):
     accounts = load_accounts(username)
     archive_dir = Path(CONFIG['data_dir']) / username
     if CONFIG['auth_mode'] == 'pam':
-        import pwd
-        try:
-            pw = pwd.getpwnam(username)
-            home = pw.pw_dir
-        except KeyError:
-            home = str(archive_dir)
+        pw = _pc.user_info(username)
+        home = pw.home if pw is not None else str(archive_dir)
     else:
         home = str(archive_dir)
     lines = [
@@ -383,7 +455,8 @@ def generate_mbsyncrc(username):
 
         auth_type = acct.get('auth_type') or provider.get('auth', 'password')
         if auth_type == 'oauth2':
-            lines.append(f'PassCmd "cat {config_dir_str}/{safe_name}.token"')
+            token_path = os.path.join(config_dir_str, f'{safe_name}.token')
+            lines.append(f'PassCmd "cat {token_path}"')
             lines.append('AuthMechs XOAUTH2')
         else:
             # T8 hardening: hand off to /usr/libexec/mail-archiver-cred so
@@ -392,7 +465,7 @@ def generate_mbsyncrc(username):
             # traversal). shlex.quote on the two args neutralizes any
             # exotic characters so mbsync's /bin/sh -c sees each as one arg.
             lines.append(
-                f'PassCmd "/usr/libexec/mail-archiver-cred '
+                f'PassCmd "{MBSYNC_CRED_HELPER} '
                 f'{shlex.quote(username)} {shlex.quote(acct["email"])}"'
             )
             # 1.1.2: pin AuthMechs to LOGIN for app-password + plain-password
@@ -416,7 +489,7 @@ def generate_mbsyncrc(username):
         else:
             lines.append('SSLType None')
         if tls_mode != 'none':
-            lines.append('CertificateFile /etc/ssl/certs/ca-certificates.crt')
+            lines.append(f'CertificateFile {MBSYNC_CA_FILE}')
 
         # Client cert + key (mutual-TLS IMAP — Exchange with mTLS front-end,
         # some paid providers, self-hosted Dovecot with cert-auth).
@@ -425,9 +498,10 @@ def generate_mbsyncrc(username):
         client_cert = acct.get('client_cert')
         client_key = acct.get('client_key')
         if client_cert:
-            lines.append(f'ClientCertificate {config_dir_str}/{client_cert}')
+            lines.append('ClientCertificate '
+                         + os.path.join(config_dir_str, client_cert))
         if client_key:
-            lines.append(f'ClientKey {config_dir_str}/{client_key}')
+            lines.append('ClientKey ' + os.path.join(config_dir_str, client_key))
 
         # Timeout (mbsync default is 20s — expose so slow WAN paths + big
         # first syncs don't drop with generic "connection lost").
@@ -435,7 +509,9 @@ def generate_mbsyncrc(username):
         if timeout:
             lines.append(f'Timeout {int(timeout)}')
 
-        pattern = acct.get('folder_pattern') or '*'
+        # 1.3.0: while an initial / rebase sync job is open for the account,
+        # its folders are left out of the regular sync (bulk_sync.py).
+        pattern = _bulk.regular_sync_pattern(config_dir_str, acct)
 
         lines.extend([
             '',
@@ -451,6 +527,11 @@ def generate_mbsyncrc(username):
             f'Far :{safe_name}-remote:',
             f'Near :{safe_name}-local:',
             f'Patterns {pattern}',
+            # 1.1.7: an archive only ever PULLS. Without this
+            # line mbsync defaults to `Sync All` (pull + push + flags), so
+            # a folder whose state is lost while local mail exists would
+            # be appended back to the user's real mailbox as duplicates.
+            'Sync Pull',
             'Create Near',
             'Expunge None',
             'SyncState *',
@@ -458,7 +539,7 @@ def generate_mbsyncrc(username):
         ])
 
     mbsyncrc = Path(home) / '.mbsyncrc'
-    mbsyncrc.write_text('\n'.join(lines))
+    mbsyncrc.write_text('\n'.join(lines), encoding='utf-8')
     os.chmod(str(mbsyncrc), 0o600)
     _chown_user(mbsyncrc, username)
 
@@ -473,17 +554,7 @@ def _supplementary_gids(username, primary_gid=None):
     0640 root:mail-archiver) and credential decryption fails. Pass the
     result as Popen's `extra_groups=`.
     """
-    import grp as _grp
-    gids = []
-    if primary_gid is not None:
-        gids.append(primary_gid)
-    try:
-        for g in _grp.getgrall():
-            if username in g.gr_mem and g.gr_gid not in gids:
-                gids.append(g.gr_gid)
-    except Exception:
-        pass
-    return gids
+    return _pc.supplementary_gids(username, primary_gid)
 
 
 def _mbsync_child_env(pw, username):
@@ -497,11 +568,15 @@ def _mbsync_child_env(pw, username):
     nothing (empty password); without MAIL_ARCHIVER_SECRET_FILE it derives
     a random encryption key and returns undecryptable bytes.
     """
+    # `pw` is a platform_compat.UserInfo (home, shell) or anything with the
+    # pwd names (pw_dir, pw_shell). PAM mode only, so Linux only.
+    home = getattr(pw, 'home', None) or getattr(pw, 'pw_dir')
+    shell = getattr(pw, 'shell', None) or getattr(pw, 'pw_shell', None)
     env = {
-        'HOME':    pw.pw_dir,
+        'HOME':    home,
         'USER':    username,
         'LOGNAME': username,
-        'SHELL':   pw.pw_shell or '/bin/sh',
+        'SHELL':   shell or '/bin/sh',
         'PATH':    '/usr/local/sbin:/usr/local/bin:'
                    '/usr/sbin:/usr/bin:/sbin:/bin',
         'MAIL_ARCHIVER_AUTH': CONFIG['auth_mode'],
@@ -577,7 +652,7 @@ def save_credential(username, email, credential):
     safe_name = email.replace('@', '_at_').replace('.', '_')
     cred_file = config_dir / f'{safe_name}.pass'
     encrypted = _encrypt_credential(credential)
-    cred_file.write_text(encrypted)
+    cred_file.write_text(encrypted, encoding='utf-8')
     os.chmod(str(cred_file), 0o600)
     _chown_user(cred_file, username)
 
@@ -589,7 +664,7 @@ def load_credential(username, email):
     cred_file = config_dir / f'{safe_name}.pass'
     if not cred_file.exists():
         return None
-    raw = cred_file.read_text().strip()
+    raw = cred_file.read_text(encoding='utf-8').strip()
     if not raw:
         return None
     # Encrypted credentials are always base64 with length > 24 (16-byte IV + data)
@@ -616,8 +691,16 @@ def load_credential(username, email):
 
 # --- Sync Operations ---
 
-def _write_sync_status_locked(status_file, state):
+def _write_sync_status_locked(status_file, state, keys=None):
     """Atomic + locked write of sync_status.json.
+
+    1.2.0: with `keys`, only those accounts' entries are written; every
+    other entry is re-read from disk under the lock. The hourly sync now
+    runs accounts of one user in parallel (one per IMAP server), and each
+    run holds a copy of the file taken when it started, so a whole-file
+    write would put back the other run's stale "syncing" entry. A new
+    entry that has no 'started' keeps the one on disk, so the schedule and
+    the dashboard can tell when the last sync began.
 
     T11 fix: cron (root) and the WebUI (mail-archiver) both write this
     file; unlocked writes let one process's truncate-then-write clobber
@@ -640,21 +723,43 @@ def _write_sync_status_locked(status_file, state):
         # (target file may not yet exist). Keep lock file around; empty.
         lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            with open(tmp, 'w') as f:
+            _pc.lock_fd(lock_fd, exclusive=True, blocking=True)
+            if keys is not None:
+                payload = json.dumps(
+                    _merge_sync_status(status_file, state, keys), indent=2)
+            with open(tmp, 'w', encoding='utf-8') as f:
                 f.write(payload)
-            os.replace(str(tmp), str(status_file))
+            _pc.replace_file(str(tmp), str(status_file))
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _pc.unlock_fd(lock_fd)
             os.close(lock_fd)
     except (OSError, IOError):
         # Locking failed (e.g. fs doesn't support flock) — degraded
         # non-atomic path. Better than blocking the sync.
         try:
-            with open(status_file, 'w') as f:
+            with open(status_file, 'w', encoding='utf-8') as f:
                 f.write(payload)
         except OSError:
             return
+
+
+def _merge_sync_status(status_file, state, keys):
+    """On-disk sync_status.json with `keys` taken from `state`. Caller
+    holds the exclusive lock."""
+    try:
+        with open(status_file, encoding='utf-8') as f:
+            merged = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        merged = {}
+    for k in keys:
+        if k not in state:
+            continue
+        entry = dict(state[k])
+        old = merged.get(k) or {}
+        if 'started' not in entry and old.get('started'):
+            entry['started'] = old['started']
+        merged[k] = entry
+    return merged
 
 
 def _read_sync_status_locked(status_file):
@@ -666,30 +771,170 @@ def _read_sync_status_locked(status_file):
     try:
         lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_SH)
-            with open(status_file) as f:
+            _pc.lock_fd(lock_fd, exclusive=False, blocking=True)
+            with open(status_file, encoding='utf-8') as f:
                 return json.load(f)
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _pc.unlock_fd(lock_fd)
             os.close(lock_fd)
     except (OSError, IOError, json.JSONDecodeError):
         # Unlocked fallback read
         try:
-            with open(status_file) as f:
+            with open(status_file, encoding='utf-8') as f:
                 return json.load(f)
         except (OSError, json.JSONDecodeError):
             return {}
 
 
+# 1.3.2: a "syncing" entry written by a release that did not record its
+# owner (up to 1.3.1) is taken as abandoned after this long with no
+# registered job in flight. The longest single mbsync run is one hour.
+STALE_SYNCING_NO_OWNER_SECS = 6 * 3600
+
+
+def _sync_owner():
+    """Who is about to run a sync: stored in the "syncing" status entry so
+    a later reader can tell a running sync from an abandoned one."""
+    return {'pid': os.getpid(), 'boot_id': _slc.current_boot_id()}
+
+
+def _syncing_entry_is_stale(username, key, entry, now=None):
+    """True when `entry` says "syncing" and nothing is running it.
+
+    Never true while a registered job covers the same target, or while the
+    process that wrote the entry is alive in this boot.
+    """
+    if not isinstance(entry, dict) or entry.get('state') != 'syncing':
+        return False
+    try:
+        for job in _slc.list_active_states_for_user(username):
+            if _slc.targets_overlap(job.get('target') or '__all__', key):
+                return False
+    except Exception:
+        return False                 # cannot tell: leave it alone
+    pid = entry.get('pid')
+    if pid is not None:
+        boot, cur = entry.get('boot_id'), _slc.current_boot_id()
+        if boot and cur and boot != cur:
+            return True
+        return not _pc.pid_alive(pid)
+    started = _status_epoch({'started': entry.get('started')})
+    if started is None:
+        return True
+    return ((now or time.time()) - started) > STALE_SYNCING_NO_OWNER_SECS
+
+
+def _interrupted_entry(entry):
+    since = entry.get('started') or 'an earlier time'
+    return {
+        'state': 'interrupted',
+        'started': entry.get('started'),
+        'finished': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'error': (f'The sync that started at {since} did not finish: the '
+                  f'service was restarted or the sync process ended. No '
+                  f'sync is running; the next one starts normally.'),
+    }
+
+
+def _replace_sync_status_entries(status_file, expected, replacement):
+    """Under the exclusive lock, replace each key whose on-disk entry still
+    equals expected[key]. An entry another run rewrote meanwhile is left
+    alone. Returns the keys replaced."""
+    status_file = Path(status_file)
+    tmp = status_file.with_suffix(status_file.suffix + '.tmp')
+    lock_path = status_file.with_suffix(status_file.suffix + '.lock')
+    done = []
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return done
+    try:
+        _pc.lock_fd(lock_fd, exclusive=True, blocking=True)
+        try:
+            with open(status_file, encoding='utf-8') as f:
+                current = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return done
+        for k, old in expected.items():
+            if current.get(k) == old:
+                current[k] = replacement[k]
+                done.append(k)
+        if done:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(current, indent=2))
+            _pc.replace_file(str(tmp), str(status_file))
+    except (OSError, IOError):
+        return []
+    finally:
+        try:
+            _pc.unlock_fd(lock_fd)
+        finally:
+            os.close(lock_fd)
+    return done
+
+
+def heal_stale_sync_status(username, status=None):
+    """Mark abandoned "syncing" entries of `username` as "interrupted".
+
+    Returns the status as it now reads. Runs on every status read and once
+    per user when the service starts.
+    """
+    status_file = get_user_config_dir(username) / 'sync_status.json'
+    if status is None:
+        status = _read_sync_status_locked(status_file)
+    stale = {k: e for k, e in status.items()
+             if _syncing_entry_is_stale(username, k, e)}
+    if not stale:
+        return status
+    new = {k: _interrupted_entry(e) for k, e in stale.items()}
+    for k in _replace_sync_status_entries(status_file, stale, new):
+        status[k] = new[k]
+    return status
+
+
+def heal_stale_sync_status_all():
+    """Service start: every user's status file. Returns entries healed."""
+    healed = 0
+    data_dir = Path(CONFIG['data_dir'])
+    try:
+        users = sorted(d.name for d in data_dir.iterdir()
+                       if d.is_dir() and not d.name.startswith('.')
+                       and (d / '.config' / 'sync_status.json').is_file())
+    except OSError:
+        return 0
+    for username in users:
+        try:
+            before = _read_sync_status_locked(
+                data_dir / username / '.config' / 'sync_status.json')
+            after = heal_stale_sync_status(username, dict(before))
+            healed += sum(1 for k in after
+                          if after[k] != before.get(k))
+        except Exception:
+            continue
+    return healed
+
+
 def get_sync_status(username):
-    """Get sync status for all accounts."""
+    """Get sync status for all accounts (abandoned "syncing" entries read
+    as "interrupted", 1.3.2)."""
     config_dir = get_user_config_dir(username)
     status_file = config_dir / 'sync_status.json'
-    return _read_sync_status_locked(status_file)
+    status = _read_sync_status_locked(status_file)
+    try:
+        return heal_stale_sync_status(username, status)
+    except Exception:
+        return status
 
 
 def _has_mbsync():
-    """Check if mbsync is available on this system."""
+    """Check if mbsync is available on this system.
+
+    Never on Windows: the Windows application syncs with imaplib
+    (imap_sync.py) even if an mbsync happens to be on PATH, because the
+    generated .mbsyncrc and the credential helper are POSIX-only.
+    """
+    if _pc.IS_WINDOWS:
+        return False
     return shutil.which('mbsync') is not None
 
 
@@ -731,7 +976,8 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
         oauth2_token = None
         password = load_credential(username, acct['email']) or ''
 
-        if provider.get('auth') == 'oauth2' or acct.get('auth_method') == 'oauth2':
+        if (provider.get('auth') == 'oauth2' or acct.get('auth_method') == 'oauth2'
+                or acct.get('auth_type') == 'oauth2'):
             auth_method = 'oauth2'
             # Resolve per-account OAuth app (server-default / user-default /
             # explicit override), refresh the token if stale, hand back the
@@ -759,21 +1005,25 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
         # gets installed later and takes over the same Maildir, it can't
         # rewrite mail-archiver-owned files → dual-uid corruption + dupes.
         chown_uid, chown_gid = None, None
-        if CONFIG['auth_mode'] == 'pam':
-            try:
-                import pwd as _pwd
-                pw = _pwd.getpwnam(username)
-                chown_uid, chown_gid = pw.pw_uid, pw.pw_gid
-            except KeyError:
-                # PAM user vanished from /etc/passwd between login and sync.
-                # Skip chown — files land under mail-archiver, operator will
-                # need to re-chown by hand once user comes back.
-                pass
+        if CONFIG['auth_mode'] == 'pam' and _pc.supports_system_accounts():
+            pw = _pc.user_info(username)
+            if pw is not None:
+                chown_uid, chown_gid = pw.uid, pw.gid
+            # else: PAM user vanished from /etc/passwd between login and
+            # sync. Skip chown — files land under mail-archiver, operator
+            # will need to re-chown by hand once user comes back.
 
         syncer = ImapSyncer(
-            host=provider.get('host', acct.get('host', '')),
-            port=provider.get('port', acct.get('port', 993)),
+            # The account's own host/port first, as generate_mbsyncrc does:
+            # the 'custom' provider has an empty host, so the provider-first
+            # lookup connected to nothing. This backend is the only one on
+            # Windows.
+            host=acct.get('host') or provider.get('host', ''),
+            port=int(acct.get('port') or provider.get('port', 993)),
             use_tls=provider.get('tls', True),
+            # 1.3.2: the account's own TLS mode, as generate_mbsyncrc uses
+            # (ssl | starttls | none); blank follows the provider.
+            tls_mode=acct.get('tls_mode'),
             username=acct['email'],
             password=password,
             local_dir=local_dir,
@@ -785,6 +1035,10 @@ def _run_sync_imaplib(username, account_email, status, key, status_file):
 
         try:
             result = syncer.sync()
+            if not result.get('success'):
+                # sync() reports a failed connection or login this way; it
+                # used to be counted as a clean run with nothing new.
+                raise RuntimeError(result.get('error') or 'IMAP sync failed')
             all_new += result.get('total_new', 0)
             all_errors += result.get('total_errors', 0)
         except Exception as e:
@@ -895,9 +1149,10 @@ def run_sync(username, account_email=None):
     status[key] = {
         'state': 'syncing',
         'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+        **_sync_owner(),
     }
     # T11: locked+atomic (cron and webui both write this file)
-    _write_sync_status_locked(status_file, status)
+    _write_sync_status_locked(status_file, status, keys=[key])
 
     # Auto-detect backend: mbsync (fast, Linux/Mac) or imaplib (portable)
     if not _has_mbsync():
@@ -905,9 +1160,13 @@ def run_sync(username, account_email=None):
     else:
         # mbsync path
         if account_email:
-            safe_name = account_email.replace('@', '_at_').replace('.', '_')
-            safe_name = re.sub(r'[^a-zA-Z0-9_]', '', safe_name)
-            mbsync_arg = safe_name
+            # The channel is named exactly as generate_mbsyncrc names it.
+            # Until 1.3.1 every character outside [A-Za-z0-9_] was stripped
+            # here but not there, so an address with a hyphen (or a plus)
+            # asked isync for a channel that does not exist: "No channel or
+            # group named 'mailarchivertest_at_...' defined", exit 1, on
+            # every scheduled sync (found with a test mailbox).
+            mbsync_arg = _bulk.safe_account_name(account_email)
         else:
             mbsync_arg = '-a'
 
@@ -920,19 +1179,17 @@ def run_sync(username, account_email=None):
         subprocess_kwargs = {'capture_output': True, 'text': True,
                              'timeout': 3600}
         if CONFIG['auth_mode'] == 'pam':
-            import pwd as _pwd
-            try:
-                pw = _pwd.getpwnam(username)
-            except KeyError:
+            pw = _pc.user_info(username)
+            if pw is None:
                 raise ValueError(
                     f'PAM user {username!r} not present on this host — '
                     f'cannot run mbsync as that identity')
             cmd = ['mbsync', mbsync_arg]
             subprocess_kwargs.update({
-                'user':  pw.pw_uid,
-                'group': pw.pw_gid,
-                'extra_groups': _supplementary_gids(username, pw.pw_gid),
-                'cwd':   pw.pw_dir,
+                'user':  pw.uid,
+                'group': pw.gid,
+                'extra_groups': _supplementary_gids(username, pw.gid),
+                'cwd':   pw.home,
                 'env':   _mbsync_child_env(pw, username),
             })
         else:
@@ -949,12 +1206,13 @@ def run_sync(username, account_email=None):
                     'error': '',
                 }
             else:
-                raw = result.stderr[-500:] if result.stderr else ''
+                raw = redact_sync_output(result.stderr or '')[-500:]
                 status[key] = {
                     'state': 'error',
                     'finished': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'exit_code': result.returncode,
-                    'error': friendly_sync_error(raw, account_email or ''),
+                    'error': friendly_sync_error(raw, account_email or '',
+                                                 result.returncode),
                     'raw_error': raw,
                 }
         except subprocess.TimeoutExpired:
@@ -971,7 +1229,7 @@ def run_sync(username, account_email=None):
             }
 
     # T11: locked+atomic (cron and webui both write this file)
-    _write_sync_status_locked(status_file, status)
+    _write_sync_status_locked(status_file, status, keys=[key])
     _chown_user(status_file, username)
 
     # Update search index after successful sync
@@ -986,43 +1244,130 @@ def run_sync(username, account_email=None):
     return status[key]
 
 
-def friendly_sync_error(raw_error, email=''):
-    """Turn raw mbsync stderr into a user-friendly message."""
-    e = raw_error.strip()
-    el = e.lower()
+# 1.1.9: mbsync prints progress and notices alongside real errors.
+# isync 1.5 prints "notice: SSLType is deprecated" on EVERY run, so the old
+# "'ssl' in output" test labelled every failure, on every provider, as a
+# TLS error; and the fallback showed the first 200 characters, which are
+# progress lines. Classify only the lines that report a failure.
+_SYNC_NOISE_RE = re.compile(
+    r'^(opening |loading |synchroni[sz]ing|creating |near side:|far side:|'
+    r'channels:|maildir notice|\[sasl-|c: \d|notice:)'
+    r'|: notice: ', re.I)
+_SYNC_ERROR_RE = re.compile(
+    r'(error|fail|denied|refused|cannot|can\'t|unable|skipping|exited with|'
+    r'no such file|bye response|timed out|locked|overquota)', re.I)
 
-    if 'authenticationfailed' in el or 'authenticate' in el and 'error' in el:
-        domain = email.split('@')[-1] if '@' in email else ''
-        hints = ['Check that the email address is spelled correctly.']
+
+def _sync_error_lines(raw):
+    lines = []
+    for ln in (raw or '').splitlines():
+        ln = ln.strip()
+        if not ln or _SYNC_NOISE_RE.search(ln):
+            continue
+        if _SYNC_ERROR_RE.search(ln):
+            lines.append(ln)
+    return lines
+
+
+# 1.1.12: with -V, mbsync echoes the SASL exchange, including
+# `AUTHENTICATE XOAUTH2 <base64 of user + Bearer access token>`. Every
+# piece of mbsync output we keep or show (live panel, job state, stored
+# raw_error, the friendly message) goes through this first.
+_AUTH_CMD_RE = re.compile(r'(AUTHENTICATE\s+[A-Za-z0-9_-]+\s+)\S+', re.I)
+_LOGIN_CMD_RE = re.compile(r'(\bLOGIN\s+)(?!<user>)("[^"]*"|\S+)\s+("[^"]*"|\S+)', re.I)
+_LONG_BLOB_RE = re.compile(r'[A-Za-z0-9+/_=-]{120,}')
+
+
+def redact_sync_output(text):
+    """Strip credentials that mbsync's verbose output can echo."""
+    if not text:
+        return text
+    text = _AUTH_CMD_RE.sub(r'\1<credential redacted>', text)
+    text = _LOGIN_CMD_RE.sub(r'\1<user> <pass>', text)
+    return _LONG_BLOB_RE.sub(lambda m: f'<{len(m.group())} chars redacted>', text)
+
+
+def friendly_sync_error(raw_error, email='', exit_code=None):
+    """Turn raw mbsync output into a message that says what actually failed."""
+    raw = redact_sync_output(raw_error or '').strip()
+    errs = _sync_error_lines(raw)
+    el = '\n'.join(errs).lower()
+    domain = email.split('@')[-1].lower() if '@' in email else ''
+    m = re.search(r'Near:\s*\+(\d+)', raw)
+    pulled = int(m.group(1)) if m else 0
+    got = f' {pulled:,} new message(s) were saved first.' if pulled else ''
+
+    if 'overquota' in el or 'bandwidth limits' in el:
+        return ('Gmail\'s daily IMAP download limit was reached, so Google '
+                'closed the connection.' + got + ' Nothing is wrong with the '
+                'account: the next scheduled sync continues where this one '
+                'stopped. A large first sync can take several days. Please do '
+                'not keep clicking Sync; it does not get past the limit.')
+
+    if 'authenticated but not connected' in el:
+        return ('Microsoft accepted the sign-in, but it belongs to a different '
+                f'mailbox than {email or "this account"}. Usually the browser '
+                'was still signed in to another Microsoft account. Sign out at '
+                'outlook.com (or use a private window), then click "Sign in '
+                'with Microsoft" again and sign in as this address. If this '
+                'address is only an alias of an Outlook account you already '
+                'archive, remove it here; its mail is in that archive.')
+
+    if ('.token' in el and 'no such file' in el) or 'refresh_token' in el:
+        return ('Not signed in to Microsoft yet. Open this account\'s '
+                'Settings and click "Sign in with Microsoft", using the '
+                'archiver at its full address (for example '
+                'https://archive.example.org:8443).')
+
+    if ('authenticationfailed' in el or 'authentication failed' in el
+            or 'login failed' in el or 'invalid credentials' in el):
         if 'icloud' in domain or 'me.com' in domain:
-            hints.append('For iCloud: use your Apple ID email and an app-specific password from appleid.apple.com.')
+            hint = 'For iCloud, use an app-specific password from appleid.apple.com.'
         elif 'gmail' in domain or 'google' in domain:
-            hints.append('For Gmail: use an app password from myaccount.google.com (not your regular password).')
-        elif 'outlook' in domain or 'hotmail' in domain or 'live' in domain:
-            hints.append('For Outlook/Hotmail: app passwords or OAuth2 may be required.')
+            hint = 'For Gmail, use an app password from myaccount.google.com.'
+        elif any(d in domain for d in ('outlook', 'hotmail', 'live')):
+            hint = 'For Outlook/Hotmail, click "Sign in with Microsoft" again.'
         else:
-            hints.append('Make sure you are using an app-specific password, not your regular login password.')
-        return 'Authentication failed. ' + ' '.join(hints)
+            hint = 'Use an app-specific password, not your normal login password.'
+        return 'The mail server rejected the login. ' + hint
 
-    if 'resolve' in el or 'getaddrinfo' in el or 'connection refused' in el:
-        return f'Could not connect to mail server. Check your internet connection and that the email provider is correct.'
+    if 'passcmd exited' in el:
+        return ('The stored password or token for this account could not be '
+                'read. Re-enter it in the account\'s Settings.')
 
-    if 'certificate' in el or 'ssl' in el or 'tls' in el:
-        return f'TLS/SSL error connecting to mail server. The server certificate may have changed.'
+    if 'permission denied' in el:
+        return ('The archive on the server has a file-permission problem, so '
+                'mail could not be written. This needs the administrator; '
+                're-entering the password will not help.')
 
-    if 'strstrstrstrstr' in el or 'strftime' in el:
-        return 'Sync configuration error. Try removing and re-adding the account.'
+    if 'is locked' in el or 'cannot be opened anymore' in el:
+        return ('Another sync of this account was running at the same time. '
+                'Wait for it to finish; the next sync will continue normally.')
 
-    if 'no strftime' in el or 'strftime' in el:
-        return 'Configuration error in mbsyncrc. Try removing and re-adding the account.'
+    if ('certificate' in el or 'ssl error' in el or 'tls error' in el
+            or 'handshake' in el):
+        return ('Secure (TLS) connection to the mail server failed. The '
+                'server certificate may have changed, or the server name or '
+                'port is wrong.')
 
-    if not e:
+    if ('resolve' in el or 'getaddrinfo' in el or 'connection refused' in el
+            or 'timed out' in el or 'network is unreachable' in el):
+        return ('Could not reach the mail server. Check the network, and '
+                'that the server name and port are right.')
+
+    if isinstance(exit_code, int) and exit_code < 0:
+        return (f'The sync was stopped before it finished (signal '
+                f'{-exit_code}), by an administrator or a service restart.'
+                + got + ' The next sync continues where it stopped.')
+
+    if errs:
+        msg = ' | '.join(errs[-3:])
+        if len(msg) > 300:
+            msg = msg[-300:]
+        return f'Sync error: {msg}'
+    if not raw:
         return 'Sync failed with no error details. Check that mbsync is installed.'
-
-    # Truncate but keep raw error if we can't parse it
-    if len(e) > 200:
-        e = e[:200] + '...'
-    return f'Sync error: {e}'
+    return 'Sync failed without an error message; see the sync log for details.'
 
 
 def get_maildir_stats(username, email):
@@ -1068,9 +1413,18 @@ def index():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    unavailable = auth_unavailable_message()
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
+
+        if unavailable:
+            # PAM asked for where there is none (Windows): say so instead
+            # of "Invalid username or password".
+            flash(unavailable)
+            return render_template('login.html',
+                                   auth_mode=CONFIG['auth_mode'],
+                                   auth_unavailable=unavailable)
 
         if not username or not password:
             flash('Username and password required.')
@@ -1088,7 +1442,8 @@ def login():
             flash('Invalid username or password.')
 
     return render_template('login.html',
-                           auth_mode=CONFIG['auth_mode'])
+                           auth_mode=CONFIG['auth_mode'],
+                           auth_unavailable=unavailable)
 
 
 @app.route('/logout')
@@ -1097,10 +1452,23 @@ def logout():
     return redirect(url_for('login'))
 
 
+def registration_open():
+    """Built-in sign-in lets anyone who reaches the login page create an
+    account. MAIL_ARCHIVER_REGISTRATION=closed turns that off (1.3.3), for
+    an installation whose accounts all exist already."""
+    return os.environ.get('MAIL_ARCHIVER_REGISTRATION', 'open').strip().lower() != 'closed'
+
+
+app.jinja_env.globals['registration_open'] = registration_open
+
+
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if CONFIG['auth_mode'] != 'builtin':
         abort(404)
+    if not registration_open():
+        flash('Registration is closed on this installation. Ask its administrator for an account.')
+        return redirect(url_for('login'))
     if request.method == 'POST':
         username = request.form.get('username', '').strip().lower()
         password = request.form.get('password', '')
@@ -1138,13 +1506,10 @@ def dashboard():
         acct['stats'] = get_maildir_stats(username, acct['email'])
         acct['provider_info'] = PROVIDERS.get(acct['provider'], {})
 
-    archive_dir = f"{CONFIG['data_dir']}/{username}"
+    archive_dir = os.path.join(CONFIG['data_dir'], username)
     if CONFIG['auth_mode'] == 'pam':
-        try:
-            import pwd
-            home_dir = pwd.getpwnam(username).pw_dir
-        except (KeyError, ImportError):
-            home_dir = archive_dir
+        pw = _pc.user_info(username)
+        home_dir = pw.home if pw is not None else archive_dir
     else:
         home_dir = archive_dir
 
@@ -1155,9 +1520,11 @@ def dashboard():
     # marker on the next manual `systemctl restart`.
     restart_pending = None
     try:
-        marker = '/run/mail-archiver/restart-pending'
-        if os.path.exists(marker):
-            with open(marker) as f:
+        # /run/mail-archiver/restart-pending; never written on Windows
+        # (no package upgrade under a running service there).
+        marker = os.path.join(_pc.runtime_dir(), 'restart-pending')
+        if _pc.supports_system_accounts() and os.path.exists(marker):
+            with open(marker, encoding='utf-8') as f:
                 restart_pending = f.read().strip()
     except OSError:
         pass
@@ -1212,7 +1579,7 @@ def add_account():
     username = session['username']
 
     # Item-1 (1.0.10): make the OAuth-app picker available at add-time so
-    # family onboarding is one form, not "add → dashboard → Settings →
+    # onboarding a new user is one form, not "add → dashboard → Settings →
     # pick app → back → Sign in". Filter to microsoft-provider apps (only
     # OAuth provider today).
     from oauth2_microsoft import list_oauth_apps, resolve_oauth_app
@@ -1387,7 +1754,7 @@ def update_credential(email):
 TLS_MODES = [
     ('ssl',      'SSL/TLS (IMAPS, port 993) — default'),
     ('starttls', 'STARTTLS (usually port 143)'),
-    ('none',     'Plaintext (NOT recommended)'),
+    ('none',     'Plaintext (NOT recommended; the built-in IMAP client refuses it)'),
 ]
 
 _ALLOWED_CERT_EXTS = {'.pem', '.crt', '.cer', '.key'}
@@ -1456,7 +1823,7 @@ def _oauth2_token_hint(username, email):
     if not token_file.exists():
         return {'authorized': False}
     try:
-        with open(token_file) as f:
+        with open(token_file, encoding='utf-8') as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return {'authorized': False, 'error': 'token file unreadable'}
@@ -1790,28 +2157,29 @@ def _parse_mbsync_line(line):
     }
 
 
-def _new_sync_job(username, target):
-    """Create a new job entry on disk. `target` is an email or '__all__'.
-    Returns the job_id (also encoded in the state filename + scope unit).
+def _new_sync_job(username, target, source='webui'):
+    """Claim a new job for `target` (an email or '__all__').
+
+    1.1.7: returns (job_id, None) on success, or (None, blocking_job) when a
+    sync for an overlapping target is already in flight. Never queues: a
+    second click, a second tab or a cron run that lands while a sync is
+    running gets the running job back instead of starting another mbsync
+    on the same maildirs.
     """
     _slc.purge_old_states(3600)
-    email = target if target != '__all__' else None
-    job_id = _slc.new_job_id(username, email)
-    _slc.write_state(job_id, {
-        'job_id': job_id,
-        'user': username,
-        'email': email,
-        'target': target,
+    return _slc.claim_sync(username, target, {
+        'source': source,
         'state': 'starting',
         'started_epoch': time.time(),
         'started': _slc.iso_utc_now(),
         'started_local': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'scope_unit': _slc.scope_unit_for(job_id),
         # 1.1.4: the worker that owns this job, plus the boot it belongs to.
         # The orphan reaper uses these to tell "worker died" from "worker is
         # busy measuring folders and has not spawned mbsync yet".
         'owner_pid': os.getpid(),
         'boot_id': _slc.current_boot_id(),
+        # The cron path writes no progress while mbsync runs.
+        'heartbeat': source != 'cron',
         'mbsync_pid': None,
         'progress': None,
         'last_line': '',
@@ -1819,11 +2187,52 @@ def _new_sync_job(username, target):
         'error': None,
         'finished': None,
     })
-    return job_id
+
+
+def _already_syncing_message(job):
+    """Plain-language refusal shown when a sync is already in flight."""
+    what = ('all accounts' if (job.get('target') or '__all__') == '__all__'
+            else job.get('target'))
+    since = job.get('started_local') or job.get('started') or 'earlier'
+    if _slc.is_state_stalled(job):
+        return (f'A sync of {what} started at {since} is still registered '
+                f'but has reported nothing for over '
+                f'{_slc.STALL_SECONDS // 60} minutes. A new sync was NOT '
+                f'started, because it would collide with that one. Ask the '
+                f'administrator to check it.')
+    return (f'A sync of {what} is already running (started {since}). '
+            f'Your click was ignored and nothing was queued. Please wait '
+            f'for it to finish; a first sync of a large mailbox can take '
+            f'hours, and clicking again does not make it faster.')
+
+
+def _already_syncing_response(job):
+    msg = _already_syncing_message(job)
+    if _wants_json():
+        return jsonify({
+            'error': 'already_syncing',
+            'message': msg,
+            'stalled': _slc.is_state_stalled(job),
+            'job_id': job.get('job_id'),
+            'target': job.get('target'),
+            'started': job.get('started_local') or job.get('started'),
+            'stream_url': url_for('sync_job_stream', job_id=job.get('job_id')),
+        }), 409
+    flash(msg)
+    return redirect(url_for('dashboard'))
 
 
 def _get_sync_job(job_id):
     return _slc.read_state(job_id)
+
+
+def _reap_if_dead(job):
+    """If `job` claims to be in flight but nothing runs it any more, mark
+    it failed (same wording as the orphan reaper) and return the new state."""
+    if job and _slc.is_state_orphaned(job):
+        _slc.reap_orphaned_states()
+        return _slc.read_state(job['job_id']) or job
+    return job
 
 
 def _update_sync_job(job_id, **updates):
@@ -1849,10 +2258,10 @@ def _plan_batches_for_account(username, account_email):
     if CONFIG['auth_mode'] != 'pam':
         return _plan_batches_inline(username, account_email)
 
-    import pwd as _pwd
-    try:
-        pw = _pwd.getpwnam(username)
-    except KeyError:
+    # PAM mode only (so Linux only): the paths in the child are those of
+    # the packaged server.
+    pw = _pc.user_info(username)
+    if pw is None:
         return None
     child = (
         "import json, sys, os\n"
@@ -1871,9 +2280,9 @@ def _plan_batches_for_account(username, account_email):
     try:
         result = subprocess.run(
             ['python3', '-c', child],
-            user=pw.pw_uid, group=pw.pw_gid,
-            extra_groups=_supplementary_gids(username, pw.pw_gid),
-            cwd=pw.pw_dir,
+            user=pw.uid, group=pw.gid,
+            extra_groups=_supplementary_gids(username, pw.gid),
+            cwd=pw.home,
             env=_mbsync_child_env(pw, username),
             capture_output=True, text=True, timeout=60,
         )
@@ -1904,6 +2313,10 @@ def _plan_batches_inline(username, account_email):
     tls_mode = (acct.get('tls_mode') or tls_default).lower()
     auth_type = acct.get('auth_type') or provider.get('auth', 'password')
     pattern = acct.get('folder_pattern') or '*'
+    # 1.3.0: folders of an open initial / rebase sync job stay out of the
+    # batches too (the batcher names folders explicitly).
+    bulk_excluded = _bulk.excluded_folders_for(
+        str(get_user_config_dir(username)), account_email)
 
     if auth_type == 'oauth2':
         safe_name = account_email.replace('@', '_at_').replace('.', '_')
@@ -1911,7 +2324,7 @@ def _plan_batches_inline(username, account_email):
         if not token_file.exists():
             return None
         try:
-            credential = token_file.read_text().strip()
+            credential = token_file.read_text(encoding='utf-8').strip()
         except OSError:
             return None
     else:
@@ -1929,6 +2342,7 @@ def _plan_batches_inline(username, account_email):
             auth_type=auth_type, folder_pattern=pattern)
     except BatcherError:
         return None
+    folders = [(n, c) for n, c in folders if n not in bulk_excluded]
 
     total = sum(c for _, c in folders)
     threshold = int(os.environ.get('MAIL_ARCHIVER_BATCH_THRESHOLD',
@@ -1991,8 +2405,9 @@ def _run_sync_background(job_id, username, account_email=None):
         status = get_sync_status(username)
         key = account_email or '__all__'
         status[key] = {'state': 'syncing',
-                       'started': time.strftime('%Y-%m-%d %H:%M:%S')}
-        _write_sync_status_locked(status_file, status)
+                       'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+                       **_sync_owner()}
+        _write_sync_status_locked(status_file, status, keys=[key])
 
         # P0 (1.0.16): refresh OAuth tokens BEFORE spawning mbsync AND
         # BEFORE the batcher measurement. In 1.1.0 the timer-driven
@@ -2011,15 +2426,16 @@ def _run_sync_background(job_id, username, account_email=None):
                                   'account settings page to renew.'),
                         'needs_reauth': True,
                     }
-                    _write_sync_status_locked(status_file, status)
+                    _write_sync_status_locked(status_file, status,
+                                              keys=[e_addr])
         except Exception as e:
             _state_mem['last_line'] = f'oauth pre-refresh error: {e}'
             _flush(force=True)
 
         if account_email:
-            safe_name = account_email.replace('@', '_at_').replace('.', '_')
-            safe_name = re.sub(r'[^a-zA-Z0-9_]', '', safe_name)
-            mbsync_arg = safe_name
+            # same name as generate_mbsyncrc (see run_sync: stripping the
+            # hyphen here asked isync for a channel that does not exist)
+            mbsync_arg = _bulk.safe_account_name(account_email)
         else:
             mbsync_arg = '-a'
 
@@ -2033,18 +2449,16 @@ def _run_sync_background(job_id, username, account_email=None):
         target_env = None
         target_groups = None
         if CONFIG['auth_mode'] == 'pam':
-            import pwd as _pwd
-            try:
-                pw = _pwd.getpwnam(username)
-            except KeyError:
+            pw = _pc.user_info(username)
+            if pw is None:
                 raise ValueError(
                     f'PAM user {username!r} not present on this host — '
                     f'cannot run mbsync as that identity')
-            target_uid = pw.pw_uid
-            target_gid = pw.pw_gid
-            target_cwd = pw.pw_dir
+            target_uid = pw.uid
+            target_gid = pw.gid
+            target_cwd = pw.home
             target_env = _mbsync_child_env(pw, username)
-            target_groups = _supplementary_gids(username, pw.pw_gid)
+            target_groups = _supplementary_gids(username, pw.gid)
             mbsync_argv = ['mbsync', '-V', mbsync_arg]
         else:
             archive_dir = Path(CONFIG['data_dir']) / username
@@ -2067,6 +2481,7 @@ def _run_sync_background(job_id, username, account_email=None):
                 _flush(force=True)
 
         def _line_cb(line):
+            line = redact_sync_output(line)
             tail_lines.append(line)
             if len(tail_lines) > 200:
                 tail_lines.pop(0)
@@ -2215,7 +2630,7 @@ def _run_sync_background(job_id, username, account_email=None):
                 'error': 'Some folder batches failed — see log for details',
             }
         else:
-            friendly = friendly_sync_error(raw_tail, account_email or '')
+            friendly = friendly_sync_error(raw_tail, account_email or '', rc)
             _update_sync_job(job_id, state='error', exit_code=rc,
                              error=friendly, finished=finished_local,
                              duration_s=duration)
@@ -2228,7 +2643,7 @@ def _run_sync_background(job_id, username, account_email=None):
             }
 
         _flush(force=True)
-        _write_sync_status_locked(status_file, status)
+        _write_sync_status_locked(status_file, status, keys=[key])
         _chown_user(status_file, username)
 
         if status[key].get('state') == 'ok':
@@ -2252,7 +2667,9 @@ def _wants_json():
 @login_required
 def sync_all():
     username = session['username']
-    job_id = _new_sync_job(username, '__all__')
+    job_id, running = _new_sync_job(username, '__all__')
+    if running:
+        return _already_syncing_response(running)
     t = threading.Thread(target=_run_sync_background,
                          args=(job_id, username, None), daemon=True)
     t.start()
@@ -2270,7 +2687,9 @@ def sync_all():
 @login_required
 def sync_account(email):
     username = session['username']
-    job_id = _new_sync_job(username, email)
+    job_id, running = _new_sync_job(username, email)
+    if running:
+        return _already_syncing_response(running)
     t = threading.Thread(target=_run_sync_background,
                          args=(job_id, username, email), daemon=True)
     t.start()
@@ -2287,13 +2706,15 @@ def sync_account(email):
 @app.route('/api/sync/<job_id>')
 @login_required
 def sync_job_status(job_id):
-    job = _get_sync_job(job_id)
+    job = _reap_if_dead(_get_sync_job(job_id))
     if not job or job.get('user') != session['username']:
         return jsonify({'error': 'not_found'}), 404
     return jsonify({
         'job_id': job_id,
         'state': job.get('state'),
         'target': job.get('target'),
+        'source': job.get('source'),
+        'heartbeat': job.get('heartbeat', True),
         'started': job.get('started_local') or job.get('started'),
         'finished': job.get('finished'),
         'exit_code': job.get('exit_code'),
@@ -2314,10 +2735,29 @@ def sync_job_stream(job_id):
     def event_stream():
         last_progress = None
         last_heartbeat = time.time()
+        last_reap_check = 0.0
         stream_start = time.time()
+        # 1.1.11: say what is running straight away. A scheduled (cron)
+        # sync writes no progress, so without this the page sat on
+        # "Reconnecting to in-flight sync..." for the whole run.
+        yield ('event: state\ndata: '
+               + json.dumps({'state': job.get('state'),
+                             'target': job.get('target'),
+                             'source': job.get('source'),
+                             'heartbeat': job.get('heartbeat', True),
+                             'started': job.get('started_local')
+                                        or job.get('started')})
+               + '\n\n')
         # Poll the state file every 500ms. Cheap (small file, tmpfs).
         while True:
             current = _get_sync_job(job_id)
+            # 1.1.11: a job whose worker died (service restart, worker
+            # recycle) stays 'running' on disk; only the dashboard render
+            # used to reap it, so an open stream pinged forever. Check
+            # every 10s and turn it into a final error event.
+            if current and time.time() - last_reap_check >= 10:
+                last_reap_check = time.time()
+                current = _reap_if_dead(current)
             if not current:
                 yield 'event: error\ndata: {"error":"job_gone"}\n\n'
                 return
@@ -2467,7 +2907,9 @@ def search_maildir(username, query, account_filter=None, max_results=100):
             search_dirs.append(str(acct_dir))
     else:
         for d in archive_dir.iterdir():
-            if d.is_dir() and not d.name.startswith('.'):
+            # 1.3.0: _import holds files waiting to be imported, not Maildirs
+            if (d.is_dir() and not d.name.startswith('.')
+                    and d.name != _pst.IMPORT_DIRNAME):
                 search_dirs.append(str(d))
 
     if not search_dirs:
@@ -2476,21 +2918,54 @@ def search_maildir(username, query, account_filter=None, max_results=100):
     # Pass 1: Fast grep for candidate files
     # Use grep -rl for file list, case-insensitive, binary-safe
     candidate_files = []
-    try:
-        cmd = [
-            'grep', '-rl', '-i', '--include=*', '-m', '1',
-            '--', query
-        ] + search_dirs
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            candidate_files = [
-                f for f in result.stdout.strip().split('\n')
-                if f and ('/cur/' in f or '/new/' in f)
-            ]
-    except (subprocess.TimeoutExpired, Exception):
-        pass
+
+    def _in_maildir(path):
+        # .../cur/<file> or .../new/<file>, with either path separator
+        parts = path.replace('\\', '/').split('/')
+        return 'cur' in parts[:-1] or 'new' in parts[:-1]
+
+    if _pc.have_tool('grep'):
+        try:
+            cmd = [
+                'grep', '-rl', '-i', '--include=*', '-m', '1',
+                '--', query
+            ] + search_dirs
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                candidate_files = [
+                    f for f in result.stdout.strip().split('\n')
+                    if f and _in_maildir(f)
+                ]
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+    else:
+        # No grep (Windows): the same first pass in Python, stopped at
+        # the same 30 seconds.
+        needle = query.lower().encode('utf-8', 'replace')
+        deadline = time.monotonic() + 30
+        for top in search_dirs:
+            for root, _dirs, files in os.walk(top):
+                if os.path.basename(root) not in ('cur', 'new'):
+                    continue
+                for name in files:
+                    fpath = os.path.join(root, name)
+                    try:
+                        with open(fpath, 'rb') as fh:
+                            if needle in fh.read().lower():
+                                candidate_files.append(fpath)
+                    except OSError:
+                        pass
+                    if (len(candidate_files) >= max_results * 2
+                            or time.monotonic() > deadline):
+                        break
+                else:
+                    continue
+                break
+            else:
+                continue
+            break
 
     # Cap candidates before parsing
     candidate_files = candidate_files[:max_results * 2]
@@ -2641,7 +3116,7 @@ def search():
 
     # Export handler
     if export_format in ('mbox', 'eml') and results:
-        return _export_results(results, export_format, query)
+        return _export_results(results, export_format, query, username)
 
     return render_template('search.html',
                            username=username,
@@ -2660,20 +3135,22 @@ def search():
                            total_in_index=total_in_index)
 
 
-def _export_results(results, fmt, query):
+def _export_results(results, fmt, query, username):
     """Export search results as MBOX or EML zip."""
     from io import BytesIO
     import zipfile
 
-    # Path traversal guard: only allow files under the user's data directory
-    data_root = os.path.realpath(CONFIG['data_dir'])
+    # Only files under the user's OWN folder (1.3.2; until then the whole
+    # data directory passed, as the viewer did before 1.3.1). The paths
+    # come from the user's own search index, so this is a second fence.
+    own_root = _readable_root(username)
 
     def _safe_path(filepath):
-        """Return True only if filepath is under the data directory."""
+        """Return True only if filepath is under the user's own folder."""
         if not filepath:
             return False
         real = os.path.realpath(filepath)
-        return real.startswith(data_root + os.sep) and os.path.isfile(real)
+        return _path_is_under(real, own_root) and os.path.isfile(real)
 
     if fmt == 'mbox':
         # MBOX format: concatenate raw email files with From_ separator
@@ -2711,6 +3188,22 @@ def _export_results(results, fmt, query):
                          download_name=f'search_{safe_query}.zip')
 
 
+def _readable_root(username):
+    """The directory a logged-in user's message paths must lie under.
+
+    Always the user's OWN folder. Up to 1.3.0 this was the whole data
+    directory, so a logged-in user could open another user's message by
+    passing its path (and, on Windows, the application's own key files).
+    """
+    data_root = os.path.realpath(CONFIG['data_dir'])
+    return os.path.join(data_root, username)
+
+
+def _path_is_under(real_path, root):
+    # normcase: Windows paths compare without case; a no-op on Linux.
+    return os.path.normcase(real_path).startswith(os.path.normcase(root) + os.sep)
+
+
 @app.route('/email/view')
 @login_required
 def view_email():
@@ -2723,12 +3216,13 @@ def view_email():
     if not filepath:
         abort(400)
     real_path = os.path.realpath(filepath)
-    if not real_path.startswith(data_root + os.sep) or not os.path.isfile(real_path):
+    if not _path_is_under(real_path, _readable_root(username)) or not os.path.isfile(real_path):
         abort(403)
 
     # Parse the raw email
     try:
-        raw_bytes = open(real_path, 'rb').read()
+        with open(real_path, 'rb') as _fh:
+            raw_bytes = _fh.read()
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
     except Exception:
         flash('Could not read email file.')
@@ -2823,11 +3317,12 @@ def download_attachment():
     if not filepath:
         abort(400)
     real_path = os.path.realpath(filepath)
-    if not real_path.startswith(data_root + os.sep) or not os.path.isfile(real_path):
+    if not _path_is_under(real_path, _readable_root(username)) or not os.path.isfile(real_path):
         abort(403)
 
     try:
-        raw_bytes = open(real_path, 'rb').read()
+        with open(real_path, 'rb') as _fh:
+            raw_bytes = _fh.read()
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
     except Exception:
         abort(404)
@@ -2860,31 +3355,66 @@ def rebuild_search_index():
     """Rebuild the FTS5 search index from Maildir."""
     from search_index import rebuild_index
     username = session['username']
-    result = rebuild_index(username, CONFIG['data_dir'])
+    try:
+        result = rebuild_index(username, CONFIG['data_dir'])
+    except PermissionError:
+        if not _pc.IS_WINDOWS:
+            raise
+        # Windows: a damaged index cannot be moved aside while a sync or an
+        # import still has it open.
+        flash('The search index is in use by a running sync or import. '
+              'Try again when it has finished.')
+        return redirect(url_for('search'))
     flash(f'Search index rebuilt: {result["indexed"]} emails indexed in {result["total_time"]:.1f}s.')
     return redirect(url_for('search'))
 
 
-def _stagger_offset(email):
-    """Derive a deterministic offset (0-3599 seconds) from email for staggering."""
-    return int(hashlib.md5(email.encode()).hexdigest()[:8], 16) % 3600
+# 1.2.0: accounts on different IMAP servers sync in parallel, at most this
+# many at once; accounts on the same server never overlap (see
+# sync_lifecycle "daily schedule, one lane per IMAP server").
+MAX_PARALLEL_SYNCS = max(1, int(os.environ.get('MAIL_ARCHIVER_MAX_PARALLEL_SYNCS', '4')))
+# Hour of the first slot on every server; the rest follow every 24/n hours.
+SCHEDULE_START_HOUR = int(os.environ.get('MAIL_ARCHIVER_SCHEDULE_START_HOUR', '0')) % 24
 
 
-def scheduled_sync():
-    """Run scheduled syncs for all users. Called by cron hourly.
+def _account_server(acct):
+    """The IMAP server an account syncs from, as a schedule lane key."""
+    provider = PROVIDERS.get(acct.get('provider', ''), {})
+    return _slc.server_key(acct.get('host') or provider.get('host', ''),
+                           acct.get('provider'))
 
-    Accounts are auto-staggered: sorted by a hash of their email
-    address with brief pauses between syncs, so multiple accounts
-    don't all hit their IMAP servers simultaneously.
+
+def _status_epoch(entry):
+    """When the account's last sync started (finished, for entries written
+    before 1.2.0 recorded the start)."""
+    for field in ('started', 'finished'):
+        value = (entry or {}).get(field)
+        if value:
+            try:
+                return time.mktime(time.strptime(value, '%Y-%m-%d %H:%M:%S'))
+            except ValueError:
+                pass
+    return None
+
+
+def sync_schedule_plan(now=None):
+    """Every scheduled account with its lane, slot and due state.
+
+    Returns a list of dicts sorted by server then slot: user, email,
+    server, interval, interval_secs, slot, last_started, due, slot_epoch.
     """
+    now = now or time.time()
     data_dir = Path(CONFIG['data_dir'])
     if not data_dir.exists():
-        return
-    now = time.time()
-    due = []
-
+        return []
+    rows = []
     for userdir in sorted(data_dir.iterdir()):
         if not userdir.is_dir() or userdir.name.startswith('.'):
+            continue
+        if _pc.IS_WINDOWS and not (userdir / '.config').is_dir():
+            # There the data directory also holds the application's own
+            # folders (certs): not a user, and load_accounts() would
+            # create a .config inside it.
             continue
         username = userdir.name
         accounts = load_accounts(username)
@@ -2898,30 +3428,847 @@ def scheduled_sync():
             interval_secs = SYNC_INTERVALS.get(interval_key, {}).get('seconds', 86400)
             if interval_secs == 0:
                 continue
-            acct_status = sync_status.get(acct['email'], {})
-            last_finished = acct_status.get('finished', '')
-            if last_finished:
-                try:
-                    last_ts = time.mktime(time.strptime(last_finished, '%Y-%m-%d %H:%M:%S'))
-                    if now - last_ts < interval_secs:
-                        continue
-                except ValueError:
-                    pass
-            due.append((username, acct['email'], interval_key,
-                        _stagger_offset(acct['email'])))
+            rows.append({
+                'user': username, 'email': acct['email'],
+                'server': _account_server(acct),
+                'interval': interval_key, 'interval_secs': interval_secs,
+                'last_started': _status_epoch(sync_status.get(acct['email'])),
+            })
+    slots = _slc.assign_slots(((r['user'], r['email'], r['server']) for r in rows),
+                              SCHEDULE_START_HOUR)
+    for r in rows:
+        r['slot'] = slots[(r['user'], r['email'])]
+        r['slot_epoch'] = _slc.last_slot_epoch(now, r['slot'], r['interval_secs'])
+        r['due'] = _slc.is_due(now, r['slot'], r['interval_secs'], r['last_started'])
+    rows.sort(key=lambda r: (r['server'], r['slot'], r['user'], r['email']))
+    return rows
 
-    # Sort by stagger hash so accounts sync in a deterministic spread order
-    due.sort(key=lambda x: x[3])
-    print(f'=== Scheduled sync: {len(due)} account(s) due at {time.strftime("%Y-%m-%d %H:%M:%S")} ===')
 
-    for i, (username, email, interval_key, _) in enumerate(due):
-        if i > 0:
-            time.sleep(10)  # 10s pause between accounts
-        print(f'Syncing {email} for {username} (interval: {interval_key})')
+def _busy_servers():
+    """Servers with a sync in flight right now, from any source (an
+    earlier hour's cron run, a WebUI click, a "Sync all")."""
+    busy = {}
+    _slc.reap_orphaned_states()
+    for st in _slc.list_all_states():
+        if st.get('state') not in _slc.ACTIVE_STATES:
+            continue
+        user, target = st.get('user'), st.get('target') or '__all__'
+        for acct in load_accounts(user) if user else []:
+            if target == '__all__' or acct['email'] == target:
+                busy.setdefault(_account_server(acct), st)
+    return busy
+
+
+def _scheduled_sync_one(username, email, interval_key):
+    # 1.1.7: the cron run claims the account like a WebUI click does, so
+    # it never overlaps a sync already in flight (a WebUI sync, or the
+    # previous hour's cron run still downloading a large mailbox).
+    job_id, running = _new_sync_job(username, email, source='cron')
+    if running:
+        print(f'Skipping {email} for {username}: a sync is already in '
+              f'flight (job {running.get("job_id")}, '
+              f'{running.get("source", "webui")}, started '
+              f'{running.get("started_local") or running.get("started")})',
+              flush=True)
+        return
+    print(f'Syncing {email} for {username} (interval: {interval_key})', flush=True)
+    _update_sync_job(job_id, state='syncing')
+    try:
         result = run_sync(username, email)
-        print(f'  -> {result.get("state", "error")}')
+    except Exception as e:
+        result = {'state': 'error', 'error': str(e)}
+    _update_sync_job(
+        job_id,
+        state='done' if result.get('state') == 'ok' else 'error',
+        exit_code=result.get('exit_code'),
+        error=result.get('error'),
+        finished=time.strftime('%Y-%m-%d %H:%M:%S'))
+    print(f'  {email} -> {result.get("state", "error")}', flush=True)
+
+
+def _scheduled_lane(rows):
+    """One server's accounts for this hour, one after another."""
+    for i, r in enumerate(rows):
+        if i > 0:
+            time.sleep(10)
+        _scheduled_sync_one(r['user'], r['email'], r['interval'])
+
+
+def scheduled_sync():
+    """Run the scheduled syncs that are due this hour. Called by cron hourly.
+
+    1.2.0: each account has a fixed hour (sync_schedule_plan). Accounts on
+    different IMAP servers run in parallel, up to MAX_PARALLEL_SYNCS at
+    once, 10 s apart; on one server they never overlap, and a server whose
+    previous sync is still running waits for the next hourly run. An
+    account whose hour was missed (host down, server busy) runs at the
+    next hourly run.
+    """
+    plan = sync_schedule_plan()
+    due = [r for r in plan if r['due']]
+    print(f'=== Scheduled sync: {len(due)} account(s) due at '
+          f'{time.strftime("%Y-%m-%d %H:%M:%S")} ===', flush=True)
+    if not due:
+        print('=== Done ===')
+        return
+
+    per_server = {}
+    for r in plan:
+        per_server[r['server']] = per_server.get(r['server'], 0) + 1
+    lanes = {}
+    for r in sorted(due, key=lambda r: (r['slot_epoch'], r['user'], r['email'])):
+        lanes.setdefault(r['server'], []).append(r)
+
+    busy = _busy_servers()
+    work = []
+    for server, rows in sorted(lanes.items(), key=lambda kv: kv[1][0]['slot_epoch']):
+        if server in busy:
+            st = busy[server]
+            for r in rows:
+                print(f'Skipping {r["email"]} for {r["user"]}: {server} is busy '
+                      f'with a sync of {st.get("target")} (job '
+                      f'{st.get("job_id")}, started '
+                      f'{st.get("started_local") or st.get("started")}); '
+                      f'it runs at the next hourly run', flush=True)
+            continue
+        work.append(rows[:_slc.lane_capacity(per_server[server])])
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_SYNCS, max(1, len(work)))) as pool:
+        futures = []
+        for i, rows in enumerate(work):
+            if i > 0:
+                time.sleep(10)  # 10 s between lane starts
+            futures.append(pool.submit(_scheduled_lane, rows))
+        for f in futures:
+            f.result()
 
     print(f'=== Done ===')
+
+
+# --- In-process hourly schedule (hosts without cron: Windows) ---
+#
+# On Linux /etc/cron.d/mail-archiver runs `app.py scheduled-sync`, `import`
+# and `bulk-sync` once an hour. The Windows application has no cron, so its
+# launcher calls start_background_scheduler() once after importing this
+# module; the same three passes then run in a daemon thread at the top of
+# every hour. Nothing starts it on Linux.
+
+_SCHEDULER_LOCK = threading.Lock()
+_SCHEDULER_THREAD = None
+
+
+def run_hourly_passes():
+    """What the hourly cron runs, in the same order. One pass failing does
+    not stop the next."""
+    for name, job in (('scheduled-sync', scheduled_sync),
+                      ('import', scheduled_mail_import),
+                      ('bulk-sync', lambda: _bulk_routes.cli([]))):
+        try:
+            job()
+        except (Exception, SystemExit) as e:   # SystemExit: an argparse path
+            print(f'hourly {name} pass failed: {type(e).__name__}: {e}',
+                  flush=True)
+
+
+def _seconds_to_next_hour(now=None):
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    return max(1.0, 3600 - (lt.tm_min * 60 + lt.tm_sec))
+
+
+def _scheduler_loop(stop_event):
+    while not stop_event.wait(_seconds_to_next_hour()):
+        run_hourly_passes()
+
+
+def start_background_scheduler():
+    """Start the in-process hourly schedule (idempotent). Returns the
+    threading.Event that stops it when set."""
+    global _SCHEDULER_THREAD
+    with _SCHEDULER_LOCK:
+        if _SCHEDULER_THREAD is not None and _SCHEDULER_THREAD[0].is_alive():
+            return _SCHEDULER_THREAD[1]
+        try:
+            # The Windows application's "service start" (gunicorn does the
+            # same from post_worker_init).
+            heal_stale_sync_status_all()
+        except Exception:
+            pass
+        stop_event = threading.Event()
+        t = threading.Thread(target=_scheduler_loop, args=(stop_event,),
+                             name='mail-archiver-scheduler', daemon=True)
+        t.start()
+        _SCHEDULER_THREAD = (t, stop_event)
+        return stop_event
+
+
+def print_sync_schedule():
+    """`app.py sync-schedule`: the daily plan, one line per account."""
+    plan = sync_schedule_plan()
+    fmt = lambda t: time.strftime('%m-%d %H:%M', time.localtime(t)) if t else 'never'
+    print(f'{"server":24} {"slot":5} {"interval":8} {"last start":11} {"due":3}  account')
+    for r in plan:
+        print(f'{r["server"][:24]:24} {r["slot"]:02d}:00 {r["interval"]:8} '
+              f'{fmt(r["last_started"]):11} {"yes" if r["due"] else "no":3}  '
+              f'{r["user"]}/{r["email"]}')
+
+
+# --- Mail import (1.3.0) ---
+#
+# Every mail account has an import folder,
+# <data_dir>/<user>/_import/<account_slug>/{inbox,done,failed}/ : what lands
+# in inbox/ (a file or a directory; PST, mbox, Maildir, eml, emlx, msg, zip,
+# tar) is imported into that account. The hourly cron runs
+# `mail-archiver-scheduled-sync import`, which imports for every user whose
+# import schedule is due; the WebUI starts the same pass for one file. The
+# conversion itself runs AS THE MAILBOX OWNER (like mbsync), so mail lands
+# owned by the user and an untrusted file is never parsed with the
+# service's capabilities. The engine, the ledger and the retention rules
+# are in mail_import.py; this section is the privilege model and the routes.
+
+IMPORT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mail_import.py')
+APP_SCRIPT = os.path.abspath(__file__)
+IMPORT_CONFIG = 'mail_import.json'
+IMPORT_CONFIG_LEGACY = 'pst_import.json'        # 1.2.x name, read if present
+IMPORT_STATE = 'mail_import_state.json'
+
+
+def _save_user_json(username, filename, data):
+    """Atomic write of a per-user .config JSON file, 0640 <user>:mail-archiver
+    (same ownership model as accounts.json, so the service can read what
+    the root cron wrote and vice versa)."""
+    config_dir = get_user_config_dir(username)
+    path = config_dir / filename
+    tmp = config_dir / f'.{filename}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    os.chmod(str(tmp), 0o640)
+    _chown_user(tmp, username)
+    service_group = _pc.group_info('mail-archiver')
+    if service_group is not None:
+        try:
+            st = os.stat(str(tmp))
+            _pc.chown(str(tmp), st.st_uid, service_group.gid)
+        except OSError:
+            pass
+    _pc.replace_file(str(tmp), str(path))
+
+
+def _load_user_json(username, filename, default):
+    path = get_user_config_dir(username) / filename
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def load_import_config(username, accounts=None):
+    if accounts is None:
+        accounts = load_accounts(username)
+    raw = _load_user_json(username, IMPORT_CONFIG, None)
+    if raw is None:
+        raw = _load_user_json(username, IMPORT_CONFIG_LEGACY, None)
+    cfg = _pst.normalize_config(raw or {}, [a['email'] for a in accounts])
+    cfg['configured'] = raw is not None
+    return cfg
+
+
+def load_import_state(username):
+    s = _load_user_json(username, IMPORT_STATE, None)
+    return s if isinstance(s, dict) else {'last_scheduled_run': None}
+
+
+def _import_child_kwargs(username):
+    """subprocess kwargs that run a child as the mailbox owner (PAM mode),
+    mirroring run_sync's mbsync spawn. Builtin mode runs as ourselves."""
+    if CONFIG['auth_mode'] != 'pam':
+        return {}
+    if not _pc.supports_system_accounts():
+        return {}            # Windows: one user, nobody to switch to
+    pw = _pc.user_info(username)
+    if pw is None:
+        raise KeyError(f'getpwnam(): name not found: {username!r}')
+    if _pc.current_uid() == pw.uid:
+        return {}
+    return {
+        'user': pw.uid,
+        'group': pw.gid,
+        'extra_groups': _supplementary_gids(username, pw.gid),
+        'env': {'HOME': pw.home, 'USER': username, 'LOGNAME': username,
+                'LANG': 'C.UTF-8',
+                'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'},
+    }
+
+
+def _import_convert_as_user(username):
+    def convert(path, typ, name, maildir, work_dir, cache_path):
+        cmd = [sys.executable, '-I', IMPORT_SCRIPT, 'convert',
+               '--path', path, '--type', typ, '--name', name,
+               '--maildir', maildir, '--work', work_dir, '--cache', cache_path,
+               '--readpst', _pst.READPST, '--msgconvert', _imp.MSGCONVERT,
+               '--timeout', str(_pst.READPST_TIMEOUT),
+               '--max-message-bytes', str(_pst.MAX_MESSAGE_BYTES)]
+        kw = _import_child_kwargs(username)
+        # (Linux: PATH=/usr/sbin:/usr/bin:/sbin:/bin and LANG=C.UTF-8.)
+        env = dict(kw.get('env') or _pc.minimal_child_env())
+        # The importer's own limits and tool paths (no secrets among them).
+        env.update({k: v for k, v in os.environ.items()
+                    if k.startswith('MAIL_ARCHIVER_IMPORT_') or k == 'MAIL_ARCHIVER_ZSTD'})
+        kw['env'] = env
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, cwd=os.path.dirname(work_dir),
+                             timeout=_pst.READPST_TIMEOUT + 6 * 3600, **kw)
+        lines = [l for l in (res.stdout or '').splitlines() if l.strip()]
+        try:
+            return json.loads(lines[-1])
+        except (IndexError, ValueError):
+            return {'status': 'failed',
+                    'error': f'converter exited {res.returncode}: '
+                             f'{(res.stderr or "").strip()[-300:]}'}
+    return convert
+
+
+def _import_compress_as_user(username):
+    """zstd for archived PST/mbox files. The compressed copy is tested
+    before the original is removed, so done/ never holds an unverified
+    copy (retention rule R2)."""
+    zstd = shutil.which('zstd')
+    if not zstd:
+        return None
+
+    def compress(path):
+        # Every step, the removals included, runs as the mailbox owner:
+        # `path` is a name in a folder the owner can rearrange, so nothing
+        # is unlinked by name with the service's or root's privileges.
+        dest = path + '.zst'
+        kw = _import_child_kwargs(username)
+
+        def run(cmd):
+            subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=6 * 3600, check=True, **kw)
+
+        def remove(target):
+            if _pc.IS_WINDOWS:
+                # No rm there; still a child, like every other step.
+                run([sys.executable, '-I', '-c',
+                     'import pathlib, sys; '
+                     'pathlib.Path(sys.argv[1]).unlink(missing_ok=True)',
+                     target])
+            else:
+                run(['rm', '-f', '--', target])
+
+        try:
+            run([zstd, '-q', '-f', '-T0', '-o', dest, path])
+            run([zstd, '-q', '-t', dest])
+        except BaseException:
+            try:
+                remove(dest)
+            except Exception:
+                pass
+            raise
+        remove(path)
+        return dest
+    return compress
+
+
+def _import_prepare(username):
+    """Give a file or a directory tree we received to the mailbox owner,
+    so the converter (running as that user) can read it. Never through a
+    link: lchown only, and a tree is walked by directory fd."""
+    def prepare(path):
+        if CONFIG['auth_mode'] != 'pam':
+            return
+        if not _pc.supports_system_accounts():
+            return
+        import stat as _stat
+        pw = _pc.user_info(username)
+        if pw is None:
+            return
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return
+        try:
+            if _stat.S_ISREG(st.st_mode):
+                _pc.lchown(path, pw.uid, pw.gid)
+                if not (st.st_mode & 0o400):
+                    os.chmod(path, (st.st_mode & 0o7777) | 0o400)
+            elif _stat.S_ISDIR(st.st_mode):
+                # lchown on the top, then a walk by directory fd
+                _pc.chown_tree_nofollow(path, pw.uid, pw.gid)
+        except OSError:
+            pass
+    return prepare
+
+
+def _import_index(username):
+    def index(account):
+        from search_index import index_maildir
+        index_maildir(username, CONFIG['data_dir'], account_filter=account)
+    return index
+
+
+def open_import_ledger(username):
+    """The import ledger: tables in the user's index database."""
+    from search_index import get_index_db
+    return _imp.Ledger(get_index_db(username, CONFIG['data_dir']))
+
+
+# How long a starting import waits for the per-user lock. The status probe
+# (mail_import_running, polled by the page) holds the lock shared for a
+# moment; without the wait, a poll at the wrong instant made an import that
+# had just been started give up as "another import is running".
+IMPORT_LOCK_WAIT = 5.0
+
+
+def _import_lock(username, wait=0.0, shared=False):
+    """Per-user import lock. Returns an fd, or None if another import for
+    this user is running (still, after `wait` seconds of retrying).
+    `shared` is the probe: it conflicts with a running import but not with
+    another probe. O_RDONLY, like claim_sync (1.1.8): the root cron and the
+    service user must both be able to open it."""
+    path = get_user_config_dir(username) / 'mail_import.lock'
+    fd = os.open(str(path), os.O_RDONLY | os.O_CREAT, 0o644)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            _pc.lock_fd(fd, exclusive=not shared, blocking=False)
+            break
+        except _pc.LockUnavailable:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
+    if not shared:
+        _chown_user(path, username)
+    return fd
+
+
+def mail_import_running(username):
+    """True while an import pass of this user holds the lock. A shared,
+    non-blocking probe: two probes never see each other as an import."""
+    fd = _import_lock(username, shared=True)
+    if fd is None:
+        return True
+    os.close(fd)
+    return False
+
+
+def _import_owners(username):
+    """uids that may own a directory of the user's import tree: the
+    mailbox owner, root, and the service (it creates them, then chowns).
+    None in builtin mode, where every user's files are the service's."""
+    if CONFIG['auth_mode'] != 'pam':
+        return None
+    if not _pc.supports_system_accounts():
+        return None
+    owners = {0, _pc.current_uid()}
+    for name in (username, 'mail-archiver'):    # the owner; the service account
+        pw = _pc.user_info(name)
+        if pw is not None:
+            owners.add(pw.uid)
+    return owners
+
+
+def make_importer(username, cfg=None, accounts=None, log=print, stable_wait=None):
+    accounts = load_accounts(username) if accounts is None else accounts
+    cfg = cfg or load_import_config(username, accounts)
+    return _imp.UserImporter(
+        CONFIG['data_dir'], username, accounts, cfg,
+        convert=_import_convert_as_user(username),
+        prepare=_import_prepare(username),
+        index=_import_index(username),
+        open_ledger=lambda: open_import_ledger(username),
+        compress=_import_compress_as_user(username),
+        log=log,
+        stable_wait=_pst.STABLE_WAIT if stable_wait is None else stable_wait,
+        owners=_import_owners(username))
+
+
+def _exclude_imported_folders_from_sync(username):
+    """After an import: if an account's channel in ~/.mbsyncrc does not yet
+    leave out the importer's local-only folders (`PST/`, `Imported/`),
+    regenerate the file. isync fails a whole-channel run on a near-side
+    folder that has no far-side partner (bulk_sync.IMPORT_TOP_FOLDERS).
+    The file is rewritten only when a channel's Patterns line would
+    change. Never raises: an import must not fail over this."""
+    try:
+        config_dir = str(get_user_config_dir(username))
+        rc_text = _bulk_routes.mbsyncrc_path(username).read_text(encoding='utf-8')
+        for acct in load_accounts(username):
+            if not acct.get('enabled', True):
+                continue
+            have = _bulk.rc_patterns(rc_text, _bulk.safe_account_name(acct['email']))
+            if have is not None and have != _bulk.regular_sync_pattern(config_dir, acct):
+                generate_mbsyncrc(username)
+                print(f'Import for {username}: imported folders are now left out '
+                      f'of the regular sync (.mbsyncrc regenerated)', flush=True)
+                return True
+    except Exception as e:
+        print(f'Import for {username}: could not update .mbsyncrc for the '
+              f'imported folders: {type(e).__name__}: {e}', flush=True)
+    return False
+
+
+def mail_import_user(username, only=None, trigger='scheduled', stable_wait=None):
+    """One import pass for one user under the per-user lock. `only` is
+    (account or None, file name). Returns the summary, or None when another
+    import for the user is running."""
+    fd = _import_lock(username, wait=IMPORT_LOCK_WAIT)
+    if fd is None:
+        print(f'Import for {username}: another import is running, skipped', flush=True)
+        return None
+    try:
+        imp = make_importer(username, stable_wait=stable_wait,
+                            log=lambda m: print(m, flush=True))
+        try:
+            return imp.run(only=only, trigger=trigger)
+        finally:
+            _exclude_imported_folders_from_sync(username)
+    finally:
+        _pc.unlock_fd(fd)
+        os.close(fd)
+
+
+def scheduled_mail_import(now=None):
+    """Hourly cron entry: import for every user whose import schedule is
+    due. A pass that left something to retry (a file still changing, low
+    disk) does not count as the scheduled run, so it is retried next hour."""
+    now = now or time.time()
+    data_dir = Path(CONFIG['data_dir'])
+    print(f'=== Mail import check at {time.strftime("%Y-%m-%d %H:%M:%S")} ===', flush=True)
+    if not data_dir.exists():
+        return
+    for userdir in sorted(data_dir.iterdir()):
+        if not userdir.is_dir() or userdir.name.startswith('.'):
+            continue
+        if not any((userdir / '.config' / n).exists()
+                   for n in (IMPORT_CONFIG, IMPORT_CONFIG_LEGACY)):
+            continue
+        username = userdir.name
+        cfg = load_import_config(username)
+        if not cfg['enabled']:
+            continue
+        state = load_import_state(username)
+        if not _pst.is_import_due(cfg['schedule'], state.get('last_scheduled_run'), now):
+            continue
+        print(f'Import for {username}', flush=True)
+        try:
+            summary = mail_import_user(username, trigger='scheduled')
+        except Exception as e:
+            print(f'Import for {username} failed: {type(e).__name__}: {e}', flush=True)
+            continue
+        if summary is None or summary.get('retry'):
+            continue
+        state['last_scheduled_run'] = now
+        _save_user_json(username, IMPORT_STATE, state)
+    print('=== Done ===', flush=True)
+
+
+def _spawn_mail_import(username, account=None, file_name=None):
+    """Start a manual import in its own process so it outlives the request
+    and any gunicorn worker recycle; progress lands in the ledger."""
+    cmd = [sys.executable, APP_SCRIPT, 'import', '--user', username, '--manual']
+    if account:
+        cmd += ['--account', account]
+    if file_name:
+        cmd += ['--file', file_name]
+    proc = subprocess.Popen(cmd, cwd=os.path.dirname(APP_SCRIPT), env=dict(os.environ),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            **_pc.detached_popen_kwargs())  # start_new_session
+    # Reap it when it ends (as bulk_sync_routes.spawn_manual_run does), or
+    # every manual import leaves a zombie until the worker is recycled.
+    threading.Thread(target=proc.wait, daemon=True).start()
+
+
+def print_import_ledger(username, events=False, limit=50, as_json=False):
+    """`app.py import --user U --ledger [--events]`: the import ledger (or
+    the retention audit trail), newest first."""
+    led = open_import_ledger(username)
+    try:
+        rows = led.events(limit) if events else led.rows(limit)
+    finally:
+        led.close()
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return
+    if events:
+        print(f'{"id":>5} {"at":19} {"action":8} {"rule":5} {"copy date":10} account / name / reason')
+        for r in rows:
+            print(f'{r["id"]:>5} {r["at"]:19} {r["action"]:8} {r["rule"]:5} '
+                  f'{r["copy_date"]:10} {r["account"]} / {r["name"]} / {r["reason"]}')
+        return
+    print(f'{"id":>5} {"finished":19} {"status":8} {"type":9} {"imported":>8} {"dup":>7} '
+          f'{"failed":>6} {"big":>4} {"sha256":16} account / file -> prefix')
+    for r in rows:
+        print(f'{r["id"]:>5} {r["finished_at"] or r["started_at"] or r["queued_at"]:19} '
+              f'{r["status"]:8} {r["detected_type"]:9} {r["imported"]:>8} '
+              f'{r["duplicates"]:>7} {r["failed"]:>6} {r["too_large"]:>4} '
+              f'{r["sha256"][:16]:16} {r["account"]} / {r["original_name"]} -> '
+              f'{r["target_prefix"]}' + (f'  [{r["error"]}]' if r['error'] else ''))
+
+
+def _fmt_bytes(n):
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024
+
+
+@app.route('/import')
+@login_required
+def mail_import_page():
+    import datetime as _dt
+    username = session['username']
+    accounts = load_accounts(username)
+    emails = [a['email'] for a in accounts]
+    cfg = load_import_config(username, accounts)
+    try:
+        imp = make_importer(username, cfg=cfg, accounts=accounts)
+    except ValueError as e:
+        flash(f'Watch folder setting ignored: {e}')
+        cfg['watch_dir'] = ''
+        imp = make_importer(username, cfg=cfg, accounts=accounts)
+    tree_error = ''
+    try:
+        imp.ensure_dirs()
+    except _imp.UnsafeImportTree as e:
+        tree_error = str(e)
+    except OSError as e:
+        flash(f'Could not create the import folders: {e.strerror or e}')
+    today = _dt.date.today()
+
+    def waiting(c):
+        typ, how = _imp.detect_unit(c.get('io') or c['path'])
+        return {'name': c['name'], 'size': _fmt_bytes(c['size']),
+                'is_dir': c.get('kind') == 'dir', 'sidecar': bool(c['sidecar']),
+                'type': typ, 'type_label': _imp.TYPE_LABELS.get(typ, ''), 'how': how}
+
+    acct_rows, watch_files, watch_ignored = [], [], []
+    try:
+        for email in emails:
+            ap = imp.account_paths(email)
+            row = {'email': email, 'slug': _pst.safe_account_name(email), 'paths': ap,
+                   'waiting': [], 'ignored': [], 'failed': [], 'archive': [],
+                   'error': tree_error}
+            acct_rows.append(row)
+            if tree_error:
+                continue
+            # A folder that is a symbolic link (or not the owner's) is
+            # refused: nothing in it is listed, read or moved.
+            scan = imp.scan_account(email)
+            row['error'] = scan['error']
+            if scan['error']:
+                continue
+            entries = imp.archive_entries(email)
+            plan = _imp.retention_preview(entries, today, cfg)
+            row.update(
+                waiting=[waiting(c) for c in scan['candidates']],
+                ignored=scan['ignored'],
+                failed=[dict(f, size=_fmt_bytes(f['size']))
+                        for f in imp.failed_entries(email)],
+                archive=[{'name': e['name'], 'date': e['date'].isoformat(),
+                          'size': _fmt_bytes(e['size']), 'series': e['series'] or '',
+                          'plan': plan.get(e['name'], '')} for e in entries])
+        if not tree_error:
+            wscan = imp.scan_watch()
+            watch_ignored = wscan['ignored']
+            if wscan['error']:
+                flash(f'The watch folder is not used: {wscan["error"]}')
+            for c in wscan['candidates']:
+                acct, how = _pst.map_file_to_account(c['name'], cfg, emails)
+                watch_files.append(dict(waiting(c), account=acct, mapped_by=how))
+    finally:
+        imp.close()
+    # The ledger lives in the index database. If that file is damaged the
+    # page still works and says what to do, instead of answering 500.
+    rows, events, ledger_error = [], [], ''
+    try:
+        led = open_import_ledger(username)
+        try:
+            rows, events = led.rows(50), led.events(25)
+        finally:
+            led.close()
+    except sqlite3.DatabaseError as e:
+        ledger_error = str(e)
+    state = load_import_state(username)
+    return render_template(
+        'mail_import.html', username=username, accounts=accounts, cfg=cfg,
+        tool_notes=_imp.tool_notes(),
+        paths=imp.paths, acct_rows=acct_rows, watch_files=watch_files,
+        watch_ignored=watch_ignored, rows=rows, events=events,
+        tree_error=tree_error, ledger_error=ledger_error,
+        running=mail_import_running(username), weekdays=_pst.WEEKDAYS,
+        msgconvert=bool(shutil.which(_imp.MSGCONVERT)),
+        readpst=bool(shutil.which(_pst.READPST)),
+        last_scheduled_run=(_pst.now_str(state['last_scheduled_run'])
+                            if state.get('last_scheduled_run') else None),
+        max_upload=_fmt_bytes(_imp.MAX_IMPORT_BYTES))
+
+
+@app.route('/pst-import')
+@login_required
+def pst_import_page():
+    """The 1.3.0 development name of the page."""
+    return redirect(url_for('mail_import_page'))
+
+
+@app.route('/import/config', methods=['POST'])
+@login_required
+def mail_import_config():
+    username = session['username']
+    accounts = load_accounts(username)
+    f = request.form
+    raw = {
+        'enabled': f.get('enabled') == '1',
+        'watch_dir': f.get('watch_dir', '').strip(),
+        'default_account': f.get('default_account', ''),
+        'schedule': {'kind': f.get('schedule_kind', 'daily'),
+                     'weekday': f.get('weekday', 0), 'hour': f.get('hour', 6)},
+        'keep_recent': f.get('keep_recent', f.get('keep_weekly', 4)),
+        'keep_monthly': f.get('keep_monthly', 3),
+        'min_keep': f.get('min_keep', 3),
+        'max_delete_per_run': f.get('max_delete_per_run', 3),
+        'mappings': [{'pattern': p, 'account': a} for p, a in
+                     zip(f.getlist('map_pattern'), f.getlist('map_account'))
+                     if p.strip()],
+    }
+    if raw['watch_dir']:
+        try:
+            watch = _pst.resolve_watch_dir(CONFIG['data_dir'], username, raw['watch_dir'])
+            # ... and every directory on the way to it is a real directory
+            # of the owner's, not a link (the scheduled run is root).
+            _imp.check_tree(os.path.join(CONFIG['data_dir'], username), [watch],
+                            _import_owners(username))
+        except (ValueError, OSError) as e:
+            flash(f'Not saved: {e}')
+            return redirect(url_for('mail_import_page'))
+    cfg = _pst.normalize_config(raw, [a['email'] for a in accounts])
+    dropped = len(raw['mappings']) - len(cfg['mappings'])
+    _save_user_json(username, IMPORT_CONFIG, cfg)
+    flash('Import settings saved.' +
+          (f' {dropped} mapping(s) dropped (unknown account or bad pattern).' if dropped else ''))
+    return redirect(url_for('mail_import_page'))
+
+
+@app.route('/import/run', methods=['POST'])
+@login_required
+def mail_import_run():
+    """Import one waiting file now (account + file), or everything that is
+    waiting (no file)."""
+    username = session['username']
+    name = request.form.get('file', '')
+    account = request.form.get('account', '')
+    accounts = load_accounts(username)
+    cfg = load_import_config(username, accounts)
+    if name:
+        if account:
+            if account not in [a['email'] for a in accounts]:
+                flash('That is not one of your accounts.')
+                return redirect(url_for('mail_import_page'))
+        try:
+            imp = make_importer(username, cfg=cfg, accounts=accounts)
+        except ValueError:
+            imp = make_importer(username, cfg=dict(cfg, watch_dir=''), accounts=accounts)
+        try:
+            scan = imp.scan_account(account) if account else imp.scan_watch()
+        finally:
+            imp.close()
+        if scan['error']:
+            flash(f'Not started: {scan["error"]}')
+            return redirect(url_for('mail_import_page'))
+        names = {c['name'] for c in scan['candidates']}
+        if name not in names:
+            flash('That file is not waiting in the import folder.')
+            return redirect(url_for('mail_import_page'))
+    if mail_import_running(username):
+        flash('An import is already running. It picks up everything that is waiting.')
+        return redirect(url_for('mail_import_page'))
+    _spawn_mail_import(username, account or None, name or None)
+    flash(f'Import of {name or "everything waiting"} started. This page refreshes while it runs.')
+    return redirect(url_for('mail_import_page'))
+
+
+@app.route('/import/upload', methods=['POST'])
+@login_required
+def mail_import_upload():
+    """Raw-body upload (the page sends the file with XHR, not a form, so
+    nothing is buffered in /tmp). The file enters the chosen account's
+    inbox/ through the same .incoming + sidecar + rename contract a
+    producer uses."""
+    username = session['username']
+    name = request.args.get('name', '')
+    account = request.args.get('account', '')
+    accounts = load_accounts(username)
+    if account not in [a['email'] for a in accounts]:
+        return jsonify({'error': 'choose one of your accounts to import into'}), 400
+    try:
+        try:
+            imp = make_importer(username, accounts=accounts)
+        except ValueError:      # a bad watch-folder setting does not stop an upload
+            imp = make_importer(username, accounts=accounts,
+                                cfg=dict(load_import_config(username, accounts),
+                                         watch_dir=''))
+        try:
+            imp.ensure_dirs()
+        finally:
+            imp.close()
+        dest, digest = _imp.receive_upload(
+            request.stream, request.content_length, imp.account_paths(account),
+            name, prepare=_import_prepare(username), owners=_import_owners(username))
+    except _imp.UnsafeImportTree as e:
+        return jsonify({'error': f'upload refused: {e}'}), 409
+    except _imp.InsufficientSpace as e:
+        return jsonify({'error': str(e)}), 507
+    except FileExistsError as e:
+        return jsonify({'error': str(e)}), 409
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    started = False
+    if request.args.get('import') == '1' and not mail_import_running(username):
+        _spawn_mail_import(username, account, name)
+        started = True
+    return jsonify({'ok': True, 'name': name, 'account': account, 'sha256': digest,
+                    'import_started': started})
+
+
+@app.route('/import/retry', methods=['POST'])
+@login_required
+def mail_import_retry():
+    username = session['username']
+    account = request.form.get('account', '')
+    name = request.form.get('file', '')
+    if account not in [a['email'] for a in load_accounts(username)]:
+        flash('That is not one of your accounts.')
+        return redirect(url_for('mail_import_page'))
+    try:
+        _imp.retry_failed(_pst.account_paths(CONFIG['data_dir'], username, account), name,
+                          owners=_import_owners(username))
+        flash(f'{name} moved back to the inbox of {account}; it is imported at the next '
+              f'run (or press Import now).')
+    except (OSError, ValueError) as e:
+        flash(f'Could not move {name}: {e}')
+    return redirect(url_for('mail_import_page'))
+
+
+@app.route('/api/import/status')
+@login_required
+def mail_import_status():
+    username = session['username']
+    rows, error = [], None
+    try:
+        led = open_import_ledger(username)
+        try:
+            rows = led.rows(25)
+        finally:
+            led.close()
+    except sqlite3.DatabaseError as e:
+        error = f'the index database cannot be read ({e}); rebuild the search index'
+    return jsonify({'running': mail_import_running(username), 'rows': rows,
+                    'error': error})
 
 
 # --- Microsoft OAuth2 Routes ---
@@ -2987,6 +4334,21 @@ def _load_scope_cfg(scope, username):
            lambda c: save_user_oauth2_config(CONFIG['data_dir'], username, c)
 
 
+SERVER_APPS_ADMIN_ONLY = (
+    'Server-wide OAuth apps can only be added, changed or removed by an '
+    'administrator. You can add a private app for your own accounts.')
+
+
+def _may_manage_oauth_scope(scope, username):
+    """Private apps are the user's own. A server-wide app is used by every
+    user's accounts (its client secret, and where sign-ins are sent), so
+    only an administrator may write one (1.3.3; any signed-in user could)."""
+    if scope != 'server':
+        return True
+    import admin as _admin_module
+    return _admin_module._is_admin(username)
+
+
 def _find_app(app_id, username):
     """Look up app by id in whichever scope its prefix indicates.
     Returns (scope, cfg, app_dict, save_fn) or (None, None, None, None)."""
@@ -3009,6 +4371,9 @@ def new_oauth_app():
         scope = request.form.get('scope', 'user').strip()
         if scope not in ('server', 'user'):
             flash('Invalid scope.')
+            return redirect(url_for('oauth2_settings'))
+        if not _may_manage_oauth_scope(scope, session['username']):
+            flash(SERVER_APPS_ADMIN_ONLY)
             return redirect(url_for('oauth2_settings'))
         provider = request.form.get('provider', 'microsoft').strip()
         if provider not in KNOWN_PROVIDERS:
@@ -3058,6 +4423,9 @@ def edit_oauth_app(app_id):
     scope, cfg, app, save = _find_app(app_id, session['username'])
     if not app:
         flash(f'OAuth app {app_id!r} not found.')
+        return redirect(url_for('oauth2_settings'))
+    if not _may_manage_oauth_scope(scope, session['username']):
+        flash(SERVER_APPS_ADMIN_ONLY)
         return redirect(url_for('oauth2_settings'))
 
     if request.method == 'POST':
@@ -3109,7 +4477,7 @@ def _accounts_referencing_app(app_id):
         if not af.exists():
             continue
         try:
-            with open(af) as f:
+            with open(af, encoding='utf-8') as f:
                 accts = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
@@ -3128,6 +4496,9 @@ def delete_oauth_app(app_id):
     scope, cfg, app, save = _find_app(app_id, session['username'])
     if not app:
         flash(f'OAuth app {app_id!r} not found.')
+        return redirect(url_for('oauth2_settings'))
+    if not _may_manage_oauth_scope(scope, session['username']):
+        flash(SERVER_APPS_ADMIN_ONLY)
         return redirect(url_for('oauth2_settings'))
 
     refs = _accounts_referencing_app(app_id)
@@ -3153,6 +4524,9 @@ def set_default_oauth_app(app_id):
     scope, cfg, app, save = _find_app(app_id, session['username'])
     if not app:
         flash(f'OAuth app {app_id!r} not found.')
+        return redirect(url_for('oauth2_settings'))
+    if not _may_manage_oauth_scope(scope, session['username']):
+        flash(SERVER_APPS_ADMIN_ONLY)
         return redirect(url_for('oauth2_settings'))
     set_default_app(cfg, app_id)
     save(cfg)
@@ -3300,11 +4674,54 @@ try:
     _admin_module.register(app)
 except ImportError:
     pass
+_bulk_routes.register(app)
+
+# 1.3.0: shared page layout (sidebar navigation, footer version) + /about.
+import layout as _layout_module
+_layout_module.register(app)
 
 
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'scheduled-sync':
         scheduled_sync()
+    elif len(sys.argv) > 1 and sys.argv[1] == 'sync-schedule':
+        print_sync_schedule()
+    elif len(sys.argv) > 1 and sys.argv[1] in ('import', 'pst-import'):
+        # import                                      scheduled pass (hourly cron)
+        # import --user U --manual [--account A] [--file F]   one user now
+        # import --user U --ledger [--events] [--limit N] [--json]   show the ledger
+        # (`pst-import` is the 1.3.0 development name, kept as an alias.)
+        import argparse
+        ap = argparse.ArgumentParser(prog='app.py import')
+        ap.add_argument('--user')
+        ap.add_argument('--account', help='with --file: the account whose inbox holds it')
+        ap.add_argument('--file')
+        ap.add_argument('--manual', action='store_true')
+        ap.add_argument('--ledger', action='store_true', help='list ledger rows')
+        ap.add_argument('--events', action='store_true',
+                        help='with --ledger: retention deletions and refusals')
+        ap.add_argument('--limit', type=int, default=50)
+        ap.add_argument('--json', action='store_true')
+        a = ap.parse_args(sys.argv[2:])
+        if a.user and a.ledger:
+            print_import_ledger(a.user, events=a.events, limit=a.limit, as_json=a.json)
+        elif a.user and a.manual:
+            mail_import_user(a.user, only=(a.account, a.file) if a.file else None,
+                             trigger='manual', stable_wait=5)
+        elif a.user:
+            ap.error('--user needs --manual or --ledger (the scheduled pass covers every user)')
+        else:
+            scheduled_mail_import()
+    elif len(sys.argv) > 1 and sys.argv[1] == 'bulk-sync':
+        # bulk-sync            hourly pass over every initial / rebase sync job
+        # bulk-sync --list | --manual | --reconcile   see bulk_sync_routes.cli
+        sys.exit(_bulk_routes.cli(sys.argv[2:]))
     else:
-        app.run(host='0.0.0.0', port=CONFIG['listen_port'], debug=False)
+        # Every interface on a server; this machine only on Windows, where
+        # the app is a single-user desktop application. MAIL_ARCHIVER_HOST
+        # overrides either.
+        app.run(host=os.environ.get(
+                    'MAIL_ARCHIVER_HOST',
+                    '127.0.0.1' if _pc.IS_WINDOWS else '0.0.0.0'),
+                port=CONFIG['listen_port'], debug=False)

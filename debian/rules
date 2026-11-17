@@ -1,0 +1,50 @@
+#!/usr/bin/make -f
+# The package is a set of files copied into place: no compiler, no debhelper.
+# The staging below installs exactly what packaging/rpm/mail-archiver.spec
+# installs, so the deb and the rpm carry the same files.
+P := mail-archiver
+D := debian/$(P)
+APP := $(D)/opt/mail-archiver
+OS_ID := $(shell . /etc/os-release 2>/dev/null; echo "$${ID:-unknown}:$${VERSION_ID%%.*}")
+
+MODULES := app.py search_index.py oauth2_microsoft.py imap_sync.py mail_batcher.py \
+           admin.py sync_lifecycle.py pst_import.py mail_import.py bulk_sync.py \
+           bulk_sync_routes.py layout.py platform_compat.py gunicorn.conf.py
+UNITS := mail-archiver-restart.path mail-archiver-restart.service \
+         mail-archiver-syncs.slice mail-archiver-oauth-refresh.service \
+         mail-archiver-oauth-refresh.timer
+
+build build-arch build-indep:
+
+clean:
+	rm -rf $(D) debian/files debian/substvars
+
+binary binary-indep: build
+	rm -rf $(D)
+	umask 022; mkdir -p $(APP)/templates $(APP)/static $(D)/etc/systemd/system \
+	    $(D)/etc/cron.d $(D)/usr/libexec $(D)/lib/systemd/system \
+	    $(D)/usr/lib/tmpfiles.d $(D)/DEBIAN
+	for f in $(MODULES) VERSION tls-sources.conf.example; do install -m 644 $$f $(APP)/; done
+	# BUILD_INFO comes with the source (commit, date); the builder line is added here.
+	{ cat BUILD_INFO; echo "builder=$(OS_ID)"; } > $(APP)/BUILD_INFO
+	chmod 644 $(APP)/BUILD_INFO
+	install -m 755 generate-cert.sh install-tls-cert.sh $(APP)/
+	install -m 755 mail-archiver-cred mail-archiver-scheduled-sync mail-archiver-fix-perms $(D)/usr/libexec/
+	install -m 644 templates/*.html $(APP)/templates/
+	install -m 644 static/*.css static/*.svg $(APP)/static/
+	install -m 644 mail-archiver.service $(D)/etc/systemd/system/
+	for u in $(UNITS); do install -m 644 packaging/systemd/$$u $(D)/lib/systemd/system/; done
+	install -m 644 packaging/tmpfiles.d/mail-archiver.conf $(D)/usr/lib/tmpfiles.d/
+	install -m 644 packaging/cron.d/mail-archiver $(D)/etc/cron.d/mail-archiver
+	umask 022; mkdir -p $(D)/usr/share/doc/$(P)
+	install -m 644 debian/copyright $(D)/usr/share/doc/$(P)/copyright
+	install -m 644 NOTICE $(D)/usr/share/doc/$(P)/NOTICE
+	install -m 755 debian/postinst $(D)/DEBIAN/postinst
+	# cron refuses a group-writable file whatever the build's umask was
+	chmod -R go-w $(D)
+	dpkg-gencontrol -p$(P) -P$(D)
+	dpkg-deb --root-owner-group --build $(D) ..
+
+binary-arch:
+
+.PHONY: build build-arch build-indep clean binary binary-indep binary-arch

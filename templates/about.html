@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}About DEC-LLC Mail-Archiver{% endblock %}
+{% block head_extra %}
+    <style>
+    table.about { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.95rem; }
+    table.about th, table.about td { border-bottom: 1px solid var(--border); padding: 0.5rem 0.6rem; text-align: left; vertical-align: top; }
+    table.about th { width: 11rem; font-weight: 600; color: var(--text-muted); white-space: nowrap; }
+    table.about td { overflow-wrap: anywhere; }
+    table.lanes { border-collapse: collapse; margin-top: 0.5rem; font-size: 0.85rem; }
+    table.lanes th, table.lanes td { border-bottom: 1px solid var(--border); padding: 0.2rem 0.75rem 0.2rem 0; text-align: left; width: auto; white-space: normal; }
+    .about-links { list-style: none; }
+    .about-links li { margin: 0.15rem 0; }
+    @media (max-width: 600px) {
+        table.about th, table.about td { display: block; width: auto; }
+        table.about th { border-bottom: 0; padding-bottom: 0; }
+        table.lanes th, table.lanes td { display: table-cell; }
+    }
+    </style>
+{% endblock %}
+{% block content %}
+        <header>
+            <div class="logo-header">
+                <h1>About DEC-LLC Mail-Archiver</h1>
+            </div>
+        </header>
+
+        <table class="about">
+            <tr><th scope="row">Version</th><td id="about-version">{{ version }}</td></tr>
+            <tr><th scope="row">Build commit</th><td id="about-commit"><code>{{ build.commit }}</code></td></tr>
+            <tr><th scope="row">Built</th><td id="about-built">{{ build.built }}{% if build.builder != 'unknown' %} on {{ build.builder }}{% endif %}</td></tr>
+            <tr><th scope="row">Package version</th><td id="about-package">{{ package_version }}</td></tr>
+            <tr><th scope="row">Install date</th><td id="about-installed">{{ install_date }}</td></tr>
+            <tr><th scope="row">Host</th><td id="about-host">{{ host }}</td></tr>
+            <tr><th scope="row">Data path</th><td id="about-data"><code>{{ data_path }}</code></td></tr>
+            <tr><th scope="row">Sync backend</th><td id="about-backend">{{ sync_backend }}</td></tr>
+            <tr><th scope="row">isync version</th><td id="about-isync">{{ isync_version }}</td></tr>
+            <tr><th scope="row">Schedule</th><td id="about-schedule">
+                {% if not schedule.available %}
+                unknown
+                {% else %}
+                {{ schedule.accounts }} account{{ '' if schedule.accounts == 1 else 's' }} scheduled
+                ({{ schedule.scope }}{% if schedule.users is not none %}, {{ schedule.users }} user{{ '' if schedule.users == 1 else 's' }}{% endif %}){% if schedule.accounts %};
+                slots: {{ schedule.slots }}; due now: {{ schedule.due }}{% endif %}
+                {% if schedule.lanes %}
+                <table class="lanes">
+                    <thead><tr><th>Mail server</th><th>Accounts</th><th>Slots</th></tr></thead>
+                    <tbody>
+                    {% for lane in schedule.lanes %}
+                    <tr><td>{{ lane.server }}</td><td>{{ lane.accounts }}</td><td>{{ lane.slots }}</td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+                {% endif %}
+                {% endif %}
+            </td></tr>
+            <tr><th scope="row">Links</th><td id="about-links">
+                <ul class="about-links">
+                    <li><a href="{{ env_status_url }}" target="_blank" rel="noopener">Project page</a></li>
+                    <li><a href="{{ release_notes_url }}" target="_blank" rel="noopener">Release notes (CHANGELOG)</a></li>
+                </ul>
+            </td></tr>
+        </table>
+{% endblock %}

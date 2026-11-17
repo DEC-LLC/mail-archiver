@@ -1,10 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ headers.subject }} — Mail Archiver</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% extends "base.html" %}
+{% block title %}{{ headers.subject }} — Mail Archiver{% endblock %}
+{% block head_extra %}
     <style>
         .email-header { background: #f8fafb; padding: 20px 24px; border-radius: 8px; margin-bottom: 16px; }
         .email-header h2 { margin: 0 0 12px; color: #0f2b46; font-size: 1.3rem; }
@@ -34,9 +30,8 @@
         .export-links a { color: #1565c0; margin-right: 16px; text-decoration: none; }
         .export-links a:hover { text-decoration: underline; }
     </style>
-</head>
-<body>
-    <div class="container">
+{% endblock %}
+{% block content %}
         <header>
             <div class="logo-header">
                 <a href="https://www.dec-llc.biz" target="_blank"><img src="{{ url_for('static', filename='logo.svg') }}" alt="DEC-LLC"></a>
@@ -124,8 +119,8 @@
         <div style="margin-top:24px;">
             <a href="javascript:history.back()" class="btn">Back to Search Results</a>
         </div>
-    </div>
-
+{% endblock %}
+{% block scripts %}
     {% if html_body and plain_body %}
     <script>
     function showBody(which) {
@@ -147,5 +142,4 @@
     });
     </script>
     {% endif %}
-</body>
-</html>
+{% endblock %}
