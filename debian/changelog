@@ -1,3 +1,21 @@
+mail-archiver (1.3.4-1) unstable; urgency=medium
+
+  * The token refresh unit works on installations whose data directory is
+    not the default: it starts through /usr/libexec/mail-archiver-oauth-refresh,
+    which takes the settings of mail-archiver.service.
+  * The refresh unit can store a token in a user-owned directory (system
+    accounts); the timer is enabled at the first installation only.
+  * Both wrappers take the service's settings through the new
+    /usr/libexec/mail-archiver-env (values with spaces or quotes were lost)
+    and stop when the settings cannot be read.
+  * Removing the package stops and disables its units (new prerm).
+  * install-tls-cert.sh no longer logs "write error: Broken pipe" at start,
+    and a passphrase-protected key file no longer hides the matching key.
+  * The administrator Host page no longer answers HTTP 500.
+  * Documentation: the backup command works without a drop-in directory.
+
+ -- Madhav Diwan <madhav@decllc.biz>  Tue, 17 Nov 2026 17:00:00 -0500
+
 mail-archiver (1.3.3-1) unstable; urgency=medium
 
   * First release with source packages: a source tarball, a Debian source

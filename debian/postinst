@@ -190,8 +190,14 @@ systemctl start mail-archiver-restart.path 2>/dev/null || true
 # boot then every 10min — kills first-sync-after-idle latency.
 systemctl enable mail-archiver-syncs.slice 2>/dev/null || true
 systemctl start mail-archiver-syncs.slice 2>/dev/null || true
-systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
-systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
+# Switched on at the first installation only (1.3.4): an administrator who
+# disabled the timer keeps it disabled across upgrades.
+if [ -z "${2:-}" ]; then
+    systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
+    systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
+fi
+# A failed run of an older version would otherwise show as failed until the next run.
+systemctl reset-failed mail-archiver-oauth-refresh.service 2>/dev/null || true
 
 echo "Mail Archiver installed. Data directory: /var/lib/mail-archiver (to change it, use a drop-in: systemctl edit mail-archiver)."
 echo "Then: systemctl enable --now mail-archiver"

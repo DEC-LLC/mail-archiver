@@ -9,20 +9,37 @@ Type=oneshot
 User=mail-archiver
 Group=mail-archiver
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /opt/mail-archiver/oauth2_microsoft.py refresh-expiring
+# 1.3.4: through a wrapper that takes mail-archiver.service's MAIL_ARCHIVER_*
+# settings, so the refresh uses the same data directory as the web interface.
+ExecStart=/usr/libexec/mail-archiver-oauth-refresh
 # Non-fatal on any single account's failure — the CLI returns 0 unless
 # something catastrophic happens. Journal has per-account results.
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
 
-# Lock down: read-only /opt, no need to write anywhere outside data dir
-ProtectSystem=strict
-# A leading '-' lets the unit start when that directory does not exist (1.3.3:
-# the unit failed with 226/NAMESPACE on every install without it).
-ReadWritePaths=-/var/lib/mail-archiver -/datapool/email-archive /srv /var/log
+# Lock down. /usr, /boot and /etc are read-only, and so is the application
+# directory. The data directory can be anywhere (a host drop-in on
+# mail-archiver.service sets it), so it is not listed here; 1.3.3 and earlier
+# listed fixed paths and failed elsewhere.
+ProtectSystem=full
+ReadOnlyPaths=/opt/mail-archiver -/var/spool -/var/lib/dpkg -/var/lib/rpm -/var/lib/systemd -/run/systemd/system -/run/systemd/transient -/run/systemd/generator
+# CAP_DAC_OVERRIDE would let this unit read the password hashes; it has no
+# business there.
+InaccessiblePaths=-/etc/shadow -/etc/gshadow -/etc/shadow- -/etc/gshadow- -/root -/etc/sudoers -/etc/sudoers.d -/etc/ssl/private -/etc/pki/tls/private
+# With system accounts (MAIL_ARCHIVER_AUTH=pam) each user's .config directory
+# belongs to that user, so storing a refreshed token there needs the same
+# file capabilities the web service has for it (1.3.4). They are broad, so the
+# paths below are closed explicitly.
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
 NoNewPrivileges=true
 PrivateTmp=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 
 [Install]
 WantedBy=multi-user.target

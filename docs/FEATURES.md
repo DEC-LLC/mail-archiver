@@ -1,7 +1,7 @@
-# DEC-LLC Mail-Archiver 1.3.3: feature reference
+# DEC-LLC Mail-Archiver 1.3.4: feature reference
 
 One section per feature: what it does, where it is in the web interface, its limits and defaults, what is different
-in the Windows application, and the release it arrived in. Numbers are the defaults in the code of 1.3.3.
+in the Windows application, and the release it arrived in. Numbers are the defaults in the code of 1.3.4.
 Release notes are in [CHANGELOG.md](../CHANGELOG.md).
 
 Menu names are written as the sidebar shows them: **Dashboard**, **Search archive**, **Import mail**,

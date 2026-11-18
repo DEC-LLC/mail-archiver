@@ -45,7 +45,9 @@
     <h2>Load (1-min) — last 15 minutes</h2>
     {% if load_history and load_history|length >= 3 %}
     <div class="sparkline">
-        {% set maxv = load_history|map(attribute=1)|reject('none')|list|max(default=1) %}
+        {# Jinja's max filter takes no default (1.3.4: this line answered HTTP 500 once three samples existed). #}
+        {% set load_values = load_history|map(attribute=1)|reject('none')|list %}
+        {% set maxv = (load_values|max) if load_values else 1 %}
         {% for _, v in load_history %}
             {% if v is not none %}
             <div class="bar" style="height: {{ ((v / (maxv if maxv > 0 else 1)) * 40)|round(0) }}px" title="{{ v }}"></div>

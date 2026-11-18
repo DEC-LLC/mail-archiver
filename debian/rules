@@ -30,6 +30,7 @@ binary binary-indep: build
 	chmod 644 $(APP)/BUILD_INFO
 	install -m 755 generate-cert.sh install-tls-cert.sh $(APP)/
 	install -m 755 mail-archiver-cred mail-archiver-scheduled-sync mail-archiver-fix-perms $(D)/usr/libexec/
+	install -m 755 mail-archiver-oauth-refresh mail-archiver-env $(D)/usr/libexec/
 	install -m 644 templates/*.html $(APP)/templates/
 	install -m 644 static/*.css static/*.svg $(APP)/static/
 	install -m 644 mail-archiver.service $(D)/etc/systemd/system/
@@ -40,6 +41,7 @@ binary binary-indep: build
 	install -m 644 debian/copyright $(D)/usr/share/doc/$(P)/copyright
 	install -m 644 NOTICE $(D)/usr/share/doc/$(P)/NOTICE
 	install -m 755 debian/postinst $(D)/DEBIAN/postinst
+	install -m 755 debian/prerm $(D)/DEBIAN/prerm
 	# cron refuses a group-writable file whatever the build's umask was
 	chmod -R go-w $(D)
 	dpkg-gencontrol -p$(P) -P$(D)

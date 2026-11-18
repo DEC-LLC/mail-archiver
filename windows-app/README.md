@@ -110,7 +110,7 @@ file, the chain need not be trusted, and the output is named
 `MailArchiver-<version>-TESTSIGNED.exe`. That file is never published.
 
 Releases are signed only with DEC-LLC's own code-signing certificate. As of
-1.3.3 there is none yet, so the published EXE is unsigned and Windows
+1.3.4 there is none yet, so the published EXE is unsigned and Windows
 SmartScreen warns on first start.
 
 ## Source and toolchain record

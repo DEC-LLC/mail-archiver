@@ -86,7 +86,8 @@ if [ -d "$APP" ] && [ ! -L "$APP" ]; then
 fi
 
 for p in "$ROOT/usr/libexec/mail-archiver-cred" "$ROOT/usr/libexec/mail-archiver-scheduled-sync" \
-         "$ROOT/usr/libexec/mail-archiver-fix-perms" "$ROOT/etc/cron.d/mail-archiver" \
+         "$ROOT/usr/libexec/mail-archiver-fix-perms" "$ROOT/usr/libexec/mail-archiver-oauth-refresh" "$ROOT/usr/libexec/mail-archiver-env" \
+         "$ROOT/etc/cron.d/mail-archiver" \
          "$ROOT/etc/systemd/system/mail-archiver.service" \
          "$ROOT"/lib/systemd/system/mail-archiver-* "$ROOT"/usr/lib/systemd/system/mail-archiver-* \
          "$ROOT/usr/lib/tmpfiles.d/mail-archiver.conf"; do

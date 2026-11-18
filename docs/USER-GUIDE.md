@@ -1,4 +1,4 @@
-# DEC-LLC Mail-Archiver 1.3.3: user guide
+# DEC-LLC Mail-Archiver 1.3.4: user guide
 
 Mail-Archiver keeps a copy of your mail on your own server or computer and lets you search and read it in a browser.
 It only downloads. It never deletes, moves or changes anything in your mailbox at the provider.
@@ -59,7 +59,7 @@ Every page has a sidebar on the left with your user name at the top:
 | About | version, data path, sync schedule summary |
 | Log out | end the session |
 
-The footer of every page shows the version, for example "DEC-LLC Mail-Archiver 1.3.3".
+The footer of every page shows the version, for example "DEC-LLC Mail-Archiver 1.3.4".
 
 ## Add a mail account
 
@@ -325,7 +325,7 @@ shortened hint of the stored password, its length and when it was saved, never t
 
 The Windows application is the same program in a single file. What is different for you:
 
-- **Start.** Double-click `MailArchiver-1.3.3.exe`. Windows SmartScreen warns the first time, because the file is
+- **Start.** Double-click `MailArchiver-<version>.exe`. Windows SmartScreen warns the first time, because the file is
   not code-signed yet. Your browser opens `https://127.0.0.1:8400`.
 - **Only this computer.** The page cannot be opened from another computer or phone.
 - **Tray icon.** The program keeps running in the notification area: **Open Mail-Archiver**,

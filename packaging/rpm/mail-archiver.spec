@@ -1,5 +1,5 @@
 Name:           mail-archiver
-Version:        1.3.3
+Version:        1.3.4
 Release:        1%{?dist}
 Summary:        Self-hosted email archive with full-text search
 License:        Apache-2.0
@@ -78,6 +78,8 @@ install -m 644 tls-sources.conf.example %{buildroot}/opt/mail-archiver/tls-sourc
 install -m 755 mail-archiver-cred %{buildroot}/usr/libexec/mail-archiver-cred
 install -m 755 mail-archiver-scheduled-sync %{buildroot}/usr/libexec/mail-archiver-scheduled-sync
 install -m 755 mail-archiver-fix-perms %{buildroot}/usr/libexec/mail-archiver-fix-perms
+install -m 755 mail-archiver-oauth-refresh %{buildroot}/usr/libexec/mail-archiver-oauth-refresh
+install -m 755 mail-archiver-env %{buildroot}/usr/libexec/mail-archiver-env
 
 # 1.0.18: restart trigger — path+service pair. WebUI (as mail-archiver)
 # touches /run/mail-archiver/restart-requested; path unit fires the
@@ -135,6 +137,8 @@ install -m 644 packaging/cron.d/mail-archiver %{buildroot}/etc/cron.d/mail-archi
 /opt/mail-archiver/VERSION
 /usr/libexec/mail-archiver-cred
 /usr/libexec/mail-archiver-scheduled-sync
+/usr/libexec/mail-archiver-oauth-refresh
+/usr/libexec/mail-archiver-env
 /usr/libexec/mail-archiver-fix-perms
 /opt/mail-archiver/templates/*.html
 /opt/mail-archiver/static/*.css
@@ -318,8 +322,13 @@ systemctl start mail-archiver-restart.path 2>/dev/null || true
 # 1.1.0: sync-scope parent slice + proactive OAuth-refresh timer
 systemctl enable mail-archiver-syncs.slice 2>/dev/null || true
 systemctl start mail-archiver-syncs.slice 2>/dev/null || true
-systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
-systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
+# Switched on at the first installation only (1.3.4): an administrator who
+# disabled the timer keeps it disabled across upgrades.
+if [ "$1" -eq 1 ]; then
+    systemctl enable mail-archiver-oauth-refresh.timer 2>/dev/null || true
+    systemctl start mail-archiver-oauth-refresh.timer 2>/dev/null || true
+fi
+systemctl reset-failed mail-archiver-oauth-refresh.service 2>/dev/null || true
 
 echo "Mail Archiver installed. Data directory: /var/lib/mail-archiver (to change it, use a drop-in: systemctl edit mail-archiver)."
 echo "Then: systemctl enable --now mail-archiver"
@@ -330,11 +339,43 @@ echo "  (takes effect within a minute; no restart needed)"
 
 %preun
 if [ "$1" = "0" ]; then
-    systemctl stop mail-archiver 2>/dev/null || true
-    systemctl disable mail-archiver 2>/dev/null || true
+    # Removal (not upgrade): stop and switch off every unit of the package.
+    for u in mail-archiver.service mail-archiver-oauth-refresh.timer \
+             mail-archiver-oauth-refresh.service mail-archiver-restart.path \
+             mail-archiver-syncs.slice; do
+        systemctl disable --now "$u" 2>/dev/null || true
+    done
+fi
+
+%postun
+if [ "$1" = "0" ]; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed 'mail-archiver*' 2>/dev/null || true
 fi
 
 %changelog
+* Tue Nov 17 2026 Madhav Diwan <madhav@decllc.biz> - 1.3.4-1
+- Fix: mail-archiver-oauth-refresh.service failed on every installation
+  whose data directory is not the default. It now starts through
+  /usr/libexec/mail-archiver-oauth-refresh, which takes the MAIL_ARCHIVER_*
+  settings of mail-archiver.service; the unit no longer lists fixed
+  writable paths (ProtectSystem=full).
+- The refresh unit has CAP_CHOWN, CAP_DAC_OVERRIDE and CAP_FOWNER (to store a
+  token in a user-owned directory with system accounts) and a read-only
+  program directory. The timer is enabled at first installation only.
+- Fix: both wrappers take the service's settings through the new
+  /usr/libexec/mail-archiver-env, which undoes systemd's quoting (a value
+  with a space or a quote was lost); they stop when the settings cannot be
+  read. `mail-archiver-scheduled-sync sync-schedule` prints the plan.
+- The refresh unit cannot read /etc/shadow or write to /root, cron spools or
+  the package database. Removing the package stops and disables its units.
+- Fix: install-tls-cert.sh no longer lets a passphrase-protected key file
+  hide the matching key.
+- Fix: the administrator Host page answered HTTP 500 once three load
+  samples existed.
+- Documentation: the backup command works on an installation without
+  drop-ins.
+
 * Mon Nov 16 2026 Madhav Diwan <madhav@decllc.biz> - 1.3.3-1
 - Built from a source tarball (Source0); an SRPM is produced with every
   build. The cron file is the one the deb installs (comment wording only).

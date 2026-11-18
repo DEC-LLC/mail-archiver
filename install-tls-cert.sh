@@ -89,7 +89,9 @@ KEYS
 }
 
 pubkey_of_cert() { openssl x509 -in "$1" -noout -pubkey 2>/dev/null; }
-pubkey_of_key()  { openssl pkey -in "$1" -pubout 2>/dev/null; }
+# stdin from /dev/null and an empty passphrase: a passphrase-protected key is
+# skipped at once instead of openssl reading its passphrase from our stdin.
+pubkey_of_key()  { openssl pkey -in "$1" -pubout -passin pass: 2>/dev/null </dev/null; }
 
 # Echoes "<startepoch> <cert> <key>" when the pair is usable, else nothing.
 evaluate_pair() {
@@ -114,13 +116,17 @@ evaluate_pair() {
         k="$key"
     else
         k=""
-        local cand
-        while read -r cand; do
+        # Read the whole list first: leaving a `while read` loop early closed
+        # the pipe under key_candidates, which then logged "echo: write
+        # error: Broken pipe" once per remaining candidate (fixed in 1.3.4).
+        local cand cands=()
+        mapfile -t cands < <(key_candidates "$crt")
+        for cand in "${cands[@]}"; do
             [ -r "$cand" ] || continue
             if [ "$(pubkey_of_cert "$crt")" = "$(pubkey_of_key "$cand")" ]; then
                 k="$cand"; break
             fi
-        done < <(key_candidates "$crt")
+        done
         [ -n "$k" ] || return 0
     fi
 

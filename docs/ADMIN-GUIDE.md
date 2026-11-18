@@ -1,4 +1,4 @@
-# DEC-LLC Mail-Archiver 1.3.3: administrator guide
+# DEC-LLC Mail-Archiver 1.3.4: administrator guide
 
 This guide is for the person who installs and runs Mail-Archiver. Users read the [user guide](USER-GUIDE.md); every
 feature with its limits is in the [feature reference](FEATURES.md).
@@ -148,13 +148,13 @@ firewalld) and SELinux in enforcing mode are not verified in a container.
 
 ### Windows
 
-1. Download `MailArchiver-1.3.3.exe` and `SHA256SUMS`.
+1. Download `MailArchiver-<version>.exe` (for this release `MailArchiver-1.3.4.exe`) and `SHA256SUMS`.
 2. Check the file in PowerShell. The first command prints the sha256 of the EXE, the second the line for it in
    `SHA256SUMS`; the hexadecimal value must be the same in both (upper and lower case do not matter):
 
    ```powershell
-   (Get-FileHash .\MailArchiver-1.3.3.exe -Algorithm SHA256).Hash
-   Select-String MailArchiver-1.3.3.exe .\SHA256SUMS
+   (Get-FileHash .\MailArchiver-<version>.exe -Algorithm SHA256).Hash
+   Select-String MailArchiver-<version>.exe .\SHA256SUMS
    ```
 
 3. Double-click the EXE. **The EXE is not code-signed yet**, so Windows SmartScreen warns before the first start
@@ -189,8 +189,8 @@ sudo apt-get install ./mail-archiver_*.deb
 sudo dnf upgrade ./mail-archiver-*.noarch.rpm
 ```
 
-(`dnf upgrade` with a newer rpm is not verified in a container; a reinstall of the same version with
-`dnf reinstall` was.)
+(The upgrade from 1.3.3 to 1.3.4 was run with `dnf upgrade` and with `dnf install` on Rocky Linux 9, and with
+`apt-get install` on Debian 13: the service restarts on the new version, mail, accounts and settings are unchanged.)
 
 ### What an upgrade does
 
@@ -215,22 +215,21 @@ as it is.
 
 ### Debian and Ubuntu
 
-The package does not stop the service when it is removed, so stop it first:
+From 1.3.4 removing the package stops and switches off all of its units; no separate stop is needed:
 
 ```bash
-sudo systemctl disable --now mail-archiver mail-archiver-restart.path mail-archiver-oauth-refresh.timer
 sudo apt-get remove mail-archiver
 ```
 
 ### EL 9
 
 ```bash
-sudo systemctl disable --now mail-archiver-restart.path mail-archiver-oauth-refresh.timer
 sudo dnf remove mail-archiver
 ```
 
-The rpm stops and disables `mail-archiver.service` itself. `dnf remove` was run on Rocky Linux 9; the `disable` line
-was run on Debian only.
+Run on Debian 13 and Rocky Linux 9 with the 1.3.4 packages: nothing of the package keeps running and no unit stays
+enabled or failed. With 1.3.3 and older, stop the units first:
+`sudo systemctl disable --now mail-archiver mail-archiver-restart.path mail-archiver-oauth-refresh.timer`.
 
 `dnf remove mail-archiver` also removes the dependencies that were installed with it and that nothing else needs:
 `python3-flask`, `python3-gunicorn`, `isync`, `python3-pam`, `zstd` and `cronie`. If `cronie` goes, other cron jobs
@@ -277,11 +276,13 @@ Quit the program and delete the EXE. Delete `%APPDATA%\MailArchiver\` to remove 
 | `/usr/lib/tmpfiles.d/mail-archiver.conf` | creates `/run/mail-archiver` and `/run/mail-archiver/sync-jobs` (0770 `root:mail-archiver`) |
 | `/etc/cron.d/mail-archiver` | the three hourly jobs |
 | `/usr/libexec/mail-archiver-scheduled-sync` | wrapper that runs a job with the service's settings |
+| `/usr/libexec/mail-archiver-oauth-refresh` | wrapper that runs the token refresh with the service's settings (since 1.3.4) |
+| `/usr/libexec/mail-archiver-env` | prints the service's `MAIL_ARCHIVER_*` settings for the two wrappers (since 1.3.4) |
 | `/usr/libexec/mail-archiver-cred` | hands a stored password to isync |
 | `/usr/libexec/mail-archiver-fix-perms` | ownership and mode check |
 | `/var/log/mail-archiver-sync.log`, `-import.log`, `-bulk-sync.log` | created empty, `root:mail-archiver`, mode 0640 |
 
-The four `mail-archiver-*` helper units are in `/lib/systemd/system` on Debian and `/usr/lib/systemd/system` on EL.
+The five `mail-archiver-*` helper units are in `/lib/systemd/system` on Debian and `/usr/lib/systemd/system` on EL.
 List everything with `dpkg -L mail-archiver` or `rpm -ql mail-archiver`.
 
 **Users and groups.** The install script creates the system user `mail-archiver` (home `/var/lib/mail-archiver`, no
@@ -307,17 +308,38 @@ because with system accounts it must write into each user's folder and start the
 The wrapper reads the `MAIL_ARCHIVER_*` settings of `mail-archiver.service`, drop-ins included, so the cron jobs use
 the same data directory and key as the web interface.
 
-**Note on the token refresh timer.** The package enables a timer that starts
-`mail-archiver-oauth-refresh.service` every 10 minutes. On a standard installation that run **fails**: the unit does
-not take the data directory of the main service, so it ends with
-`oauth-refresh: MAIL_ARCHIVER_DATA=/datapool/email-archive does not exist` (`status=1/FAILURE`) and shows in
-`systemctl --failed`. Before 1.3.3 the same unit failed earlier, with `status=226/NAMESPACE`. Seen with the 1.3.3
-packages on Debian 13 and Rocky Linux 9. It is harmless for syncing: Microsoft tokens are refreshed before every
-sync anyway. Until the unit is corrected in a later release, switch the timer off:
+**Note on the token refresh timer.** The package switches on a timer that starts
+`mail-archiver-oauth-refresh.service` every 10 minutes. From 1.3.4 the unit starts through
+`/usr/libexec/mail-archiver-oauth-refresh`, which reads the `MAIL_ARCHIVER_*` settings of `mail-archiver.service`
+the same way the cron wrapper does, so it uses the same data directory wherever that is. It runs as the
+`mail-archiver` user with three file capabilities (`CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`), which it needs to
+store a token in a user's own configuration directory when system accounts are used. Those capabilities are broad,
+so the unit is closed off from what it has no business with: `/usr`, `/boot`, `/etc`, the program directory,
+`/var/spool`, the package database and systemd's own unit directories are read-only for it, and the password files
+(`/etc/shadow`, `/etc/gshadow`), `/root`, the sudo configuration and the system's private key directories are hidden
+from it.
+
+Up to 1.3.3 the run failed on every installation whose data directory is not the built-in default
+(`MAIL_ARCHIVER_DATA=... does not exist`, or `status=226/NAMESPACE` before 1.3.3). That was harmless for syncing,
+because Microsoft tokens are refreshed before every sync anyway.
+
+The timer is switched on at the first installation only. An upgrade leaves it as it was, so if you switched it off
+on an older version, switch it on again after upgrading to 1.3.4:
 
 ```bash
-sudo systemctl disable --now mail-archiver-oauth-refresh.timer
+sudo systemctl enable --now mail-archiver-oauth-refresh.timer
 ```
+
+Both wrappers take the settings through `/usr/libexec/mail-archiver-env`, which reads the `Environment=` lines of
+the unit and its drop-ins with systemd's quoting undone, so a value that systemd quotes (one with a `$`, a quote or
+a space) arrives as the service has it; `sudo /usr/libexec/mail-archiver-env` prints what they get. Settings given
+through `EnvironmentFile=`, and removals through `UnsetEnvironment=`, are not seen by them. If the unit is not
+loaded, or its settings cannot be read or understood, a wrapper stops with a message in its log
+(`cannot take the settings of mail-archiver.service`) and does nothing, instead of running with the built-in
+defaults.
+
+**A data directory whose path contains a space is not supported.** The settings are carried correctly, but the
+isync configuration is written without quoting, so every sync fails.
 
 **Licence files.** The rpm installs `LICENSE` and `NOTICE` as licence files (`rpm -qL mail-archiver` lists them);
 the deb installs `/usr/share/doc/mail-archiver/copyright` and `/usr/share/doc/mail-archiver/NOTICE`.
@@ -464,7 +486,7 @@ sudo tee /etc/systemd/system/mail-archiver.service.d/port.conf >/dev/null <<'EOF
 Environment=MAIL_ARCHIVER_PORT=9443
 EOF
 sudo systemctl daemon-reload && sudo systemctl restart mail-archiver
-systemctl show mail-archiver -p Environment --value | tr ' ' '\n'
+sudo /usr/libexec/mail-archiver-env
 ```
 
 The last command prints the settings in effect. Every example in this guide writes **its own file** in that
@@ -819,7 +841,7 @@ checked for this guide.
 Every 12 hours, Daily (default). The hourly cron job starts what is due. Print the plan:
 
 ```bash
-cd /opt/mail-archiver && sudo env $(systemctl show mail-archiver -p Environment --value) python3 app.py sync-schedule
+sudo /usr/libexec/mail-archiver-scheduled-sync sync-schedule
 ```
 
 ```
@@ -937,10 +959,20 @@ The simple, safe way is a short stop:
 
 ```bash
 sudo systemctl stop mail-archiver
+sudo mkdir -p /etc/systemd/system/mail-archiver.service.d
 sudo tar -C / -czf /root/mail-archiver-backup.tar.gz \
     var/lib/mail-archiver opt/mail-archiver/.secret_key opt/mail-archiver/certs \
     etc/systemd/system/mail-archiver.service.d
 sudo systemctl start mail-archiver
+```
+
+**`var/lib/mail-archiver` is the default data directory.** If you set `MAIL_ARCHIVER_DATA`, put that path there
+instead, without the leading `/` (the About page shows it as "Data path"); otherwise the command succeeds and the
+archive contains no mail. If `/etc/mail-archiver/` exists, add `etc/mail-archiver` to the list. Check what was
+saved:
+
+```bash
+sudo tar -tzf /root/mail-archiver-backup.tar.gz | head -20
 ```
 
 Stopping the service does not stop a download that cron started. Before the backup, check that no sync is
@@ -1040,7 +1072,7 @@ an ordinary account can write are a way to run code as the service or, through c
 | Initial / rebase sync: "Today's budget is used up." on **Run now** | the daily budget | raise the budget or wait until tomorrow |
 | "Upload rejected: file exceeds 256 KiB." | a client certificate upload that is not a certificate | pick the right file |
 | No scheduled sync ever runs | no cron daemon, or all accounts on "Manual only" | install and start cron; check `/var/log/mail-archiver-sync.log` |
-| `mail-archiver-oauth-refresh.service` in `systemctl --failed` (journal: `MAIL_ARCHIVER_DATA=... does not exist`, or `Failed at step NAMESPACE` before 1.3.3) | the token refresh unit does not use the data directory of the main service | harmless for syncing; disable the timer (see [What the package installs](#what-the-package-installs)) |
+| `mail-archiver-oauth-refresh.service` in `systemctl --failed` (journal: `MAIL_ARCHIVER_DATA=... does not exist`, or `Failed at step NAMESPACE` before 1.3.3) | version 1.3.3 or older: the token refresh unit did not use the data directory of the main service | upgrade to 1.3.4 or later; harmless for syncing meanwhile (see [What the package installs](#what-the-package-installs)) |
 | **Sync Now** fails with "Maildir error: cannot open store", or opened search results answer 403, after the data directory was changed | the isync configuration and the search index still name the old directory | see [Moving a data directory that already holds mail](#moving-a-data-directory-that-already-holds-mail) |
 
 ## Security notes
@@ -1094,7 +1126,7 @@ service's settings and runs `python3 app.py <job>` in `/opt/mail-archiver` as ro
 | Purpose | Command |
 |---|---|
 | Scheduled sync pass (what cron runs at minute 0) | `sudo /usr/libexec/mail-archiver-scheduled-sync` |
-| Print the schedule plan | `cd /opt/mail-archiver && sudo env $(systemctl show mail-archiver -p Environment --value) python3 app.py sync-schedule` |
+| Print the schedule plan | `sudo /usr/libexec/mail-archiver-scheduled-sync sync-schedule` |
 | Scheduled import pass (cron, minute 30) | `sudo /usr/libexec/mail-archiver-scheduled-sync import` |
 | Import everything waiting for one user | `sudo /usr/libexec/mail-archiver-scheduled-sync import --user alice --manual` |
 | Import one waiting file | `sudo /usr/libexec/mail-archiver-scheduled-sync import --user alice --manual --account bob@example.org --file old-mail.mbox` |
@@ -1107,12 +1139,11 @@ service's settings and runs `python3 app.py <job>` in `/opt/mail-archiver` as ro
 
 Notes:
 
-- The wrapper accepts `scheduled-sync` (the default), `import` (old name `pst-import`) and `bulk-sync`. It does not
-  accept `sync-schedule`; that one needs the `env` form shown above. Without the service's settings `app.py` looks
+- The wrapper accepts `scheduled-sync` (the default), `import` (old name `pst-import`), `bulk-sync` and, from
+  1.3.4, `sync-schedule` (prints the plan and starts nothing). Without the service's settings `app.py` looks
   at the wrong data directory and prints an empty plan.
 - `import --user` needs `--manual` or `--ledger`. `--account` is used together with `--file`.
 - `bulk-sync --manual` and `--reconcile` need both `--user` and `--account`.
-- A value that contains a space breaks the `env $(...)` form; none of the documented settings needs one.
 
 Other commands used in this guide:
 
@@ -1120,11 +1151,11 @@ Other commands used in this guide:
 systemctl status mail-archiver
 sudo systemctl restart mail-archiver
 sudo journalctl -u mail-archiver -n 50
-systemctl show mail-archiver -p Environment --value | tr ' ' '\n'
+sudo /usr/libexec/mail-archiver-env
 sudo /usr/libexec/mail-archiver-fix-perms --check
 ```
 
-Windows: `MailArchiver-1.3.3.exe --quit` stops the running program; `--no-browser` starts it without opening the
+Windows: `MailArchiver-<version>.exe --quit` stops the running program; `--no-browser` starts it without opening the
 browser.
 
 ## EL 9: known limits in this release
@@ -1193,14 +1224,14 @@ section. That rpm did not start as packaged; the statements of this guide about 
 
 - moving a data directory that already holds mail: the plain move breaks the archive, and the additional steps
   named in [that section](#moving-a-data-directory-that-already-holds-mail) were not tested;
-- the token refresh unit on an installation that uses Microsoft sign-in (on a standard installation its run fails,
-  see [What the package installs](#what-the-package-installs));
+- the token refresh unit refreshing a real Microsoft token (from 1.3.4 its run ends without error on Debian 13 and
+  Rocky Linux 9; no installation with a Microsoft account was available to test an actual refresh);
 - Microsoft sign-in on EL 9, including the EPEL package `sasl-xoauth2`;
 - anything on Windows (read from `windows-app/main.py`, `platform_compat.py` and the modules);
 - Microsoft sign-in and every OAuth step (needs a real registration), and syncs against Gmail, Microsoft, iCloud and
   Yahoo; only a local IMAP server was used;
 - PST and `.msg` import with real files (the tools were installed; the formats were not exercised);
-- a real upgrade from an older package version, and the deferred restart during a running sync;
+- an upgrade from a version older than 1.3.2, and the deferred restart during a running sync;
 - SELinux, firewalld, certbot;
 - the provider limits and budgets of the initial / rebase sync;
 - restoring a backup on another host.

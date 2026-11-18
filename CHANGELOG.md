@@ -3,6 +3,45 @@
 Release notes for DEC-LLC Mail-Archiver. Older releases are described in the
 `%changelog` of `packaging/rpm/mail-archiver.spec` and in the git history.
 
+## 1.3.4 (2026-11-17)
+
+A small corrective release. Nothing changes in how mail is synced, stored, searched or imported.
+
+### Fixed
+- **The token refresh unit runs.** `mail-archiver-oauth-refresh.service` failed every 10 minutes on any
+  installation whose data directory is not the built-in default, which includes a standard package installation.
+  The unit did not take the settings of the main service. It now starts through
+  `/usr/libexec/mail-archiver-oauth-refresh`, which reads the `MAIL_ARCHIVER_*` settings of `mail-archiver.service`
+  (drop-ins included). It has the three file capabilities needed to store a token in a user's own configuration
+  directory when system accounts are used; the program directory, `/var/spool`, the package database and systemd's
+  unit directories are read-only for it, and the password files, `/root` and the system's private keys are hidden.
+- **The timer is switched on at the first installation only.** An upgrade used to switch it on again even when the
+  administrator had disabled it. If you switched it off as the 1.3.3 guide advised, switch it back on:
+  `sudo systemctl enable --now mail-archiver-oauth-refresh.timer`.
+- **Settings are taken as the service sees them.** The cron wrapper and the refresh wrapper lost a setting whose
+  value systemd quotes (a `$`, a quote, a space and similar) and fell back to the built-in default. Both now use
+  `/usr/libexec/mail-archiver-env`, and they stop with a message instead of running with the defaults when the
+  settings cannot be read. (A data directory with a space in its path is still not supported: syncing fails.)
+- `mail-archiver-scheduled-sync sync-schedule` prints the schedule plan (the guide's longer `env` command is gone).
+- **Removing the package** stops and switches off all of its units; the deb left the web service running and the
+  rpm left the timer behind.
+- **No "Broken pipe" lines at start.** On Debian and Ubuntu, on a host with many private key files,
+  `install-tls-cert.sh` wrote `echo: write error: Broken pipe` to the journal once per file each time the service
+  started. (EL 9's shell does not print that message.)
+- **A passphrase-protected key file no longer hides the right key.** When such a file came before the matching key
+  in the scan, `install-tls-cert.sh` could report that no certificate was found and keep the self-signed one.
+- `mail-archiver-fix-perms` checks the new wrapper as well.
+- **The administrator's Host page** answered "Internal Server Error" from about a minute after it was first opened
+  (as soon as three load samples existed). It has done so since the page was introduced.
+
+### Documentation
+- The backup command in the administrator guide failed with `Cannot stat` on an installation that has no drop-in
+  directory (the erratum listed with 1.3.3). It now creates the directory first, and the guide says to put your own
+  data directory into the command when you moved it: with the default path left in, the backup held no mail.
+- The uninstall section, the upgrade notes and the Windows file names describe 1.3.4.
+- The README says that the commit on the About page is the maintainers' commit, which is not in the public
+  repository.
+
 ## 1.3.3 (2026-11-16)
 
 This release is about how the program is built and published. Preparing it for the public found defects, which

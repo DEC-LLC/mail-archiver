@@ -7,11 +7,12 @@
 # instead of hard-coding them in the cron line, so a drop-in override is
 # honoured and a package upgrade cannot lose it.
 set -euo pipefail
-while IFS= read -r kv; do
-    case "$kv" in
-        MAIL_ARCHIVER_*=*) export "$kv" ;;
-    esac
-done < <(systemctl show mail-archiver -p Environment --value | tr ' ' '\n')
+# The settings of mail-archiver.service, with systemd's quoting undone (a
+# value with a space or a quote arrives as the service sees it). Stop when
+# they cannot be read: never run with the built-in defaults by accident.
+exports=$(/usr/libexec/mail-archiver-env) || {
+    echo "$0: cannot take the settings of mail-archiver.service" >&2; exit 1; }
+eval "$exports"
 # 1.3.0: an optional argument picks the job. `import` is the hourly mail
 # import check (same cron mechanism, same environment); `pst-import` is its
 # old name and still works. `bulk-sync` is the hourly check of the initial /
@@ -24,7 +25,8 @@ case "${1:-scheduled-sync}" in
     scheduled-sync)     job=scheduled-sync ;;
     import|pst-import)  job=import ;;
     bulk-sync)          job=bulk-sync ;;
-    *) echo "usage: $0 [scheduled-sync|import [options]|bulk-sync [options]]" >&2; exit 2 ;;
+    sync-schedule)      job=sync-schedule ;;   # 1.3.4: print the plan, start nothing
+    *) echo "usage: $0 [scheduled-sync|import [options]|bulk-sync [options]|sync-schedule]" >&2; exit 2 ;;
 esac
 [ "$#" -gt 0 ] && shift
 cd /opt/mail-archiver

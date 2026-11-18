@@ -4,9 +4,9 @@ Mail-Archiver is a self-hosted mail archive with a web interface. It downloads y
 files on your own machine, indexes them for full-text search, and lets each user search, read and export their own
 mail in a browser. It can also import mail from files such as Outlook PST, mbox and `.eml`.
 
-Current release: **1.3.3**. Licence: Apache-2.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Current release: **1.3.4**. Licence: Apache-2.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
-## Features in 1.3.3
+## Features in 1.3.4
 
 Details, limits and defaults for each point are in the [feature reference](docs/FEATURES.md).
 
@@ -74,16 +74,16 @@ All downloads are on GitHub Releases: <https://github.com/DEC-LLC/mail-archiver/
 
 | File | For |
 |---|---|
-| `mail-archiver_1.3.3-1_all.deb` | Debian and Ubuntu |
-| `mail-archiver-1.3.3-1.el9.noarch.rpm` | EL 9 |
+| `mail-archiver_1.3.4-1_all.deb` | Debian and Ubuntu |
+| `mail-archiver-1.3.4-1.el9.noarch.rpm` | EL 9 |
 | `perl-Email-Outlook-Message-0.921-1.el9.noarch.rpm` | EL 9 dependency (`msgconvert`), built by DEC-LLC because no EL repository carries it |
 | `perl-Email-Outlook-Message-0.921-1.el9.src.rpm` | its source rpm |
 | `libpst` (not in the release) | EL 9 dependency (`readpst`), from the `devel` repository of Rocky Linux |
-| `MailArchiver-1.3.3.exe` | Windows |
-| `MailArchiver-1.3.3-source.zip`, `MailArchiver-1.3.3-toolchain.txt` | the source tree and the toolchain versions of the Windows build |
-| `mail-archiver-1.3.3-1.el9.src.rpm` | source rpm (SRPM) |
-| `mail-archiver-1.3.3.tar.gz` | source tarball |
-| `mail-archiver_1.3.3-1.dsc`, `mail-archiver_1.3.3.orig.tar.gz`, `mail-archiver_1.3.3-1.debian.tar.xz` | Debian source package |
+| `MailArchiver-1.3.4.exe` | Windows |
+| `MailArchiver-1.3.4-source.zip`, `MailArchiver-1.3.4-toolchain.txt` | the source tree and the toolchain versions of the Windows build |
+| `mail-archiver-1.3.4-1.el9.src.rpm` | source rpm (SRPM) |
+| `mail-archiver-1.3.4.tar.gz` | source tarball |
+| `mail-archiver_1.3.4-1.dsc`, `mail-archiver_1.3.4.orig.tar.gz`, `mail-archiver_1.3.4-1.debian.tar.xz` | Debian source package |
 | `SHA256SUMS` | one file for the whole release: the sha256 of every other release file |
 
 ## Verify your download
@@ -101,8 +101,8 @@ Windows (PowerShell). The first command prints the sha256 of the EXE, the second
 the hexadecimal value must be the same in both (upper and lower case do not matter):
 
 ```powershell
-(Get-FileHash .\MailArchiver-1.3.3.exe -Algorithm SHA256).Hash
-Select-String MailArchiver-1.3.3.exe .\SHA256SUMS
+(Get-FileHash .\MailArchiver-1.3.4.exe -Algorithm SHA256).Hash
+Select-String MailArchiver-1.3.4.exe .\SHA256SUMS
 ```
 
 **Nothing in this release is signed.** The Windows EXE is not code-signed yet, so Windows SmartScreen warns before
@@ -138,7 +138,7 @@ there before it is started. Search, mail import and sync then work as on Debian.
 
 ### Windows
 
-1. Download `MailArchiver-1.3.3.exe` and `SHA256SUMS`, and verify the sha256 as shown above.
+1. Download `MailArchiver-1.3.4.exe` and `SHA256SUMS`, and verify the sha256 as shown above.
 2. Double-click the EXE. Confirm the SmartScreen warning.
 3. The browser opens `https://127.0.0.1:8400`; accept the program's own certificate.
 4. Choose **Create one** to register a user, then **Add email account** and **Sync Now**.
@@ -162,7 +162,7 @@ The program keeps running as a tray icon. Data is in `%APPDATA%\MailArchiver\`.
 
 ```bash
 packaging/build.sh            # from the current commit
-packaging/build.sh all v1.3.3 # from a tag
+packaging/build.sh all v1.3.4 # from a tag
 ```
 
 It makes the source tarball with [packaging/make-source.sh](packaging/make-source.sh) (a `git archive` of the commit
@@ -174,11 +174,12 @@ Debian 12 container, and writes them to `packaging/dist/` with a `SHA256SUMS` fo
 To rebuild from the published sources instead:
 
 ```bash
-rpmbuild --rebuild mail-archiver-1.3.3-1.el9.src.rpm              # on EL 9, package rpm-build
-dpkg-source -x mail-archiver_1.3.3-1.dsc && cd mail-archiver-1.3.3 && dpkg-buildpackage -us -uc -d   # on Debian 12
+rpmbuild --rebuild mail-archiver-1.3.4-1.el9.src.rpm              # on EL 9, package rpm-build
+dpkg-source -x mail-archiver_1.3.4-1.dsc && cd mail-archiver-1.3.4 && dpkg-buildpackage -us -uc -d   # on Debian 12
 ```
 
-The version comes from the file `VERSION`; the commit is shown on the About page.
+The version comes from the file `VERSION`; the commit is shown on the About page. For the published packages that
+is the commit in the maintainers' repository, which is not part of this public repository.
 
 `packaging/perl-Email-Outlook-Message/build.sh` builds the EL 9 `msgconvert` package from the CPAN source in a Rocky
 Linux 9 container.

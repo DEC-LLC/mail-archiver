@@ -1,0 +1,15 @@
+#!/bin/sh
+# Stop and switch off the units when the package is removed (1.3.4). An
+# upgrade does not come through here with "remove", so the running service
+# and the administrator's enable/disable choices are left alone then.
+set -e
+if [ "$1" = "remove" ]; then
+    for u in mail-archiver.service mail-archiver-oauth-refresh.timer \
+             mail-archiver-oauth-refresh.service mail-archiver-restart.path \
+             mail-archiver-syncs.slice; do
+        systemctl disable --now "$u" 2>/dev/null || true
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed 'mail-archiver*' 2>/dev/null || true
+fi
+exit 0
